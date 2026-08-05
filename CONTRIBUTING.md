@@ -39,12 +39,27 @@
 
 ```console
 gofmt -w cmd internal
+go mod verify
 go test -count=1 ./...
 go test -count=1 -shuffle=on ./...
 go test -count=1 -race ./...
 go vet ./...
+go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 CGO_ENABLED=0 go build -trimpath ./cmd/sazanami-dvr
 ```
+
+GitHub Actionsも同じ検査を行い、Linux／macOSのIntel／Arm向けにコンパイルできることを確認します。同じPull Requestへ続けてpushした場合は、古い実行を中止します。
+
+## リリース
+
+リリースは管理者が行います。通常の`main`更新では公開されません。
+
+1. 製品内のバージョンとREADMEをPull Requestで更新する
+2. `main`のCIが成功したcommitへ、同じ番号の`v0.0.x`タグを付ける
+3. タグをpushする
+4. GitHub ReleaseにLinux Intel版、Linux Arm版、チェックサムがそろったことを確認する
+
+タグと製品内のバージョンが一致しない場合、リリース処理は停止します。0.x系はGitHub上でもプレリリースとして公開します。公開済みタグは上書きせず、修正が必要な場合は新しいバージョンを使ってください。
 
 ## 公開してはいけない情報
 
