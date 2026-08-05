@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: Goの品質確認
@@ -22,12 +26,20 @@ jobs:
       - name: Go toolchainを準備
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
-          go-version-file: go.mod
+          go-version: "1.26.5"
           check-latest: false
           cache: false
 
+      - name: Go toolchainのversionを確認
+        run: |
+          go version
+          test "$(go env GOVERSION)" = "go1.26.5"
+
       - name: gofmtを確認
         run: test -z "$(gofmt -l .)"
+
+      - name: 依存fileを確認
+        run: go mod verify
 
       - name: unit testを実行
         run: go test -count=1 ./...
@@ -44,5 +56,14 @@ jobs:
       - name: 静的検査を実行
         run: go vet ./...
 
-      - name: Linux binaryをbuild
-        run: CGO_ENABLED=0 go build -trimpath ./cmd/sazanami-dvr
+      - name: 既知の脆弱性を確認
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+
+      - name: 主要環境向けbinaryをbuild
+        run: |
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os=${target%/*}
+            arch=${target#*/}
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+              go build -trimpath -o "$RUNNER_TEMP/sazanami-dvr-$os-$arch" ./cmd/sazanami-dvr
+          done

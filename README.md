@@ -13,7 +13,7 @@ Sazanami DVRは、Mirakurun／mirakcから番組情報と放送ストリーム�
 - 保存済みの番組表と運用状態を、同じPCのWebUIで確認する
 - DBの移行、バックアップ、復元を明示的なコマンドで行う
 
-MirakurunとKonomiTV v0.14.1を使い、番組表の取得、予約追加、5分間の録画、再起動後の状態確認を一件だけ確認しています。KonomiTVの画面からの一連の操作、録画番組の再生、長時間運転、さまざまな環境での互換性は未確認です。
+MirakurunとKonomiTV v0.14.1を使い、番組表の表示、予約、5分間の録画、再起動後の状態確認、録画済み一覧からの再生を一件だけ確認しています。録画開始が予定より約3秒遅れたため、KonomiTV上では「一部のみ録画」と表示されました。長時間運転や幅広い環境での互換性は未確認です。
 
 ## 主な制限
 
@@ -131,12 +131,16 @@ sazanami-dvr db recover --data-root <data-root> --operation-id <uuid>
 SQLiteドライバーは`github.com/ncruces/go-sqlite3 v0.35.2`を使用し、CGOは使いません。Webフレームワーク、ORM、Node.js、コード生成も使っていません。
 
 ```console
+go mod verify
 go test ./...
 go test -shuffle=on ./...
 go test -race ./...
 go vet ./...
+go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 CGO_ENABLED=0 go build ./cmd/sazanami-dvr
 ```
+
+Pull Requestと`main`へのpushでは、GitHub Actionsがこれらの検査と、Linux／macOSのIntel／Arm向けビルドを実行します。同じPull Requestへ続けてpushした場合は、古い実行を中止して新しいcommitだけを検査します。
 
 主なパッケージ構成は次のとおりです。
 
