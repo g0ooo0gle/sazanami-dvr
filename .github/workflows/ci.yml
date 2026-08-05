@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Goの品質確認
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: sourceを取得
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Go toolchainを準備
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          check-latest: false
+          cache: false
+
+      - name: gofmtを確認
+        run: test -z "$(gofmt -l .)"
+
+      - name: unit testを実行
+        run: go test -count=1 ./...
+
+      - name: Linux resource smokeを記録
+        run: /usr/bin/time -v go test -count=1 ./internal/adapters/sqlite ./internal/app/catalogsync
+
+      - name: test順序への依存を確認
+        run: go test -count=1 -shuffle=on ./...
+
+      - name: data raceを確認
+        run: go test -count=1 -race ./...
+
+      - name: 静的検査を実行
+        run: go vet ./...
+
+      - name: Linux binaryをbuild
+        run: CGO_ENABLED=0 go build -trimpath ./cmd/sazanami-dvr

@@ -1,0 +1,10 @@
+{{define "settings.html"}}<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>設定 | Sazanami DVR</title><link rel="stylesheet" href="/assets/style.css"></head>
+<body><header><h1>Sazanami DVR</h1><nav><a href="/">概要</a><a href="/epg">EPG</a><a aria-current="page" href="/settings">設定</a><a href="/operations">操作</a></nav></header>
+<main><h2>実効設定（読み取り専用）</h2><table><tbody>
+<tr><th>待受範囲</th><td>{{.Settings.ListenScope}}</td></tr><tr><th>UI</th><td>developer preview / read-only settings</td></tr>
+<tr><th>DB schema</th><td>{{.Settings.SchemaCurrent}} / {{.Settings.SchemaTarget}}</td></tr><tr><th>Catalog</th><td>最後に完了したFake／Mirakurun同期（読み取り専用）</td></tr>
+<tr><th>上限</th><td>backend 16 / service 256 / program 256 / EPG 8日</td></tr><tr><th>HTTP上限</th><td>body 4 KiB / header 16 KiB / application timeout 10秒</td></tr>
+<tr><th>Version</th><td>{{.Settings.ProductVersion}}</td></tr><tr><th>Commit</th><td><code>{{.Settings.ProductCommit}}</code></td></tr>
+</tbody></table><p class="muted">データ保存先、ホスト名、ユーザー名、接続先、認証情報は表示しません。</p></main></body></html>{{end}}

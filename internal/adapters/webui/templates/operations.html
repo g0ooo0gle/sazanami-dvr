@@ -1,0 +1,10 @@
+{{define "operations.html"}}<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>操作 | Sazanami DVR</title><link rel="stylesheet" href="/assets/style.css"></head>
+<body><header><h1>Sazanami DVR</h1><nav><a href="/">概要</a><a href="/epg">EPG</a><a href="/settings">設定</a><a aria-current="page" href="/operations">操作</a></nav></header>
+<main><h2>操作</h2><section><h3>オンラインバックアップ</h3><p>現在のデータベースを整合性検査付きでバックアップします。復元や削除は行いません。</p>
+{{if .Result.ID}}<p class="success">完了: ID <code>{{.Result.ID}}</code> / state {{.Result.State}} / schema {{.Result.SchemaVersion}}</p>{{end}}
+{{if .Failure}}<p class="warning">失敗: <code>{{.Failure}}</code></p>{{end}}
+<form method="post" action="/operations/backup"><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit">バックアップを作成</button></form></section>
+<section><h3>この画面で行わない操作</h3><p>復元、migration、設定変更、サービス再起動、ファイル削除、任意SQLは実行できません。</p></section></main></body></html>{{end}}
+

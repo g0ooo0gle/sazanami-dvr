@@ -1,0 +1,11 @@
+# Go build／coverage生成物
+/sazanami-dvr
+/bin/
+*.test
+*.prof
+coverage.out
+
+# 開発環境のローカルファイル
+.DS_Store
+.idea/
+*.iml
