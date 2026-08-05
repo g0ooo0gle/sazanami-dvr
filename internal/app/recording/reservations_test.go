@@ -23,6 +23,9 @@ func (catalog fixedCatalog) FindProgram(context.Context, core.ReservationRequest
 type memoryReservations struct {
 	created []core.Reservation
 	err     error
+	changed []core.ReservationChange
+	deleted []int32
+	record  bool
 }
 
 func (store *memoryReservations) CreateReservation(_ context.Context, reservation core.Reservation) (core.Reservation, error) {
@@ -36,6 +39,26 @@ func (store *memoryReservations) CreateReservation(_ context.Context, reservatio
 
 func (store *memoryReservations) ActiveReservations(context.Context, int, int32) ([]core.Reservation, error) {
 	return append([]core.Reservation(nil), store.created...), nil
+}
+
+func (store *memoryReservations) UpdateReservation(_ context.Context, change core.ReservationChange, _ time.Time) error {
+	if store.err != nil {
+		return store.err
+	}
+	store.changed = append(store.changed, change)
+	return nil
+}
+
+func (store *memoryReservations) CancelReservation(_ context.Context, number int32, _ time.Time) error {
+	if store.err != nil {
+		return store.err
+	}
+	store.deleted = append(store.deleted, number)
+	return nil
+}
+
+func (store *memoryReservations) ReservationRecording(context.Context, int32) (bool, error) {
+	return store.record, store.err
 }
 
 type fixedClock struct{ now time.Time }
@@ -84,6 +107,26 @@ func TestReservationServiceDoesNotNotifyOnFailure(t *testing.T) {
 	service.Catalog = fixedCatalog{program: appProgram(t, request)}
 	if _, err := service.Add(context.Background(), request); err == nil || notified != 0 {
 		t.Fatalf("save err=%v notified=%d", err, notified)
+	}
+}
+
+func TestReservationServiceChangesDeletesAndReadsRecordingState(t *testing.T) {
+	now := time.Date(2026, 8, 5, 2, 0, 0, 0, time.UTC)
+	store := &memoryReservations{record: true}
+	notified := 0
+	service := ReservationService{Store: store, Clock: fixedClock{now: now}, OnAdded: func() { notified++ }}
+	change := core.ReservationChange{Number: 7, Request: core.ReservationRequest{
+		Start: now.Add(time.Hour), Duration: 30 * time.Minute, Priority: 4,
+	}}
+	if err := service.Change(context.Background(), change); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Delete(context.Background(), 8); err != nil {
+		t.Fatal(err)
+	}
+	active, err := service.Recording(context.Background(), 7)
+	if err != nil || !active || len(store.changed) != 1 || len(store.deleted) != 1 || notified != 2 {
+		t.Fatalf("active=%v changed=%d deleted=%d notified=%d err=%v", active, len(store.changed), len(store.deleted), notified, err)
 	}
 }
 

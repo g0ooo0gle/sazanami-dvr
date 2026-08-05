@@ -11,6 +11,7 @@ import (
 const (
 	lateStartLimit  = 5 * time.Minute
 	minimumRunTime  = 60 * time.Second
+	startupLeadTime = 5 * time.Second
 	maximumWakeSize = 1
 )
 
@@ -105,8 +106,9 @@ func (scheduler *Scheduler) Run(ctx context.Context) error {
 		if now.IsZero() || now.UnixMilli() < 0 {
 			return errors.New("recording: invalid scheduler clock")
 		}
-		if reservation.Program.Start.After(now) {
-			timer := scheduler.clock.NewTimer(reservation.Program.Start.Sub(now))
+		wakeAt := reservation.Program.Start.Add(-startupLeadTime)
+		if wakeAt.After(now) {
+			timer := scheduler.clock.NewTimer(wakeAt.Sub(now))
 			if timer == nil || timer.C() == nil {
 				return errors.New("recording: invalid scheduler timer")
 			}

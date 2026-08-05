@@ -1,4 +1,4 @@
-// Package reservationは番組予約をCtrlCmd 2011／2013の通信形式へ変換する。
+// Package reservationは番組予約と録画中確認をKonomiTV向けCtrlCmd形式へ変換する。
 package reservation
 
 import (
@@ -15,6 +15,14 @@ const (
 	CommandList int32 = 2011
 	// CommandAddはKonomiTVが番組予約の追加に使うCtrlCmd番号である。
 	CommandAdd int32 = 2013
+	// CommandChangeはKonomiTVが録画開始前の予約設定を更新するCtrlCmd番号である。
+	CommandChange int32 = 2015
+	// CommandDeleteはKonomiTVが録画開始前の予約を取り消すCtrlCmd番号である。
+	CommandDelete int32 = 1014
+	// CommandRecordingOpenはKonomiTVが予約の録画中状態を確認するCtrlCmd番号である。
+	CommandRecordingOpen int32 = 1087
+	// CommandRecordingCloseは録画中確認の直後にKonomiTVが送るCtrlCmd番号である。
+	CommandRecordingClose int32 = 1081
 	// Versionは今回受理するCmd2の版である。
 	Version uint16 = 5
 	// ResultSuccessは予約一覧の取得または予約追加が完了したことを表す。
@@ -26,12 +34,16 @@ const (
 	maxReservations    = 16_384
 	listResponseCap    = 64 * 1024 * 1024
 	minimumReserveSize = 133
+	recordingPath      = "sazanami-recording.ts"
 )
 
-// Operationsは予約の確定保存と未完了一覧だけを提供する。
+// Operationsは予約の保存、変更、取消し、録画中照合を提供する。
 type Operations interface {
 	Add(context.Context, recording.ReservationRequest) (recording.Reservation, error)
 	Active(context.Context, int, int32) ([]recording.Reservation, error)
+	Change(context.Context, recording.ReservationChange) error
+	Delete(context.Context, int32) error
+	Recording(context.Context, int32) (bool, error)
 }
 
 // Handlerは対応済みの予約操作だけをapplication層へ渡す。
@@ -40,7 +52,7 @@ type Handler struct {
 	Limits     codec.Limits
 }
 
-// Handleは2011／2013を振り分け、対応済み操作の失敗理由を応答へ含めない。
+// Handleは対応済みの予約commandを振り分け、失敗理由を応答へ含めない。
 func (handler Handler) Handle(ctx context.Context, request []byte, destination io.Writer) error {
 	frame, err := codec.ParseRequestFrame(request, handler.Limits)
 	if err != nil {
@@ -54,6 +66,14 @@ func (handler Handler) Handle(ctx context.Context, request []byte, destination i
 		return handler.list(ctx, frame.Body, destination)
 	case CommandAdd:
 		return handler.add(ctx, frame.Body, destination)
+	case CommandChange:
+		return handler.change(ctx, frame.Body, destination)
+	case CommandDelete:
+		return handler.delete(ctx, frame.Body, destination)
+	case CommandRecordingOpen:
+		return handler.recordingOpen(ctx, frame.Body, destination)
+	case CommandRecordingClose:
+		return handler.recordingClose(ctx, frame.Body, destination)
 	default:
 		return failure(codec.Unsupported, "command-out-of-profile", int64(frame.Code))
 	}
@@ -95,11 +115,11 @@ func (handler Handler) list(ctx context.Context, body []byte, destination io.Wri
 }
 
 func (handler Handler) add(ctx context.Context, body []byte, destination io.Writer) error {
-	request, err := decodeAdd(body, handler.Limits)
+	change, err := decodeReservationRequest(body, handler.Limits, false)
 	if err != nil {
 		return writeFailure(ctx, destination, handler.Limits)
 	}
-	if _, err := handler.Operations.Add(ctx, request); err != nil {
+	if _, err := handler.Operations.Add(ctx, change.Request); err != nil {
 		return writeFailure(ctx, destination, handler.Limits)
 	}
 	return codec.WriteFrame(reservationDestination{ctx: ctx, destination: destination}, ResultSuccess, 2, handler.Limits, func(writer *codec.Writer) error {
@@ -107,36 +127,86 @@ func (handler Handler) add(ctx context.Context, body []byte, destination io.Writ
 	})
 }
 
-func decodeAdd(body []byte, limits codec.Limits) (recording.ReservationRequest, error) {
+func (handler Handler) change(ctx context.Context, body []byte, destination io.Writer) error {
+	change, err := decodeReservationRequest(body, handler.Limits, true)
+	if err != nil || handler.Operations.Change(ctx, change) != nil {
+		return writeFailure(ctx, destination, handler.Limits)
+	}
+	return codec.WriteFrame(reservationDestination{ctx: ctx, destination: destination}, ResultSuccess, 2, handler.Limits, func(writer *codec.Writer) error {
+		return writer.U16(Version)
+	})
+}
+
+func (handler Handler) delete(ctx context.Context, body []byte, destination io.Writer) error {
+	number, err := decodeOneNumber(body, handler.Limits, true)
+	if err != nil || handler.Operations.Delete(ctx, number) != nil {
+		return writeFailure(ctx, destination, handler.Limits)
+	}
+	return writeEmptySuccess(ctx, destination, handler.Limits)
+}
+
+func (handler Handler) recordingOpen(ctx context.Context, body []byte, destination io.Writer) error {
+	number, err := decodeOneNumber(body, handler.Limits, false)
+	if err != nil {
+		return writeFailure(ctx, destination, handler.Limits)
+	}
+	active, err := handler.Operations.Recording(ctx, number)
+	if err != nil || !active {
+		return writeFailure(ctx, destination, handler.Limits)
+	}
+	stringSize, err := codec.StringSize(recordingPath, handler.Limits)
+	if err != nil {
+		return err
+	}
+	structureSize := int64(8) + stringSize
+	return codec.WriteFrame(reservationDestination{ctx: ctx, destination: destination}, ResultSuccess, structureSize, handler.Limits, func(writer *codec.Writer) error {
+		if err := writer.I32(int32(structureSize)); err != nil {
+			return err
+		}
+		if err := writer.I32(number); err != nil {
+			return err
+		}
+		return writer.String(recordingPath)
+	})
+}
+
+func (handler Handler) recordingClose(ctx context.Context, body []byte, destination io.Writer) error {
+	if _, err := decodeOneNumber(body, handler.Limits, false); err != nil {
+		return writeFailure(ctx, destination, handler.Limits)
+	}
+	return writeEmptySuccess(ctx, destination, handler.Limits)
+}
+
+func decodeReservationRequest(body []byte, limits codec.Limits, requireNumber bool) (recording.ReservationChange, error) {
 	reader, err := codec.NewReader(body, limits)
 	if err != nil {
-		return recording.ReservationRequest{}, err
+		return recording.ReservationChange{}, err
 	}
 	version, err := reader.U16()
 	if err != nil || version != Version {
-		return recording.ReservationRequest{}, failure(codec.Malformed, "reservation-version", int64(version))
+		return recording.ReservationChange{}, failure(codec.Malformed, "reservation-version", int64(version))
 	}
-	var request recording.ReservationRequest
+	var change recording.ReservationChange
 	count := 0
 	err = reader.Vector(4, 1, func(item *codec.Reader, _ int) error {
 		count++
 		return item.Structure(func(value *codec.Reader) error {
-			return decodeReservation(value, &request)
+			return decodeReservation(value, &change, requireNumber)
 		})
 	})
 	if err != nil || count != 1 {
-		return recording.ReservationRequest{}, failure(codec.Malformed, "reservation-vector", int64(count))
+		return recording.ReservationChange{}, failure(codec.Malformed, "reservation-vector", int64(count))
 	}
 	if err := reader.Exact(); err != nil {
-		return recording.ReservationRequest{}, err
+		return recording.ReservationChange{}, err
 	}
-	if err := request.Validate(); err != nil {
-		return recording.ReservationRequest{}, failure(codec.Malformed, "reservation-value", 0)
+	if change.Request.Validate() != nil || requireNumber && change.Validate() != nil || !requireNumber && change.Number != 0 {
+		return recording.ReservationChange{}, failure(codec.Malformed, "reservation-value", 0)
 	}
-	return request, nil
+	return change, nil
 }
 
-func decodeReservation(reader *codec.Reader, request *recording.ReservationRequest) error {
+func decodeReservation(reader *codec.Reader, change *recording.ReservationChange, requireNumber bool) error {
 	if _, err := reader.String(); err != nil {
 		return err
 	}
@@ -210,15 +280,45 @@ func decodeReservation(reader *codec.Reader, request *recording.ReservationReque
 	if err != nil {
 		return err
 	}
-	if reserveID != 0 || unknown != 0 || overlap != 0 || unused != "" || !epgStart.Equal(start) ||
+	if (!requireNumber && reserveID != 0) || (requireNumber && reserveID < 1) || unknown != 0 || overlap != 0 || unused != "" || !epgStart.Equal(start) ||
 		trailingOne != 0 || fileNames != 0 || trailingTwo != 0 || duration < 1 || duration > 86_400 {
 		return failure(codec.Malformed, "reservation-server-field", 0)
 	}
-	*request = recording.ReservationRequest{
+	change.Number = reserveID
+	change.Request = recording.ReservationRequest{
 		NetworkID: networkID, TransportStreamID: transportID, ServiceID: serviceID, EventID: eventID,
 		Start: start, Duration: time.Duration(duration) * time.Second, Priority: priority, RequestedFollow: follow,
 	}
 	return nil
+}
+
+func decodeOneNumber(body []byte, limits codec.Limits, vector bool) (int32, error) {
+	reader, err := codec.NewReader(body, limits)
+	if err != nil {
+		return 0, err
+	}
+	var number int32
+	if vector {
+		count := 0
+		err = reader.Vector(4, 1, func(item *codec.Reader, _ int) error {
+			count++
+			value, readErr := item.I32()
+			number = value
+			return readErr
+		})
+		if err != nil || count != 1 || len(body) != 12 {
+			return 0, failure(codec.Malformed, "reservation-id-vector", int64(count))
+		}
+	} else {
+		if len(body) != 4 {
+			return 0, failure(codec.Malformed, "reservation-id-body", int64(len(body)))
+		}
+		number, err = reader.I32()
+	}
+	if err != nil || number < 1 || reader.Exact() != nil {
+		return 0, failure(codec.Malformed, "reservation-id", int64(number))
+	}
+	return number, nil
 }
 
 func decodeSettings(reader *codec.Reader) (uint8, bool, error) {
@@ -516,6 +616,10 @@ func addReservationSize(current, addition, limit int64) (int64, error) {
 
 func writeFailure(ctx context.Context, destination io.Writer, limits codec.Limits) error {
 	return codec.WriteFrame(reservationDestination{ctx: ctx, destination: destination}, ResultFailure, 0, limits, func(*codec.Writer) error { return nil })
+}
+
+func writeEmptySuccess(ctx context.Context, destination io.Writer, limits codec.Limits) error {
+	return codec.WriteFrame(reservationDestination{ctx: ctx, destination: destination}, ResultSuccess, 0, limits, func(*codec.Writer) error { return nil })
 }
 
 type reservationDestination struct {

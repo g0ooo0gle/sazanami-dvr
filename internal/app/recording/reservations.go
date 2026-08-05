@@ -19,6 +19,9 @@ type Catalog interface {
 type ReservationStore interface {
 	CreateReservation(context.Context, recording.Reservation) (recording.Reservation, error)
 	ActiveReservations(context.Context, int, int32) ([]recording.Reservation, error)
+	UpdateReservation(context.Context, recording.ReservationChange, time.Time) error
+	CancelReservation(context.Context, int32, time.Time) error
+	ReservationRecording(context.Context, int32) (bool, error)
 }
 
 // Clockは予約追加時刻をテストから指定できるようにする。
@@ -74,4 +77,48 @@ func (service ReservationService) Active(ctx context.Context, limit int, after i
 		return nil, errors.New("recording: invalid reservation operation")
 	}
 	return service.Store.ActiveReservations(ctx, limit, after)
+}
+
+// Changeは録画開始前の予約について、KonomiTVから受けた対応済み設定だけを更新する。
+func (service ReservationService) Change(ctx context.Context, change recording.ReservationChange) error {
+	if ctx == nil || service.Store == nil || service.Clock == nil || change.Validate() != nil {
+		return errors.New("recording: invalid reservation operation")
+	}
+	now := service.Clock.Now().UTC()
+	if now.IsZero() || now.UnixMilli() < 0 {
+		return errors.New("recording: invalid clock")
+	}
+	if err := service.Store.UpdateReservation(ctx, change, now); err != nil {
+		return err
+	}
+	if service.OnAdded != nil {
+		service.OnAdded()
+	}
+	return nil
+}
+
+// Deleteは録画開始前の予約を取消し状態へ進め、予約番号と履歴を残す。
+func (service ReservationService) Delete(ctx context.Context, number int32) error {
+	if ctx == nil || service.Store == nil || service.Clock == nil || number < 1 {
+		return errors.New("recording: invalid reservation operation")
+	}
+	now := service.Clock.Now().UTC()
+	if now.IsZero() || now.UnixMilli() < 0 {
+		return errors.New("recording: invalid clock")
+	}
+	if err := service.Store.CancelReservation(ctx, number, now); err != nil {
+		return err
+	}
+	if service.OnAdded != nil {
+		service.OnAdded()
+	}
+	return nil
+}
+
+// Recordingは予約に録画中の処理があるかを、副作用なしで返す。
+func (service ReservationService) Recording(ctx context.Context, number int32) (bool, error) {
+	if ctx == nil || service.Store == nil || number < 1 {
+		return false, errors.New("recording: invalid reservation operation")
+	}
+	return service.Store.ReservationRecording(ctx, number)
 }
