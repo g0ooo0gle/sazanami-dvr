@@ -12,7 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/channel"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/codec"
+	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/programguide"
 	reservationadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/reservation"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/status"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/catalogmodel"
@@ -490,4 +492,88 @@ func TestRouterDispatchesOnlyAcceptedCommands(t *testing.T) {
 	if err := router.Handle(canceled, enumRequest, &bytes.Buffer{}); err == nil {
 		t.Fatal("canceled request succeeded")
 	}
+}
+
+func TestRecordingRouterKeepsKonomiTVCoreProfile(t *testing.T) {
+	root, path, base, _ := validFixture(t)
+	catalog := &recordingCatalog{fakeCatalog: base}
+	snapshot, err := BuildSnapshot(context.Background(), root, path, catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router, err := NewRecordingRouter(
+		snapshot,
+		emptyReservationOperations{},
+		fixedClock{time.Date(2026, 8, 5, 0, 0, 0, 0, time.UTC)},
+		codec.DefaultLimits(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	statusBody := make([]byte, status.RequestBodySize)
+	binary.LittleEndian.PutUint16(statusBody[0:2], status.Version)
+
+	fileBody := make([]byte, 26)
+	binary.LittleEndian.PutUint32(fileBody[0:4], 26)
+	position := 4
+	for _, character := range []byte("ChSet5.txt") {
+		binary.LittleEndian.PutUint16(fileBody[position:position+2], uint16(character))
+		position += 2
+	}
+
+	programBody := make([]byte, 40)
+	binary.LittleEndian.PutUint32(programBody[0:4], 40)
+	binary.LittleEndian.PutUint32(programBody[4:8], 4)
+	for index, selector := range [...]uint64{0xffffffffffff, 0xffffffffffff, 1, 0x7fffffffffffffff} {
+		binary.LittleEndian.PutUint64(programBody[8+index*8:16+index*8], selector)
+	}
+
+	listBody := make([]byte, 2)
+	binary.LittleEndian.PutUint16(listBody, reservationadapter.Version)
+	requests := []struct {
+		name    string
+		command int32
+		body    []byte
+	}{
+		{name: "起動確認", command: status.Command, body: statusBody},
+		{name: "チャンネル設定", command: channel.CommandFileCopy, body: fileBody},
+		{name: "サービス一覧", command: channel.CommandEnumService},
+		{name: "番組表", command: programguide.Command, body: programBody},
+		{name: "予約一覧", command: reservationadapter.CommandList, body: listBody},
+	}
+	for _, test := range requests {
+		t.Run(test.name, func(t *testing.T) {
+			var response bytes.Buffer
+			if err := router.Handle(context.Background(), commandFrame(test.command, test.body), &response); err != nil {
+				t.Fatal(err)
+			}
+			frame, err := codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
+			if err != nil || frame.Code != 1 {
+				t.Fatalf("response=%x err=%v", response.Bytes(), err)
+			}
+		})
+	}
+
+	var addResponse bytes.Buffer
+	if err := router.Handle(context.Background(), commandFrame(reservationadapter.CommandAdd, nil), &addResponse); err != nil {
+		t.Fatal(err)
+	}
+	addFrame, err := codec.ParseRequestFrame(addResponse.Bytes(), codec.DefaultLimits())
+	if err != nil || addFrame.Code != reservationadapter.ResultFailure {
+		t.Fatalf("予約追加の不正入力応答=%x err=%v", addResponse.Bytes(), err)
+	}
+
+	var codecError *codec.Error
+	if err := router.Handle(context.Background(), commandFrame(2060, nil), &bytes.Buffer{}); !errors.As(err, &codecError) || codecError.Category != codec.Unsupported {
+		t.Fatalf("対象外命令error=%v", err)
+	}
+}
+
+func commandFrame(command int32, body []byte) []byte {
+	request := make([]byte, codec.HeaderSize+len(body))
+	binary.LittleEndian.PutUint32(request[0:4], uint32(command))
+	binary.LittleEndian.PutUint32(request[4:8], uint32(len(body)))
+	copy(request[codec.HeaderSize:], body)
+	return request
 }
