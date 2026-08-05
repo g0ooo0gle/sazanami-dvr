@@ -55,6 +55,7 @@ jobs:
             CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
               go build -trimpath -ldflags "-s -w -X main.productCommit=$GITHUB_SHA" \
               -o "dist/$package/sazanami-dvr" ./cmd/sazanami-dvr
+            cp LICENSE README.md THIRD_PARTY_NOTICES.md "dist/$package/"
             tar -C dist -czf "dist/$package.tar.gz" "$package"
             rm -r "dist/$package"
           done
