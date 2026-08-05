@@ -572,7 +572,7 @@ func writeEmptyVector(writer *codec.Writer) error {
 }
 
 func validateStoredReservation(reservation recording.Reservation) error {
-	if reservation.Number < 1 || reservation.Version != 1 || reservation.State != recording.ReservationActive ||
+	if reservation.Number < 1 || reservation.Version < 1 || reservation.State != recording.ReservationActive ||
 		reservation.EffectiveFollow || reservation.Priority < 1 || reservation.Priority > 5 ||
 		reservation.Program.Start.IsZero() || reservation.Program.Start.Location() != time.UTC ||
 		reservation.Program.Duration < time.Second || reservation.Program.Duration > 24*time.Hour ||

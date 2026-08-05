@@ -87,6 +87,23 @@ func TestListWritesOneReservationInTwoPasses(t *testing.T) {
 	}
 }
 
+func TestListAcceptsUpdatedReservationVersion(t *testing.T) {
+	reservation := listedReservation(1)
+	reservation.Version = 2
+	handler := Handler{
+		Operations: &fakeOperations{reservations: []recording.Reservation{reservation}},
+		Limits:     codec.DefaultLimits(),
+	}
+	var response bytes.Buffer
+	if err := handler.Handle(context.Background(), listRequest(Version), &response); err != nil {
+		t.Fatal(err)
+	}
+	frame, err := codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
+	if err != nil || frame.Code != ResultSuccess {
+		t.Fatalf("frame=%+v err=%v", frame, err)
+	}
+}
+
 func TestAddAcceptsFollowButRejectsUnsupportedSettings(t *testing.T) {
 	operations := &fakeOperations{}
 	handler := Handler{Operations: operations, Limits: codec.DefaultLimits()}
