@@ -113,7 +113,7 @@ func TestMeasureProgramCountBoundary(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			source := &generatedSource{count: test.count, snapshot: channel.Snapshot{Key: "guide", Services: []channel.Service{service}}}
-			_, _, err := measure(context.Background(), source, []channel.Service{service}, codec.DefaultLimits())
+			_, _, err := measure(context.Background(), source, []channel.Service{service}, programQuery{}, codec.DefaultLimits())
 			if (err != nil) != test.wantErr {
 				t.Fatalf("err=%v", err)
 			}
@@ -122,6 +122,70 @@ func TestMeasureProgramCountBoundary(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHandlerSupportsKonomiExactServiceAndTimeRange(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 2, 3, 0, time.UTC)
+	target := guideService("1003", 1, 2, 3)
+	other := guideService("1004", 1, 2, 4)
+	before := guideProgram("1003", "event:1", 4)
+	inRange := guideProgram("1003", "event:2", 5)
+	atEnd := guideProgram("1003", "event:3", 6)
+	otherService := guideProgram("1004", "event:4", 7)
+	for program, value := range map[*catalogmodel.CurrentProgram]time.Time{
+		&before:       start.Add(-time.Second),
+		&inRange:      start,
+		&atEnd:        start.Add(time.Minute),
+		&otherService: start,
+	} {
+		unixMS := value.UnixMilli()
+		program.Material.StartUTCMS = &unixMS
+	}
+	source := &memorySource{
+		snapshot: channel.Snapshot{Key: "guide", Services: []channel.Service{target, other}},
+		programs: []catalogmodel.CurrentProgram{before, inRange, atEnd, otherService},
+	}
+	handler, err := NewHandler(source, codec.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	serviceKey := int64(target.NetworkID)<<32 | int64(target.TransportStreamID)<<16 | int64(target.ServiceID)
+	selectors := [4]int64{0, serviceKey, edcbFileTime(start), edcbFileTime(start.Add(time.Minute))}
+	var response bytes.Buffer
+	if err := handler.Handle(context.Background(), guideRequest(selectors), &response); err != nil {
+		t.Fatal(err)
+	}
+	frame, err := codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
+	if err != nil || frame.Code != ResultSuccess {
+		t.Fatalf("frame=%+v err=%v", frame, err)
+	}
+	reader, err := codec.NewReader(frame.Body, codec.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	services, events := 0, 0
+	if err := reader.Vector(1, maxServices, func(serviceReader *codec.Reader, _ int) error {
+		services++
+		return serviceReader.Structure(func(item *codec.Reader) error {
+			if err := readService(item); err != nil {
+				return err
+			}
+			return item.Vector(1, maxPrograms, func(eventReader *codec.Reader, _ int) error {
+				events++
+				return readEvent(eventReader, inRange)
+			})
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.Exact(); err != nil || services != 1 || events != 1 || source.reads != 2 ||
+		len(source.requested) != 2 || source.requested[0] != "1003" || source.requested[1] != "1003" {
+		t.Fatalf("services=%d events=%d reads=%d requested=%v exact=%v", services, events, source.reads, source.requested, err)
+	}
+}
+
+func edcbFileTime(value time.Time) int64 {
+	return value.UnixMilli()*10_000 + fileTimeUnixEpoch + fileTimeJSTOffset
 }
 
 type generatedSource struct {

@@ -4,6 +4,7 @@ package programguide
 import (
 	"context"
 	"io"
+	"math"
 	"sort"
 	"time"
 
@@ -22,10 +23,20 @@ const (
 	maxPrograms = 262_144
 	pageSize    = 256
 	responseCap = 256 * 1024 * 1024
+
+	fileTimeUnixEpoch = int64(116_444_736_000_000_000)
+	fileTimeJSTOffset = int64(9 * time.Hour / (100 * time.Nanosecond))
 )
 
 var acceptedSelectors = [...]int64{0xffffffffffff, 0xffffffffffff, 1, 0x7fffffffffffffff}
 var japanStandardTime = time.FixedZone("Asia/Tokyo", 9*60*60)
+
+type programQuery struct {
+	exactService bool
+	serviceKey   uint64
+	start        int64
+	end          int64
+}
 
 // Sourceは起動時に固定したチャンネルと完成済み番組表だけを返す。
 type Source interface {
@@ -75,7 +86,8 @@ func (handler *Handler) Handle(ctx context.Context, request []byte, destination 
 	if err := reader.Exact(); err != nil {
 		return err
 	}
-	if selectors != acceptedSelectors {
+	query, accepted := parseProgramQuery(selectors)
+	if !accepted {
 		return failure(codec.Unsupported, "program-selector-out-of-profile", 0)
 	}
 	if destination == nil {
@@ -96,12 +108,13 @@ func (handler *Handler) Handle(ctx context.Context, request []byte, destination 
 	if err != nil || len(services) > maxServices {
 		return failure(codec.OverLimit, "program-service-count", int64(len(services)))
 	}
+	services = selectServices(services, query)
 	sort.Slice(services, func(i, j int) bool { return services[i].ProviderLocator < services[j].ProviderLocator })
 	limits := handler.Limits
 	if limits.ResponseBody == 0 || limits.ResponseBody > responseCap {
 		limits.ResponseBody = responseCap
 	}
-	stats, bodySize, err := measure(ctx, handler.Source, services, limits)
+	stats, bodySize, err := measure(ctx, handler.Source, services, query, limits)
 	if err != nil {
 		return err
 	}
@@ -112,8 +125,39 @@ func (handler *Handler) Handle(ctx context.Context, request []byte, destination 
 		if err := writer.I32(int32(len(services))); err != nil {
 			return err
 		}
-		return writePrograms(ctx, writer, handler.Source, services, stats, limits)
+		return writePrograms(ctx, writer, handler.Source, services, stats, query, limits)
 	})
+}
+
+// parseProgramQueryは、KonomiTVが使う全件取得と単一サービス・開始時刻範囲の二形式だけを受理する。
+func parseProgramQuery(selectors [4]int64) (programQuery, bool) {
+	if selectors == acceptedSelectors {
+		return programQuery{}, true
+	}
+	if selectors[0] != 0 || selectors[1] < 0 || selectors[1] > 0xffffffffffff ||
+		selectors[2] < 0 || selectors[2] >= selectors[3] {
+		return programQuery{}, false
+	}
+	return programQuery{
+		exactService: true,
+		serviceKey:   uint64(selectors[1]),
+		start:        selectors[2],
+		end:          selectors[3],
+	}, true
+}
+
+func selectServices(services []channel.Service, query programQuery) []channel.Service {
+	if !query.exactService {
+		return services
+	}
+	selected := services[:0]
+	for _, service := range services {
+		key := uint64(service.NetworkID)<<32 | uint64(service.TransportStreamID)<<16 | uint64(service.ServiceID)
+		if key == query.serviceKey {
+			selected = append(selected, service)
+		}
+	}
+	return selected
 }
 
 type serviceStats struct {
@@ -122,7 +166,7 @@ type serviceStats struct {
 	eventCount    int
 }
 
-func measure(ctx context.Context, source Source, services []channel.Service, limits codec.Limits) ([]serviceStats, int64, error) {
+func measure(ctx context.Context, source Source, services []channel.Service, query programQuery, limits codec.Limits) ([]serviceStats, int64, error) {
 	stats := make([]serviceStats, len(services))
 	byLocator := make(map[string]int, len(services))
 	bodySize := int64(8)
@@ -145,6 +189,9 @@ func measure(ctx context.Context, source Source, services []channel.Service, lim
 			return failure(codec.OverLimit, "program-count", int64(programCount))
 		}
 		index, selected := byLocator[program.ServiceLocator]
+		if !programMatchesQuery(program, query) {
+			return nil
+		}
 		eventSize, eligible, err := serializedEventSize(program, limits)
 		if err != nil || !selected || !eligible {
 			return err
@@ -165,6 +212,18 @@ func measure(ctx context.Context, source Source, services []channel.Service, lim
 		return nil, 0, err
 	}
 	return stats, bodySize, nil
+}
+
+func programMatchesQuery(program catalogmodel.CurrentProgram, query programQuery) bool {
+	if !query.exactService {
+		return true
+	}
+	start := program.Material.StartUTCMS
+	if start == nil || *start < 0 || *start > (math.MaxInt64-fileTimeUnixEpoch-fileTimeJSTOffset)/10_000 {
+		return false
+	}
+	fileTime := *start*10_000 + fileTimeUnixEpoch + fileTimeJSTOffset
+	return query.start <= fileTime && fileTime < query.end
 }
 
 func serializedEventSize(program catalogmodel.CurrentProgram, limits codec.Limits) (int64, bool, error) {
@@ -199,7 +258,7 @@ func serializedEventSize(program catalogmodel.CurrentProgram, limits codec.Limit
 	return 63 + titleSize + descriptionSize, true, nil
 }
 
-func writePrograms(ctx context.Context, writer *codec.Writer, source Source, services []channel.Service, stats []serviceStats, limits codec.Limits) error {
+func writePrograms(ctx context.Context, writer *codec.Writer, source Source, services []channel.Service, stats []serviceStats, query programQuery, limits codec.Limits) error {
 	byLocator := make(map[string]int, len(services))
 	for index, service := range services {
 		byLocator[service.ProviderLocator] = index
@@ -221,6 +280,9 @@ func writePrograms(ctx context.Context, writer *codec.Writer, source Source, ser
 	}
 	err := forEachProgram(ctx, source, services, func(program catalogmodel.CurrentProgram) error {
 		index, selected := byLocator[program.ServiceLocator]
+		if !programMatchesQuery(program, query) {
+			return nil
+		}
 		_, eligible, sizeErr := serializedEventSize(program, limits)
 		if sizeErr != nil || !selected || !eligible {
 			return sizeErr
