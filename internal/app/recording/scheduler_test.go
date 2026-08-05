@@ -187,12 +187,12 @@ func TestSchedulerUsesTimerAndRechecksDatabase(t *testing.T) {
 		cancel()
 		t.Fatal("開始時刻のtimerが作られませんでした")
 	}
-	if clock.duration != time.Hour {
+	if clock.duration != time.Hour-startupLeadTime {
 		cancel()
 		t.Fatalf("timer=%s", clock.duration)
 	}
-	clock.now = start
-	clock.timer.channel <- start
+	clock.now = start.Add(-startupLeadTime)
+	clock.timer.channel <- clock.now
 	select {
 	case <-executor.executed:
 	case <-time.After(time.Second):

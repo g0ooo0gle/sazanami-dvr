@@ -42,6 +42,59 @@ func TestReservationCreateReadbackAndDuplicate(t *testing.T) {
 	}
 }
 
+func TestReservationUpdateCancelAndRecordingStatus(t *testing.T) {
+	root, store := openMigratedStore(t)
+	reservation := reservationForTest(t, store)
+	created, err := store.CreateReservation(context.Background(), reservation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	change := recording.ReservationChange{Number: created.Number, Request: recording.ReservationRequest{
+		NetworkID: reservation.Program.NetworkID, TransportStreamID: reservation.Program.TransportStreamID,
+		ServiceID: reservation.Program.ServiceID, EventID: reservation.Program.EventID,
+		Start: reservation.Program.Start, Duration: reservation.Program.Duration, Priority: 5,
+	}}
+	now := reservation.CreatedAt.Add(time.Second)
+	if err := store.UpdateReservation(context.Background(), change, now); err != nil {
+		t.Fatal(err)
+	}
+	items, err := store.ActiveReservations(context.Background(), 1, 0)
+	if err != nil || len(items) != 1 || items[0].Priority != 5 || items[0].Version != 2 {
+		t.Fatalf("items=%+v err=%v", items, err)
+	}
+	change.Request.EventID++
+	if err := store.UpdateReservation(context.Background(), change, now.Add(time.Second)); !errors.Is(err, ErrReservationUnavailable) {
+		t.Fatalf("変更不可項目の差分が受理されました: %v", err)
+	}
+	active, err := store.ReservationRecording(context.Background(), created.Number)
+	if err != nil || active {
+		t.Fatalf("recording=%v err=%v", active, err)
+	}
+	if err := store.CancelReservation(context.Background(), created.Number, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CancelReservation(context.Background(), created.Number, now.Add(3*time.Second)); !errors.Is(err, ErrReservationUnavailable) {
+		t.Fatalf("取消しの再送が成功しました: %v", err)
+	}
+	var state, reason string
+	if err := store.reader.QueryRow(`SELECT state, terminal_reason FROM reservations WHERE id=?`, reservation.ID.Bytes()).Scan(&state, &reason); err != nil ||
+		state != "FINISHED" || reason != "CANCELLED_BY_USER" {
+		t.Fatalf("state=%s reason=%s err=%v", state, reason, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenStore(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	items, err = reopened.ActiveReservations(context.Background(), 1, 0)
+	if err != nil || len(items) != 0 {
+		t.Fatalf("restarted items=%+v err=%v", items, err)
+	}
+}
+
 func TestActiveReservationsRejectsUnboundedQuery(t *testing.T) {
 	_, store := openMigratedStore(t)
 	for _, limit := range []int{0, recording.MaxPage + 1} {
@@ -151,6 +204,21 @@ func TestRecordingAttemptLifecycle(t *testing.T) {
 	if err := store.StartAttempt(context.Background(), claim.AttemptID, now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
+	active, err := store.ReservationRecording(context.Background(), created.Number)
+	if err != nil || !active {
+		t.Fatalf("starting recording=%v err=%v", active, err)
+	}
+	change := recording.ReservationChange{Number: created.Number, Request: recording.ReservationRequest{
+		NetworkID: reservation.Program.NetworkID, TransportStreamID: reservation.Program.TransportStreamID,
+		ServiceID: reservation.Program.ServiceID, EventID: reservation.Program.EventID,
+		Start: reservation.Program.Start, Duration: reservation.Program.Duration, Priority: 5,
+	}}
+	if err := store.UpdateReservation(context.Background(), change, now.Add(time.Second)); !errors.Is(err, ErrReservationUnavailable) {
+		t.Fatalf("録画開始後の変更が成功しました: %v", err)
+	}
+	if err := store.CancelReservation(context.Background(), created.Number, now.Add(time.Second)); !errors.Is(err, ErrReservationUnavailable) {
+		t.Fatalf("録画開始後の取消しが成功しました: %v", err)
+	}
 	if err := store.RecordingStarted(context.Background(), claim.AttemptID, now.Add(2*time.Second)); err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +255,7 @@ func TestRecordingAttemptLifecycle(t *testing.T) {
 	if err != nil || len(items) != 0 {
 		t.Fatalf("active=%+v err=%v", items, err)
 	}
-	var attemptState, reason, segmentState, availability string
+	var attemptState, reason, segmentState, availability, reservationReason string
 	var byteCount, fileSynced, finalPublished, directorySynced int64
 	err = store.reader.QueryRow(`SELECT a.state, a.terminal_reason, a.byte_count, s.state, s.availability,
 		s.file_synced, s.final_published, s.directory_synced FROM recording_attempts a
@@ -197,6 +265,14 @@ func TestRecordingAttemptLifecycle(t *testing.T) {
 		segmentState != "FINALIZED" || availability != "FINAL" || fileSynced != 1 || finalPublished != 1 || directorySynced != 1 {
 		t.Fatalf("state=%s reason=%s bytes=%d segment=%s availability=%s flags=%d/%d/%d err=%v",
 			attemptState, reason, byteCount, segmentState, availability, fileSynced, finalPublished, directorySynced, err)
+	}
+	if err := store.reader.QueryRow(`SELECT terminal_reason FROM reservations WHERE id=?`, reservation.ID.Bytes()).Scan(&reservationReason); err != nil ||
+		reservationReason != "ATTEMPT_FINISHED" {
+		t.Fatalf("reservation reason=%s err=%v", reservationReason, err)
+	}
+	active, err = store.ReservationRecording(context.Background(), created.Number)
+	if err != nil || active {
+		t.Fatalf("finished recording=%v err=%v", active, err)
 	}
 	recoveryItems, err := store.RecoveryAttempts(context.Background(), recording.MaxRecoveryPage, catalogmodel.ID{})
 	if err != nil || len(recoveryItems) != 1 || recoveryItems[0].State != recording.AttemptSucceeded ||

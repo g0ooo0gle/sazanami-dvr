@@ -65,6 +65,20 @@ type ReservationRequest struct {
 	RequestedFollow   bool
 }
 
+// ReservationChangeはKonomiTVが返す完全な予約情報から、変更対象と照合条件を分離した値である。
+type ReservationChange struct {
+	Number  int32
+	Request ReservationRequest
+}
+
+// Validateは保存済み予約へ安全に照合できる変更要求かを検証する。
+func (change ReservationChange) Validate() error {
+	if change.Number < 1 || change.Request.Validate() != nil {
+		return errors.New("recording: invalid reservation change")
+	}
+	return nil
+}
+
 // Validateは番組表の候補照合へ使用できる値かを検証する。
 func (request ReservationRequest) Validate() error {
 	if request.Start.IsZero() || request.Start.Location() != time.UTC || request.Start.UnixMilli() < 0 ||

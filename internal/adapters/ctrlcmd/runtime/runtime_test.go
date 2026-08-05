@@ -43,6 +43,12 @@ func (emptyReservationOperations) Active(context.Context, int, int32) ([]recordi
 	return nil, nil
 }
 
+func (emptyReservationOperations) Change(context.Context, recording.ReservationChange) error {
+	return nil
+}
+func (emptyReservationOperations) Delete(context.Context, int32) error            { return nil }
+func (emptyReservationOperations) Recording(context.Context, int32) (bool, error) { return false, nil }
+
 func (catalog *recordingCatalog) CurrentProgramsByService(_ context.Context, _ catalogmodel.ID, limit int, after catalogmodel.ProgramCursor) ([]catalogmodel.CurrentProgram, error) {
 	result := make([]catalogmodel.CurrentProgram, 0, limit)
 	for _, program := range catalog.programs {

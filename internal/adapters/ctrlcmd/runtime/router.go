@@ -22,7 +22,7 @@ type Router struct {
 	limits       codec.Limits
 }
 
-// NewRecordingRouterは既存commandに番組表1029と予約2011／2013を加える。
+// NewRecordingRouterは番組表とKonomiTV向け予約・録画中確認commandを接続する。
 func NewRecordingRouter(snapshot programguide.Source, operations reservationadapter.Operations, clock status.Clock, limits codec.Limits) (*Router, error) {
 	if snapshot == nil || operations == nil {
 		return nil, stable("recording-snapshot-failed")
@@ -71,7 +71,8 @@ func (router *Router) Handle(ctx context.Context, request []byte, destination io
 		if router.programGuide != nil {
 			return router.programGuide.Handle(ctx, request, destination)
 		}
-	case reservationadapter.CommandList, reservationadapter.CommandAdd:
+	case reservationadapter.CommandList, reservationadapter.CommandAdd, reservationadapter.CommandChange,
+		reservationadapter.CommandDelete, reservationadapter.CommandRecordingOpen, reservationadapter.CommandRecordingClose:
 		if router.reservations != nil {
 			return router.reservations.Handle(ctx, request, destination)
 		}

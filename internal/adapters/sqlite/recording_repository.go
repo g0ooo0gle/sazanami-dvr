@@ -115,6 +115,71 @@ func (store *Store) ActiveReservations(ctx context.Context, limit int, after int
 	return result, nil
 }
 
+// UpdateReservationは変更不可の番組情報を照合し、録画開始前の設定だけを更新する。
+func (store *Store) UpdateReservation(ctx context.Context, change recording.ReservationChange, now time.Time) error {
+	if store == nil || store.writer == nil || ctx == nil || change.Validate() != nil || now.IsZero() ||
+		now.Location() != time.UTC || now.UnixMilli() < 0 {
+		return errors.New("sqlite: invalid reservation update")
+	}
+	request := change.Request
+	result, err := store.writer.ExecContext(ctx, `UPDATE reservations SET requested_priority=?, requested_follow=?,
+		version=version+1, updated_at_utc_ms=? WHERE id=(
+			SELECT reservation_id FROM ctrlcmd_reservation_ids WHERE reserve_id=?
+		) AND state='ACTIVE' AND network_id=? AND transport_stream_id=? AND service_id=? AND event_id=?
+		AND start_at_utc_ms=? AND duration_seconds=? AND NOT EXISTS (
+			SELECT 1 FROM recording_attempts WHERE reservation_id=reservations.id
+		)`, request.Priority, request.RequestedFollow, now.UnixMilli(), change.Number, request.NetworkID,
+		request.TransportStreamID, request.ServiceID, request.EventID, request.Start.UnixMilli(),
+		int64(request.Duration/time.Second))
+	if err != nil {
+		return sanitize("update-reservation", err)
+	}
+	if affected(result) != 1 {
+		return ErrReservationUnavailable
+	}
+	return nil
+}
+
+// CancelReservationは録画開始前の予約だけを終了状態へ進め、取消理由を残す。
+func (store *Store) CancelReservation(ctx context.Context, number int32, now time.Time) error {
+	if store == nil || store.writer == nil || ctx == nil || number < 1 || now.IsZero() ||
+		now.Location() != time.UTC || now.UnixMilli() < 0 {
+		return errors.New("sqlite: invalid reservation cancellation")
+	}
+	nowMS := now.UnixMilli()
+	result, err := store.writer.ExecContext(ctx, `UPDATE reservations SET state='FINISHED', version=version+1,
+		updated_at_utc_ms=?, finished_at_utc_ms=?, terminal_reason='CANCELLED_BY_USER' WHERE id=(
+			SELECT reservation_id FROM ctrlcmd_reservation_ids WHERE reserve_id=?
+		) AND state='ACTIVE' AND NOT EXISTS (
+			SELECT 1 FROM recording_attempts WHERE reservation_id=reservations.id
+		)`, nowMS, nowMS, number)
+	if err != nil {
+		return sanitize("cancel-reservation", err)
+	}
+	if affected(result) != 1 {
+		return ErrReservationUnavailable
+	}
+	return nil
+}
+
+// ReservationRecordingは予約に録画中の処理があるかを、DBを変更せずに返す。
+func (store *Store) ReservationRecording(ctx context.Context, number int32) (bool, error) {
+	if store == nil || store.reader == nil || ctx == nil || number < 1 {
+		return false, errors.New("sqlite: invalid recording status query")
+	}
+	var active int
+	err := store.reader.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1 FROM ctrlcmd_reservation_ids m
+		JOIN reservations r ON r.id=m.reservation_id
+		JOIN recording_attempts a ON a.reservation_id=r.id
+		WHERE m.reserve_id=? AND r.state='ACTIVE' AND a.state IN ('STARTING','RECORDING','FINALIZING')
+	)`, number).Scan(&active)
+	if err != nil {
+		return false, sanitize("read-recording-status", err)
+	}
+	return active == 1, nil
+}
+
 // NextActiveReservationはまだ録画処理へ割り当てていない予約を開始時刻順に一件だけ返す。
 func (store *Store) NextActiveReservation(ctx context.Context) (*recording.Reservation, error) {
 	if store == nil || store.reader == nil || ctx == nil {
@@ -386,7 +451,8 @@ func (store *Store) FinishAttempt(ctx context.Context, request recording.FinishR
 		return ErrAttemptState
 	}
 	result, err = tx.ExecContext(ctx, `UPDATE reservations SET state='FINISHED', version=version+1,
-		updated_at_utc_ms=?, finished_at_utc_ms=? WHERE id=? AND state='ACTIVE'`, nowMS, nowMS, reservationID)
+		updated_at_utc_ms=?, finished_at_utc_ms=?, terminal_reason='ATTEMPT_FINISHED'
+		WHERE id=? AND state='ACTIVE'`, nowMS, nowMS, reservationID)
 	if err != nil {
 		return sanitize("finish-recording-reservation", err)
 	}

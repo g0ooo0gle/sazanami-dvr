@@ -33,7 +33,7 @@ func openMigratedStore(t *testing.T) (string, *Store) {
 		t.Fatalf("before=%+v err=%v", before, err)
 	}
 	after, err := migrate(ctx, writer, 1785628800000)
-	if err != nil || after.State != StateCurrent || after.CurrentVersion != 3 {
+	if err != nil || after.State != StateCurrent || after.CurrentVersion != 4 {
 		t.Fatalf("after=%+v err=%v", after, err)
 	}
 	if err := writer.Close(); err != nil {
@@ -81,19 +81,19 @@ func TestMigrateVersionOneWithVerifiedBackup(t *testing.T) {
 	}
 	createVersionOneDatabase(t, root, true)
 	before, err := InspectDatabase(context.Background(), root)
-	if err != nil || before.State != StateBehind || before.CurrentVersion != 1 || before.TargetVersion != 3 {
+	if err != nil || before.State != StateBehind || before.CurrentVersion != 1 || before.TargetVersion != 4 {
 		t.Fatalf("before=%+v err=%v", before, err)
 	}
 	result, err := MigrateDatabaseWithBackup(context.Background(), root, MigrationRequest{
 		AppliedAt: time.UnixMilli(1785628800000).UTC(), BackupID: testID(t, 90), ProductVersion: "test",
 		ProductCommit: strings.Repeat("a", 40), Now: func() time.Time { return time.UnixMilli(1785628800001).UTC() },
 	})
-	if err != nil || result.Inspection.State != StateCurrent || result.Inspection.CurrentVersion != 3 || result.Backup == nil {
+	if err != nil || result.Inspection.State != StateCurrent || result.Inspection.CurrentVersion != 4 || result.Backup == nil {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
 	if result.Backup.Purpose != "pre_migration" || result.Backup.SchemaVersion != 1 ||
 		result.Backup.MigrationFromSchema == nil || *result.Backup.MigrationFromSchema != 1 ||
-		result.Backup.MigrationToSchema == nil || *result.Backup.MigrationToSchema != 3 {
+		result.Backup.MigrationToSchema == nil || *result.Backup.MigrationToSchema != 4 {
 		t.Fatalf("backup=%+v", result.Backup)
 	}
 	store, err := OpenStore(context.Background(), root)
@@ -138,19 +138,19 @@ func TestMigrateVersionTwoWithVerifiedBackup(t *testing.T) {
 	}
 	createVersionTwoDatabase(t, root)
 	before, err := InspectDatabase(context.Background(), root)
-	if err != nil || before.State != StateBehind || before.CurrentVersion != 2 || before.TargetVersion != 3 {
+	if err != nil || before.State != StateBehind || before.CurrentVersion != 2 || before.TargetVersion != 4 {
 		t.Fatalf("before=%+v err=%v", before, err)
 	}
 	result, err := MigrateDatabaseWithBackup(context.Background(), root, MigrationRequest{
 		AppliedAt: time.UnixMilli(1785628800000).UTC(), BackupID: testID(t, 86), ProductVersion: "test",
 		ProductCommit: strings.Repeat("c", 40), Now: func() time.Time { return time.UnixMilli(1785628800001).UTC() },
 	})
-	if err != nil || result.Inspection.State != StateCurrent || result.Inspection.CurrentVersion != 3 || result.Backup == nil {
+	if err != nil || result.Inspection.State != StateCurrent || result.Inspection.CurrentVersion != 4 || result.Backup == nil {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
 	if result.Backup.SchemaVersion != 2 || result.Backup.MigrationFromSchema == nil ||
 		*result.Backup.MigrationFromSchema != 2 || result.Backup.MigrationToSchema == nil ||
-		*result.Backup.MigrationToSchema != 3 {
+		*result.Backup.MigrationToSchema != 4 {
 		t.Fatalf("backup=%+v", result.Backup)
 	}
 	store, err := OpenStore(context.Background(), root)
@@ -173,6 +173,46 @@ func TestMigrateVersionTwoWithVerifiedBackup(t *testing.T) {
 		if err := store.reader.QueryRow(`SELECT count(*) FROM sqlite_schema WHERE type='table' AND name=?`, table).Scan(&count); err != nil || count != 1 {
 			t.Fatalf("table=%s count=%d err=%v", table, count, err)
 		}
+	}
+}
+
+func TestMigrateVersionThreeAddsReservationTerminalReason(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	createVersionThreeDatabase(t, root)
+	result, err := MigrateDatabaseWithBackup(context.Background(), root, MigrationRequest{
+		AppliedAt: time.UnixMilli(1785628800000).UTC(), BackupID: testID(t, 82), ProductVersion: "test",
+		ProductCommit: strings.Repeat("d", 40), Now: func() time.Time { return time.UnixMilli(1785628800001).UTC() },
+	})
+	if err != nil || result.Inspection.CurrentVersion != 4 || result.Backup == nil ||
+		result.Backup.MigrationFromSchema == nil || *result.Backup.MigrationFromSchema != 3 ||
+		result.Backup.MigrationToSchema == nil || *result.Backup.MigrationToSchema != 4 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	store, err := OpenStore(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	rows, err := store.reader.Query(`PRAGMA table_info(reservations)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	found := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, kind string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatal(err)
+		}
+		found = found || name == "terminal_reason"
+	}
+	if err := rows.Err(); err != nil || !found {
+		t.Fatalf("terminal_reason=%v err=%v", found, err)
 	}
 }
 
@@ -336,6 +376,36 @@ func createVersionTwoDatabase(t *testing.T, root string) {
 	}
 }
 
+func createVersionThreeDatabase(t *testing.T, root string) {
+	t.Helper()
+	database, err := openWriter(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	migrations, err := embeddedMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := database.BeginTx(context.Background(), &sql.TxOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	for _, item := range migrations[:3] {
+		if _, err := tx.Exec(item.content); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(`INSERT INTO schema_migrations(version, name, checksum, applied_at_utc_ms) VALUES (?, ?, ?, 1)`,
+			item.version, item.name, item.checksum[:]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestMigrationStateClassification(t *testing.T) {
 	t.Run("unversioned nonempty", func(t *testing.T) {
 		database := openMemoryDatabase(t)
@@ -356,7 +426,7 @@ func TestMigrationStateClassification(t *testing.T) {
 		if _, err := migrate(context.Background(), database, 1); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := database.Exec(`INSERT INTO schema_migrations VALUES (4, 'future', zeroblob(32), 2)`); err != nil {
+		if _, err := database.Exec(`INSERT INTO schema_migrations VALUES (5, 'future', zeroblob(32), 2)`); err != nil {
 			t.Fatal(err)
 		}
 		got, err := inspect(context.Background(), database)
@@ -668,9 +738,10 @@ func TestEmbeddedMigrationChecksumAndLimits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(migrations) != 3 || migrations[0].version != 1 || migrations[0].name != "catalog_v1" ||
+	if len(migrations) != 4 || migrations[0].version != 1 || migrations[0].name != "catalog_v1" ||
 		migrations[1].version != 2 || migrations[1].name != "mirakurun_catalog_limits" ||
-		migrations[2].version != 3 || migrations[2].name != "first_recording" {
+		migrations[2].version != 3 || migrations[2].name != "first_recording" ||
+		migrations[3].version != 4 || migrations[3].name != "reservation_terminal_reason" {
 		t.Fatalf("migrations=%+v", migrations)
 	}
 	if got := sha256.Sum256([]byte(migrations[0].content)); got != migrations[0].checksum {
