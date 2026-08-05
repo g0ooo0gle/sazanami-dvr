@@ -79,6 +79,9 @@ mkdir -m 700 <recording-root>
 
 このプロセスは、起動しただけではMirakurunへ接続しません。保存済み予約の開始時刻になったときだけ放送ストリームを開きます。停止には`SIGINT`または`SIGTERM`を使います。詳しくは[録画機能の運用手順](docs/recording-operations.md)を参照してください。
 
+KonomiTV側の設定と、画面から一件確認する手順は
+[KonomiTVと接続する](docs/konomitv-setup.md)を参照してください。
+
 ## その他のコマンド
 
 保存済みの情報をWebUIで確認します。
