@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +18,7 @@ import (
 	ctrlcmdruntime "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/runtime"
 	mirakurunadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/provider/mirakurun"
 	sqliteadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/sqlite"
+	autoreservationapp "github.com/g0ooo0gle/sazanami-dvr/internal/app/autoreservation"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/app/catalogrefresh"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/app/catalogsync"
 	recordingapp "github.com/g0ooo0gle/sazanami-dvr/internal/app/recording"
@@ -104,17 +106,29 @@ func TestRecordingCatalogRefreshPublishesOnlyValidatedGeneration(t *testing.T) {
 	state.service = "更新後の局"
 	state.Unlock()
 	followCalls := 0
+	automaticCalls := 0
+	observedAutomaticError := false
 	operation := &recordingCatalogRefresh{
 		dataRoot: root, channelMap: channelMap, provider: provider, store: store, holder: holder, clock: wallClock{},
 		follow: func(context.Context) (recordingapp.FollowResult, error) {
 			followCalls++
 			return recordingapp.FollowResult{}, nil
 		},
+		automatic: func(context.Context) (autoreservationapp.Result, error) {
+			automaticCalls++
+			return autoreservationapp.Result{}, errors.New("private automatic failure")
+		},
+		observeAutomatic: func(_ autoreservationapp.Result, err error, _ time.Duration) {
+			observedAutomaticError = err != nil
+		},
 	}
 	result, reason, err := operation.sync(context.Background())
-	if err != nil || reason != "" || result.Services != 1 || result.Programs != 1 || holder.Load() == initial || followCalls != 1 {
-		t.Fatalf("result=%+v reason=%q switched=%v follows=%d err=%v", result, reason, holder.Load() != initial, followCalls, err)
+	if err != nil || reason != "" || result.Services != 1 || result.Programs != 1 || holder.Load() == initial ||
+		followCalls != 1 || automaticCalls != 1 || !observedAutomaticError {
+		t.Fatalf("result=%+v reason=%q switched=%v follows=%d automatic=%d observed=%v err=%v",
+			result, reason, holder.Load() != initial, followCalls, automaticCalls, observedAutomaticError, err)
 	}
+	operation.automatic = nil
 	value, err := holder.Load().Current(context.Background())
 	if err != nil || len(value.Services) != 1 || value.Services[0].ServiceName != "更新後の局" {
 		t.Fatalf("snapshot=%+v err=%v", value, err)
@@ -195,6 +209,25 @@ func TestCatalogRefreshOutputIsBoundedAndRedacted(t *testing.T) {
 	observe(catalogrefresh.Event{Reason: "catalog-refresh-provider-failed", DurationMS: 5})
 	wantOutput := "catalog_refresh result=completed services=2 programs=3 duration_ms=4\n"
 	wantDiagnostic := "catalog_refresh result=failed reason=catalog-refresh-provider-failed duration_ms=5\n"
+	if output.String() != wantOutput || diagnostic.String() != wantDiagnostic {
+		t.Fatalf("output=%q diagnostic=%q", output.String(), diagnostic.String())
+	}
+	for _, private := range []string{"http://", "/home/", "番組", "private"} {
+		if strings.Contains(output.String(), private) || strings.Contains(diagnostic.String(), private) {
+			t.Fatalf("private value=%q", private)
+		}
+	}
+}
+
+func TestAutomaticReservationOutputIsBoundedAndRedacted(t *testing.T) {
+	var output, diagnostic bytes.Buffer
+	observe := observeAutomaticReservation(&output, &diagnostic)
+	observe(autoreservationapp.Result{
+		Rules: 2, Programs: 3, Matched: 4, Created: 5, Duplicates: 6, UnavailableRules: 7, LimitReached: true,
+	}, nil, 8*time.Millisecond)
+	observe(autoreservationapp.Result{}, errors.New("private program and path"), 9*time.Millisecond)
+	wantOutput := "automatic_reservation result=completed rules=2 programs=3 matched=4 created=5 duplicates=6 unavailable_rules=7 limit_reached=true duration_ms=8\n"
+	wantDiagnostic := "automatic_reservation result=failed reason=evaluation-failed duration_ms=9\n"
 	if output.String() != wantOutput || diagnostic.String() != wantDiagnostic {
 		t.Fatalf("output=%q diagnostic=%q", output.String(), diagnostic.String())
 	}

@@ -13,12 +13,14 @@ import (
 	"testing"
 	"time"
 
+	autoreservationadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/autoreservation"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/channel"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/codec"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/filecopy2"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/programguide"
 	reservationadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/reservation"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/status"
+	coreautoreservation "github.com/g0ooo0gle/sazanami-dvr/internal/core/autoreservation"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/catalogmodel"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/recording"
 )
@@ -36,6 +38,26 @@ type recordingCatalog struct {
 }
 
 type emptyReservationOperations struct{}
+
+type emptyAutomaticReservationOperations struct{}
+
+func (emptyAutomaticReservationOperations) Add(context.Context, coreautoreservation.SearchCondition,
+	coreautoreservation.RecordingSettings,
+) (coreautoreservation.Rule, error) {
+	return coreautoreservation.Rule{}, nil
+}
+
+func (emptyAutomaticReservationOperations) List(context.Context, int, int32) ([]coreautoreservation.Rule, error) {
+	return nil, nil
+}
+
+func (emptyAutomaticReservationOperations) Change(context.Context, int32, coreautoreservation.SearchCondition,
+	coreautoreservation.RecordingSettings,
+) error {
+	return nil
+}
+
+func (emptyAutomaticReservationOperations) Delete(context.Context, int32) error { return nil }
 
 func (emptyReservationOperations) Add(context.Context, recording.ReservationRequest) (recording.Reservation, error) {
 	return recording.Reservation{}, nil
@@ -332,6 +354,32 @@ func TestRecordingRouterDispatchesReservationList(t *testing.T) {
 	}
 	frame, err := codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
 	if err != nil || frame.Code != reservationadapter.ResultSuccess {
+		t.Fatalf("frame=%+v err=%v", frame, err)
+	}
+}
+
+func TestRecordingRouterDispatchesAutomaticReservationList(t *testing.T) {
+	root, path, base, _ := validFixture(t)
+	catalog := &recordingCatalog{fakeCatalog: base}
+	snapshot, err := BuildSnapshot(context.Background(), root, path, catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router, err := NewRecordingRouterWithAutomatic(snapshot, emptyReservationOperations{},
+		emptyAutomaticReservationOperations{}, SystemClock{}, codec.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := make([]byte, 10)
+	binary.LittleEndian.PutUint32(request[0:4], uint32(autoreservationadapter.CommandList))
+	binary.LittleEndian.PutUint32(request[4:8], 2)
+	binary.LittleEndian.PutUint16(request[8:10], autoreservationadapter.Version)
+	var response bytes.Buffer
+	if err := router.Handle(context.Background(), request, &response); err != nil {
+		t.Fatal(err)
+	}
+	frame, err := codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
+	if err != nil || frame.Code != 1 {
 		t.Fatalf("frame=%+v err=%v", frame, err)
 	}
 }

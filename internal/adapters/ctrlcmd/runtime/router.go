@@ -5,6 +5,7 @@ import (
 	"io"
 	"time"
 
+	autoreservationadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/autoreservation"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/channel"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/codec"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/filecopy2"
@@ -20,7 +21,23 @@ type Router struct {
 	snapshots    SnapshotLoader
 	recording    bool
 	reservations *reservationadapter.Handler
+	automatic    *autoreservationadapter.Handler
 	limits       codec.Limits
+}
+
+// NewRecordingRouterWithAutomaticは番組表、通常予約、自動予約の対応済みcommandを接続する。
+func NewRecordingRouterWithAutomatic(snapshots SnapshotLoader, reservations reservationadapter.Operations,
+	automatic autoreservationadapter.Operations, clock status.Clock, limits codec.Limits,
+) (*Router, error) {
+	if automatic == nil {
+		return nil, stable("recording-snapshot-failed")
+	}
+	router, err := NewRecordingRouter(snapshots, reservations, clock, limits)
+	if err != nil {
+		return nil, err
+	}
+	router.automatic = &autoreservationadapter.Handler{Operations: automatic, Limits: limits}
+	return router, nil
 }
 
 // NewRecordingRouterは番組表とKonomiTV向け予約・録画中確認commandを接続する。
@@ -83,6 +100,11 @@ func (router *Router) Handle(ctx context.Context, request []byte, destination io
 		reservationadapter.CommandDelete, reservationadapter.CommandRecordingOpen, reservationadapter.CommandRecordingClose:
 		if router.reservations != nil {
 			return router.reservations.Handle(ctx, request, destination)
+		}
+	case autoreservationadapter.CommandList, autoreservationadapter.CommandAdd, autoreservationadapter.CommandChange,
+		autoreservationadapter.CommandDelete:
+		if router.automatic != nil {
+			return router.automatic.Handle(ctx, request, destination)
 		}
 	default:
 	}
