@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	ctrlcmdruntime "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/runtime"
 	mirakurunadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/provider/mirakurun"
 	sqliteadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/sqlite"
+	autoreservationapp "github.com/g0ooo0gle/sazanami-dvr/internal/app/autoreservation"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/app/catalogrefresh"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/app/catalogsync"
 	recordingapp "github.com/g0ooo0gle/sazanami-dvr/internal/app/recording"
@@ -17,13 +19,15 @@ import (
 
 // recordingCatalogRefreshは一回分のMirakurun取得、候補検証、完了、公開を順に実行する。
 type recordingCatalogRefresh struct {
-	dataRoot   string
-	channelMap string
-	provider   *mirakurunadapter.Adapter
-	store      *sqliteadapter.Store
-	holder     *ctrlcmdruntime.SnapshotHolder
-	clock      wallClock
-	follow     func(context.Context) (recordingapp.FollowResult, error)
+	dataRoot         string
+	channelMap       string
+	provider         *mirakurunadapter.Adapter
+	store            *sqliteadapter.Store
+	holder           *ctrlcmdruntime.SnapshotHolder
+	clock            wallClock
+	follow           func(context.Context) (recordingapp.FollowResult, error)
+	automatic        func(context.Context) (autoreservationapp.Result, error)
+	observeAutomatic func(autoreservationapp.Result, error, time.Duration)
 }
 
 func (operation *recordingCatalogRefresh) sync(ctx context.Context) (catalogrefresh.Result, string, error) {
@@ -71,6 +75,13 @@ func (operation *recordingCatalogRefresh) sync(ctx context.Context) (catalogrefr
 			return catalogrefresh.Result{}, "catalog-refresh-follow-failed", err
 		}
 	}
+	if operation.automatic != nil {
+		started := time.Now()
+		automaticResult, automaticErr := operation.automatic(ctx)
+		if operation.observeAutomatic != nil {
+			operation.observeAutomatic(automaticResult, automaticErr, time.Since(started))
+		}
+	}
 	return catalogrefresh.Result{Services: result.Services, Programs: result.Programs}, "", nil
 }
 
@@ -84,6 +95,18 @@ func refreshFailureReason(err error) string {
 		return "catalog-refresh-channel-mismatch"
 	default:
 		return "catalog-refresh-internal"
+	}
+}
+
+func observeAutomaticReservation(stdout, stderr io.Writer) func(autoreservationapp.Result, error, time.Duration) {
+	return func(result autoreservationapp.Result, err error, duration time.Duration) {
+		if err != nil {
+			fmt.Fprintf(stderr, "automatic_reservation result=failed reason=evaluation-failed duration_ms=%d\n", duration.Milliseconds())
+			return
+		}
+		fmt.Fprintf(stdout, "automatic_reservation result=completed rules=%d programs=%d matched=%d created=%d duplicates=%d unavailable_rules=%d limit_reached=%t duration_ms=%d\n",
+			result.Rules, result.Programs, result.Matched, result.Created, result.Duplicates,
+			result.UnavailableRules, result.LimitReached, duration.Milliseconds())
 	}
 }
 

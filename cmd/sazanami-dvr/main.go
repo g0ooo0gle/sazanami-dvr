@@ -23,6 +23,7 @@ import (
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/recordingfs"
 	sqliteadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/sqlite"
 	webuiadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/webui"
+	autoreservationapp "github.com/g0ooo0gle/sazanami-dvr/internal/app/autoreservation"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/app/catalogrefresh"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/app/catalogsync"
 	ctrlcmdapp "github.com/g0ooo0gle/sazanami-dvr/internal/app/ctrlcmd"
@@ -204,7 +205,9 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	reservations := recordingapp.ReservationService{
 		Catalog: snapshots, Store: store, Clock: recordingClock, NewID: catalogmodel.NewID, OnAdded: scheduler.Notify,
 	}
-	router, err := ctrlcmdruntime.NewRecordingRouter(snapshots, reservations, ctrlcmdruntime.SystemClock{}, codec.DefaultLimits())
+	automaticRules := autoreservationapp.RuleService{Store: store, Clock: recordingClock, NewID: catalogmodel.NewID}
+	router, err := ctrlcmdruntime.NewRecordingRouterWithAutomatic(snapshots, reservations, automaticRules,
+		ctrlcmdruntime.SystemClock{}, codec.DefaultLimits())
 	if err != nil {
 		return errorsStable("recording-router-failed")
 	}
@@ -230,6 +233,14 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 		follow: (recordingapp.FollowService{
 			Store: store, Clock: recordingClock, OnUpdated: scheduler.Notify,
 		}).Run,
+		automatic: func(evaluationContext context.Context) (autoreservationapp.Result, error) {
+			return (autoreservationapp.Evaluator{
+				Store: store, Catalog: snapshots.Load(), Clock: recordingClock, NewID: catalogmodel.NewID,
+				IsDuplicate: func(err error) bool { return errors.Is(err, sqliteadapter.ErrAutomaticReservationDuplicate) },
+				OnCreated:   scheduler.Notify,
+			}).Run(evaluationContext)
+		},
+		observeAutomatic: observeAutomaticReservation(stdout, stderr),
 	}
 	refresher := catalogrefresh.Runner{
 		Interval: *refreshInterval, Sync: refreshOperation.sync, Observe: observeCatalogRefresh(stdout, stderr),

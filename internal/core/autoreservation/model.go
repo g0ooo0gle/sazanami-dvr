@@ -117,6 +117,7 @@ func validateValues(search SearchCondition, settings RecordingSettings) error {
 	if !validText(search.Keyword) || !validText(search.Exclude) || len(search.Services) > maxServices ||
 		len(search.Contents) > maxContents || len(search.Dates) > maxDates || len(search.Video) > maxComponents ||
 		len(search.Audio) > maxComponents || search.FreeAccess > 2 ||
+		search.CheckRecordedDays > 9_999 ||
 		(search.MinimumMinutes > 0 && search.MaximumMinutes > 0 && search.MinimumMinutes > search.MaximumMinutes) {
 		return errors.New("autoreservation: invalid search condition")
 	}

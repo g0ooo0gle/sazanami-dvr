@@ -9,6 +9,7 @@ import (
 	"hash"
 	"sort"
 	"strconv"
+	"time"
 
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/channel"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/catalogmodel"
@@ -201,6 +202,43 @@ func (snapshot *Snapshot) CurrentProgramsForService(ctx context.Context, service
 	}
 	return snapshot.programs.ProgramsForServiceForGeneration(ctx, snapshot.backendID, snapshot.generationID,
 		serviceLocator, limit, afterEvent)
+}
+
+// ReservationRequestForProgramは固定世代の番組を既存予約照合に使う放送IDへ変換する。
+func (snapshot *Snapshot) ReservationRequestForProgram(program catalogmodel.CurrentProgram, priority uint8,
+	follow bool,
+) (recording.ReservationRequest, error) {
+	if snapshot == nil || program.RawEventID == nil || *program.RawEventID < 0 || *program.RawEventID > 65_535 ||
+		program.Material.StartUTCMS == nil || program.Material.DurationMS == nil ||
+		*program.Material.StartUTCMS < 0 || *program.Material.DurationMS < 1_000 ||
+		*program.Material.DurationMS > int64((24*time.Hour)/time.Millisecond) ||
+		*program.Material.DurationMS%1_000 != 0 || program.Material.Validation != catalogmodel.ValidationValid {
+		return recording.ReservationRequest{}, stable("program-not-reservable")
+	}
+	var selected *channel.Service
+	for index := range snapshot.value.Services {
+		service := &snapshot.value.Services[index]
+		if service.ProviderLocator == program.ServiceLocator {
+			if selected != nil {
+				return recording.ReservationRequest{}, stable("program-not-reservable")
+			}
+			selected = service
+		}
+	}
+	if selected == nil {
+		return recording.ReservationRequest{}, stable("program-not-reservable")
+	}
+	request := recording.ReservationRequest{
+		NetworkID: selected.NetworkID, TransportStreamID: selected.TransportStreamID,
+		ServiceID: selected.ServiceID, EventID: uint16(*program.RawEventID),
+		Start:    time.UnixMilli(*program.Material.StartUTCMS).UTC(),
+		Duration: time.Duration(*program.Material.DurationMS) * time.Millisecond,
+		Priority: priority, RequestedFollow: follow,
+	}
+	if request.Validate() != nil {
+		return recording.ReservationRequest{}, stable("program-not-reservable")
+	}
+	return request, nil
 }
 
 func findBackend(ctx context.Context, reader CatalogReader, target catalogmodel.ID) (catalogmodel.CurrentBackend, error) {
