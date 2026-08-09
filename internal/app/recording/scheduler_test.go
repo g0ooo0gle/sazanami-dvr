@@ -2,6 +2,7 @@ package recording
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -152,6 +153,44 @@ func TestSchedulerWaitsForNotificationWithoutPolling(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+type schedulerErrorStore struct {
+	err    error
+	before func()
+}
+
+func (store schedulerErrorStore) NextActiveReservation(context.Context) (*core.Reservation, error) {
+	if store.before != nil {
+		store.before()
+	}
+	return nil, store.err
+}
+
+func TestSchedulerTreatsDatabaseCancellationAsCleanShutdown(t *testing.T) {
+	clock := &manualScheduleClock{now: time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)}
+	executor := &schedulerExecutor{clock: clock}
+	ctx, cancel := context.WithCancel(context.Background())
+	store := schedulerErrorStore{err: context.Canceled, before: cancel}
+	scheduler, err := NewScheduler(store, executor, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := scheduler.Run(ctx); err != nil {
+		t.Fatalf("停止によるDB取消しが失敗扱いになりました: %v", err)
+	}
+}
+
+func TestSchedulerKeepsDatabaseFailureWhileRunning(t *testing.T) {
+	clock := &manualScheduleClock{now: time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)}
+	executor := &schedulerExecutor{clock: clock}
+	scheduler, err := NewScheduler(schedulerErrorStore{err: errors.New("database failed")}, executor, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := scheduler.Run(context.Background()); err == nil {
+		t.Fatal("稼働中のDB失敗が正常停止扱いになりました")
 	}
 }
 
