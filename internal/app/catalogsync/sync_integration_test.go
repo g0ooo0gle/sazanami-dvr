@@ -209,8 +209,9 @@ func TestUnverifiedEIDReuseRemainsAmbiguous(t *testing.T) {
 		t.Fatal(err)
 	}
 	programs, err := store.CurrentPrograms(context.Background(), backendID, 16, catalogmodel.ID{})
-	if err != nil || len(programs) != 0 {
-		t.Fatalf("未解決の再利用がcurrentへ公開されました: programs=%+v err=%v", programs, err)
+	if err != nil || len(programs) != 1 || programs[0].Classification != catalogmodel.Ambiguous ||
+		programs[0].RevisionNumber != 1 || *programs[0].Material.Title != "元の番組" {
+		t.Fatalf("曖昧な変更で元revisionを維持できませんでした: programs=%+v err=%v", programs, err)
 	}
 	request.CorrelationID = "original-again"
 	request.VerifiedFakeLineage = true
@@ -256,6 +257,41 @@ func TestMirakurunCannotClaimVerifiedSuccessor(t *testing.T) {
 	if _, err := (catalogsync.Service{Provider: newHarness(t, "不正", nil).Catalog, Repository: store, Clock: clock}).Sync(
 		context.Background(), request); err == nil {
 		t.Fatal("実providerがFake専用lineageを受理しました")
+	}
+}
+
+func TestMirakurunBoundedChangeCreatesSuccessor(t *testing.T) {
+	_, store := migratedStore(t)
+	clock := &advancingClock{now: time.Date(2026, 8, 2, 0, 0, 0, 0, time.UTC)}
+	backendID := mustCatalogID(t, 44)
+	backend := catalogmodel.Backend{ID: backendID, Kind: "MIRAKURUN", IdentityHash: sha256.Sum256([]byte("mirakurun:bounded"))}
+	request := catalogsync.Request{Backend: backend, CorrelationID: "original", ServicePageLimit: 16, ProgramPageLimit: 16}
+	eventID := uint16(10)
+	withEvent := func(config *fake.Config) { config.ProgramPages[0].Items[0].EventID = &eventID }
+	if _, err := (catalogsync.Service{Provider: newHarness(t, "元の番組", withEvent).Catalog, Repository: store, Clock: clock}).Sync(
+		context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	request.CorrelationID = "bounded-change"
+	changed := func(config *fake.Config) {
+		withEvent(config)
+		start := config.ProgramPages[0].Items[0].Start.Add(10 * time.Minute)
+		duration := 35 * time.Minute
+		config.ProgramPages[0].Items[0].Start = &start
+		config.ProgramPages[0].Items[0].Duration = &duration
+	}
+	if _, err := (catalogsync.Service{Provider: newHarness(t, "変更後の番組", changed).Catalog, Repository: store, Clock: clock}).Sync(
+		context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	programs, err := store.CurrentPrograms(context.Background(), backendID, 16, catalogmodel.ID{})
+	if err != nil || len(programs) != 1 || programs[0].RevisionNumber != 2 ||
+		programs[0].Classification != catalogmodel.VerifiedSuccessor || *programs[0].Material.Title != "変更後の番組" {
+		t.Fatalf("bounded successor=%+v err=%v", programs, err)
+	}
+	services, err := store.CurrentServices(context.Background(), backendID, 16, catalogmodel.ID{})
+	if err != nil || len(services) != 1 || services[0].Validation == catalogmodel.ValidationInvalid {
+		t.Fatalf("services=%+v err=%v", services, err)
 	}
 }
 

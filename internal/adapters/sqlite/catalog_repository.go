@@ -95,8 +95,12 @@ func (store *Store) StorePrograms(ctx context.Context, syncID catalogmodel.ID, v
 	if err != nil {
 		return err
 	}
+	providerKind, err := runningBackendKind(ctx, tx, syncID)
+	if err != nil {
+		return err
+	}
 	for _, observation := range observations {
-		if err := storeProgram(ctx, tx, syncID, backendID, verifiedFakeLineage, observation); err != nil {
+		if err := storeProgram(ctx, tx, syncID, backendID, providerKind, verifiedFakeLineage, observation); err != nil {
 			return err
 		}
 	}
@@ -673,6 +677,16 @@ func runningBackend(ctx context.Context, tx *sql.Tx, syncID catalogmodel.ID) ([]
 	return backend, nil
 }
 
+func runningBackendKind(ctx context.Context, tx *sql.Tx, syncID catalogmodel.ID) (string, error) {
+	var kind string
+	if err := tx.QueryRowContext(ctx, `SELECT b.provider_kind FROM catalog_syncs s
+		JOIN backend_instances b ON b.id=s.backend_instance_id
+		WHERE s.id=? AND s.state='RUNNING'`, syncID.Bytes()).Scan(&kind); err != nil {
+		return "", sanitize("read-running-backend-kind", err)
+	}
+	return kind, nil
+}
+
 func storeService(ctx context.Context, tx *sql.Tx, syncID catalogmodel.ID, backendID []byte, observation catalogmodel.ServiceObservation) error {
 	if !validText(observation.ProviderLocator, 1, 256) || !validText(observation.DisplayName, 0, 4096) ||
 		!validOptionalText(observation.BroadcastKind, 32) || !validOptionalText(observation.TuningTarget, 256) ||
@@ -717,7 +731,9 @@ func storeService(ctx context.Context, tx *sql.Tx, syncID catalogmodel.ID, backe
 	return nil
 }
 
-func storeProgram(ctx context.Context, tx *sql.Tx, syncID catalogmodel.ID, backendID []byte, verified bool, observation catalogmodel.ProgramObservation) error {
+func storeProgram(ctx context.Context, tx *sql.Tx, syncID catalogmodel.ID, backendID []byte, providerKind string,
+	verifiedFakeLineage bool, observation catalogmodel.ProgramObservation,
+) error {
 	if !validText(observation.ServiceLocator, 1, 256) || !validText(observation.EventLocator, 1, 256) ||
 		!validStableReasonPointer(observation.Reason) {
 		return errors.New("sqlite: invalid program observation")
@@ -744,11 +760,14 @@ func storeProgram(ctx context.Context, tx *sql.Tx, syncID catalogmodel.ID, backe
 
 	var instanceID catalogmodel.ID
 	var instanceIDBytes []byte
-	err := tx.QueryRowContext(ctx, `SELECT id FROM program_instances WHERE service_id=? AND provider_event_locator=?`,
-		serviceID.Bytes(), observation.EventLocator).Scan(&instanceIDBytes)
+	var previousEventID sql.NullInt64
+	var previousSeenMS int64
+	err := tx.QueryRowContext(ctx, `SELECT id, raw_event_id, last_seen_at_utc_ms FROM program_instances
+		WHERE service_id=? AND provider_event_locator=?`, serviceID.Bytes(), observation.EventLocator).
+		Scan(&instanceIDBytes, &previousEventID, &previousSeenMS)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		return insertNewProgram(ctx, tx, syncID, serviceID, verified, observation, hash)
+		return insertNewProgram(ctx, tx, syncID, serviceID, verifiedFakeLineage, observation, hash)
 	case err != nil:
 		return sanitize("find-program-instance", err)
 	}
@@ -760,43 +779,64 @@ func storeProgram(ctx context.Context, tx *sql.Tx, syncID catalogmodel.ID, backe
 	var revisionIDBytes []byte
 	var latestHash []byte
 	var revisionNumber int64
+	var previousStart, previousDuration, previousFree sql.NullInt64
+	var previousTitle, previousDescription sql.NullString
+	var previousValidation string
 	if err := tx.QueryRowContext(ctx, `
-		SELECT id, content_hash, revision_number FROM program_revisions
-		WHERE program_instance_id=? ORDER BY revision_number DESC LIMIT 1`, instanceID.Bytes()).Scan(&revisionIDBytes, &latestHash, &revisionNumber); err != nil {
+		SELECT id, content_hash, revision_number, start_at_utc_ms, duration_ms, title, description,
+		       free_access, validation_state FROM program_revisions
+		WHERE program_instance_id=? ORDER BY revision_number DESC LIMIT 1`, instanceID.Bytes()).
+		Scan(&revisionIDBytes, &latestHash, &revisionNumber, &previousStart, &previousDuration,
+			&previousTitle, &previousDescription, &previousFree, &previousValidation); err != nil {
 		return sanitize("read-latest-revision", err)
 	}
 	if err := copyExact(revisionID[:], revisionIDBytes); err != nil {
 		return err
 	}
+	observedAt, err := syncStartedAt(ctx, tx, syncID)
+	if err != nil {
+		return err
+	}
 	if bytesEqual(latestHash, hash[:]) {
+		if err := touchProgramInstance(ctx, tx, instanceID, observedAt); err != nil {
+			return err
+		}
 		return insertProgramObservation(ctx, tx, syncID, observation, hash, instanceID, revisionID, catalogmodel.SameContent)
 	}
+	previousMaterial := materialFromSQL(previousStart, previousDuration, previousTitle, previousDescription,
+		previousFree, previousValidation)
+	var previousEventPointer *int64
+	if previousEventID.Valid {
+		previousEventPointer = &previousEventID.Int64
+	}
+	verified := verifiedFakeLineage || providerKind == "MIRAKURUN" && catalogmodel.MirakurunSuccessor(
+		previousMaterial, previousEventPointer, previousSeenMS, observation.Material, observation.RawEventID, observedAt)
 	if !verified {
-		_, err := tx.ExecContext(ctx, `
-			INSERT INTO program_observations(sync_id, provider_service_locator, provider_event_locator,
-			 raw_event_id, content_hash, classification, validation_reason)
-			VALUES (?, ?, ?, ?, ?, 'AMBIGUOUS', ?)`, syncID.Bytes(), observation.ServiceLocator,
-			observation.EventLocator, observation.RawEventID, hash[:], stableReason(observation.Reason, "lineage-unverified"))
-		if err != nil {
-			return sanitize("insert-ambiguous-program", err)
+		if err := touchProgramInstance(ctx, tx, instanceID, observedAt); err != nil {
+			return err
 		}
-		return nil
+		return insertProgramObservation(ctx, tx, syncID, observation, hash, instanceID, revisionID, catalogmodel.Ambiguous)
 	}
 	newRevisionID, err := catalogmodel.NewID()
 	if err != nil {
 		return errors.New("sqlite: generate revision id")
 	}
-	createdAt, err := syncStartedAt(ctx, tx, syncID)
-	if err != nil {
+	if err := insertRevision(ctx, tx, newRevisionID, instanceID, revisionNumber+1, hash, observation.Material, observedAt); err != nil {
 		return err
 	}
-	if err := insertRevision(ctx, tx, newRevisionID, instanceID, revisionNumber+1, hash, observation.Material, createdAt); err != nil {
+	if err := touchProgramInstance(ctx, tx, instanceID, observedAt); err != nil {
 		return err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE program_instances SET last_seen_at_utc_ms=? WHERE id=?`, createdAt, instanceID.Bytes()); err != nil {
-		return sanitize("touch-program-instance", err)
 	}
 	return insertProgramObservation(ctx, tx, syncID, observation, hash, instanceID, newRevisionID, catalogmodel.VerifiedSuccessor)
+}
+
+func touchProgramInstance(ctx context.Context, tx *sql.Tx, instanceID catalogmodel.ID, observedAt int64) error {
+	result, err := tx.ExecContext(ctx, `UPDATE program_instances SET last_seen_at_utc_ms=?
+		WHERE id=? AND last_seen_at_utc_ms<=?`, observedAt, instanceID.Bytes(), observedAt)
+	if err != nil {
+		return sanitize("touch-program-instance", err)
+	}
+	return requireOneRow(result, "touch-program-instance-conflict")
 }
 
 func insertNewProgram(ctx context.Context, tx *sql.Tx, syncID, serviceID catalogmodel.ID, verified bool, observation catalogmodel.ProgramObservation, hash [32]byte) error {

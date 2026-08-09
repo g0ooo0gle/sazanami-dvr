@@ -475,7 +475,7 @@ func readListedReservation(reader *codec.Reader, want recording.Reservation) err
 			return err
 		}
 		priority, follow, err := decodeSettings(item)
-		if err != nil || priority != want.Priority || follow {
+		if err != nil || priority != want.Priority || follow != want.EffectiveFollow {
 			return fmt.Errorf("priority=%d follow=%v err=%v", priority, follow, err)
 		}
 		if _, err := item.I32(); err != nil {
@@ -497,7 +497,8 @@ func readListedReservation(reader *codec.Reader, want recording.Reservation) err
 func listedReservation(number int32) recording.Reservation {
 	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
 	return recording.Reservation{
-		Number: number, Version: 1, State: recording.ReservationActive, Priority: 3, RequestedFollow: true,
+		Number: number, Version: 1, State: recording.ReservationActive, Priority: 3,
+		RequestedFollow: true, EffectiveFollow: true,
 		Program: recording.ProgramSnapshot{
 			NetworkID: 1, TransportStreamID: 2, ServiceID: 3, EventID: 4,
 			Title: "server title", StationName: "server station", Start: start, Duration: 30 * time.Minute,

@@ -65,6 +65,7 @@ func (service ReservationService) Add(ctx context.Context, request recording.Res
 	if err != nil {
 		return recording.Reservation{}, err
 	}
+	reservation.EffectiveFollow = reservation.RequestedFollow
 	if service.OnAdded != nil {
 		service.OnAdded()
 	}

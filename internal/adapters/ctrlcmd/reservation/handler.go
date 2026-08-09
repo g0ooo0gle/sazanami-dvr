@@ -510,7 +510,7 @@ func writeReservation(writer *codec.Writer, reservation recording.Reservation, l
 	if err := writer.SystemTime(reservation.Program.Start); err != nil {
 		return err
 	}
-	if err := writeSettings(writer, reservation.Priority); err != nil {
+	if err := writeSettings(writer, reservation.Priority, reservation.EffectiveFollow); err != nil {
 		return err
 	}
 	if err := writer.I32(0); err != nil {
@@ -522,11 +522,15 @@ func writeReservation(writer *codec.Writer, reservation recording.Reservation, l
 	return writer.I32(0)
 }
 
-func writeSettings(writer *codec.Writer, priority uint8) error {
+func writeSettings(writer *codec.Writer, priority uint8, follow bool) error {
 	if err := writer.I32(51); err != nil {
 		return err
 	}
-	for _, value := range [...]uint8{1, priority, 0} {
+	followValue := uint8(0)
+	if follow {
+		followValue = 1
+	}
+	for _, value := range [...]uint8{1, priority, followValue} {
 		if err := writer.U8(value); err != nil {
 			return err
 		}
@@ -573,7 +577,7 @@ func writeEmptyVector(writer *codec.Writer) error {
 
 func validateStoredReservation(reservation recording.Reservation) error {
 	if reservation.Number < 1 || reservation.Version < 1 || reservation.State != recording.ReservationActive ||
-		reservation.EffectiveFollow || reservation.Priority < 1 || reservation.Priority > 5 ||
+		reservation.EffectiveFollow != reservation.RequestedFollow || reservation.Priority < 1 || reservation.Priority > 5 ||
 		reservation.Program.Start.IsZero() || reservation.Program.Start.Location() != time.UTC ||
 		reservation.Program.Duration < time.Second || reservation.Program.Duration > 24*time.Hour ||
 		reservation.Program.Duration%time.Second != 0 {

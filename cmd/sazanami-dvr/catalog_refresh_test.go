@@ -19,6 +19,7 @@ import (
 	sqliteadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/sqlite"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/app/catalogrefresh"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/app/catalogsync"
+	recordingapp "github.com/g0ooo0gle/sazanami-dvr/internal/app/recording"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/catalogmodel"
 )
 
@@ -102,12 +103,17 @@ func TestRecordingCatalogRefreshPublishesOnlyValidatedGeneration(t *testing.T) {
 	state.Lock()
 	state.service = "更新後の局"
 	state.Unlock()
+	followCalls := 0
 	operation := &recordingCatalogRefresh{
 		dataRoot: root, channelMap: channelMap, provider: provider, store: store, holder: holder, clock: wallClock{},
+		follow: func(context.Context) (recordingapp.FollowResult, error) {
+			followCalls++
+			return recordingapp.FollowResult{}, nil
+		},
 	}
 	result, reason, err := operation.sync(context.Background())
-	if err != nil || reason != "" || result.Services != 1 || result.Programs != 1 || holder.Load() == initial {
-		t.Fatalf("result=%+v reason=%q switched=%v err=%v", result, reason, holder.Load() != initial, err)
+	if err != nil || reason != "" || result.Services != 1 || result.Programs != 1 || holder.Load() == initial || followCalls != 1 {
+		t.Fatalf("result=%+v reason=%q switched=%v follows=%d err=%v", result, reason, holder.Load() != initial, followCalls, err)
 	}
 	value, err := holder.Load().Current(context.Background())
 	if err != nil || len(value.Services) != 1 || value.Services[0].ServiceName != "更新後の局" {
@@ -125,11 +131,17 @@ func TestRecordingCatalogRefreshPublishesOnlyValidatedGeneration(t *testing.T) {
 	if _, reason, err := operation.sync(context.Background()); err == nil || reason != "catalog-refresh-channel-mismatch" || holder.Load() != accepted {
 		t.Fatalf("mismatch reason=%q kept=%v err=%v", reason, holder.Load() == accepted, err)
 	}
+	if followCalls != 1 {
+		t.Fatalf("不正な世代で追従しました: calls=%d", followCalls)
+	}
 	state.Lock()
 	state.fail = true
 	state.Unlock()
 	if _, reason, err := operation.sync(context.Background()); err == nil || reason != "catalog-refresh-provider-failed" || holder.Load() != accepted {
 		t.Fatalf("provider reason=%q kept=%v err=%v", reason, holder.Load() == accepted, err)
+	}
+	if followCalls != 1 {
+		t.Fatalf("取得失敗後に追従しました: calls=%d", followCalls)
 	}
 	state.Lock()
 	state.fail = false
@@ -145,6 +157,9 @@ func TestRecordingCatalogRefreshPublishesOnlyValidatedGeneration(t *testing.T) {
 			t.Fatalf("cycle=%d reason=%q switched=%v err=%v", cycle+1, reason, holder.Load() != previous, err)
 		}
 		previous = holder.Load()
+	}
+	if followCalls != 101 {
+		t.Fatalf("follow calls=%d", followCalls)
 	}
 	provider.CloseIdleConnections()
 	runtime.GC()

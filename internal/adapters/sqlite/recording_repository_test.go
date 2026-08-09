@@ -20,7 +20,7 @@ func TestReservationCreateReadbackAndDuplicate(t *testing.T) {
 	}
 	items, err := store.ActiveReservations(context.Background(), 1, 0)
 	if err != nil || len(items) != 1 || items[0].ID != reservation.ID || items[0].Number != created.Number ||
-		!items[0].RequestedFollow || items[0].EffectiveFollow || items[0].Program.Title != reservation.Program.Title {
+		!items[0].RequestedFollow || !items[0].EffectiveFollow || items[0].Program.Title != reservation.Program.Title {
 		t.Fatalf("items=%+v err=%v", items, err)
 	}
 	duplicate := reservation
@@ -39,6 +39,79 @@ func TestReservationCreateReadbackAndDuplicate(t *testing.T) {
 	items, err = reopened.ActiveReservations(context.Background(), 256, 0)
 	if err != nil || len(items) != 1 || items[0].Number != 1 {
 		t.Fatalf("restarted items=%+v err=%v", items, err)
+	}
+}
+
+func TestReservationFollowUsesLatestCompletedRevision(t *testing.T) {
+	_, store := openMigratedStore(t)
+	reservation := reservationForTest(t, store)
+	created, err := store.CreateReservation(context.Background(), reservation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncID := testID(t, 112)
+	if err := store.BeginSync(context.Background(), catalogmodel.Sync{
+		ID: syncID, BackendID: reservation.Program.BackendID, StartedAtMS: 3, CorrelationID: "follow-target",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	networkID, transportID, serviceID := int64(1), int64(2), int64(3)
+	tuningTarget := reservation.Program.TuningTarget
+	if err := store.StoreServices(context.Background(), syncID, []catalogmodel.ServiceObservation{{
+		ProviderLocator: tuningTarget, NetworkID: &networkID, TransportID: &transportID, ServiceID: &serviceID,
+		DisplayName: "テスト局", TuningTarget: &tuningTarget, Validation: catalogmodel.ValidationValid,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	start := reservation.Program.Start.Add(10 * time.Minute)
+	startMS, durationMS, eventID := start.UnixMilli(), int64((35*time.Minute)/time.Millisecond), int64(4)
+	title := "変更後の番組名"
+	if err := store.StorePrograms(context.Background(), syncID, false, []catalogmodel.ProgramObservation{{
+		ServiceLocator: tuningTarget, EventLocator: "4", RawEventID: &eventID,
+		Material: catalogmodel.RevisionMaterial{StartUTCMS: &startMS, DurationMS: &durationMS,
+			Title: &title, Validation: catalogmodel.ValidationValid},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompleteSync(context.Background(), syncID, startMS+1, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	var programIdentity string
+	if err := store.reader.QueryRow(`SELECT identity_state FROM program_instances WHERE id=?`,
+		reservation.Program.ProgramInstanceID.Bytes()).Scan(&programIdentity); err != nil {
+		t.Fatal(err)
+	}
+	if programIdentity != "PROVISIONAL" {
+		t.Fatalf("program_identity=%s", programIdentity)
+	}
+	target, err := store.CurrentFollowTarget(context.Background(), reservation.Program.BackendID,
+		reservation.Program.ProgramInstanceID)
+	if err != nil || target == nil || target.ProgramRevisionID == reservation.Program.ProgramRevisionID ||
+		!target.Start.Equal(start) || target.Duration != 35*time.Minute {
+		t.Fatalf("target=%+v err=%v", target, err)
+	}
+	applied, err := store.ApplyReservationFollow(context.Background(), recording.ReservationFollowRequest{
+		ReservationID: created.ID, ExpectedVersion: created.Version,
+		ExpectedRevisionID: created.Program.ProgramRevisionID, TargetRevisionID: target.ProgramRevisionID,
+		Now: time.Date(2026, 8, 5, 0, 10, 0, 0, time.UTC),
+	})
+	if err != nil || !applied {
+		t.Fatalf("applied=%v err=%v", applied, err)
+	}
+	items, err := store.ActiveReservations(context.Background(), 1, 0)
+	if err != nil || len(items) != 1 || items[0].Version != 2 ||
+		items[0].Program.ProgramRevisionID != target.ProgramRevisionID || !items[0].Program.Start.Equal(start) ||
+		items[0].Program.Duration != 35*time.Minute || items[0].Program.Title != reservation.Program.Title ||
+		!items[0].EffectiveFollow {
+		t.Fatalf("followed=%+v err=%v", items, err)
+	}
+	applied, err = store.ApplyReservationFollow(context.Background(), recording.ReservationFollowRequest{
+		ReservationID: created.ID, ExpectedVersion: created.Version,
+		ExpectedRevisionID: created.Program.ProgramRevisionID, TargetRevisionID: target.ProgramRevisionID,
+		Now: time.Date(2026, 8, 5, 0, 11, 0, 0, time.UTC),
+	})
+	if err != nil || applied {
+		t.Fatalf("stale applied=%v err=%v", applied, err)
 	}
 }
 
