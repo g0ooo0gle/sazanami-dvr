@@ -17,6 +17,7 @@ func TestReservationCreateReadbackAndDuplicate(t *testing.T) {
 	root, store := openMigratedStore(t)
 	reservation := reservationForTest(t, store)
 	reservation.Output = recording.OutputSettings{Folder: "ドラマ/保存", Template: "$Title$-$ReserveID$"}
+	reservation.Components = recording.ComponentDataOnly
 	created, err := store.CreateReservation(context.Background(), reservation)
 	if err != nil || created.Number != 1 {
 		t.Fatalf("created=%+v err=%v", created, err)
@@ -24,7 +25,7 @@ func TestReservationCreateReadbackAndDuplicate(t *testing.T) {
 	items, err := store.ActiveReservations(context.Background(), 1, 0)
 	if err != nil || len(items) != 1 || items[0].ID != reservation.ID || items[0].Number != created.Number ||
 		!items[0].RequestedFollow || !items[0].EffectiveFollow || items[0].Program.Title != reservation.Program.Title ||
-		items[0].Output != reservation.Output {
+		items[0].Output != reservation.Output || items[0].Components != recording.ComponentDataOnly {
 		t.Fatalf("items=%+v err=%v", items, err)
 	}
 	duplicate := reservation
@@ -41,7 +42,8 @@ func TestReservationCreateReadbackAndDuplicate(t *testing.T) {
 	}
 	defer reopened.Close()
 	items, err = reopened.ActiveReservations(context.Background(), 256, 0)
-	if err != nil || len(items) != 1 || items[0].Number != 1 || items[0].Output != reservation.Output {
+	if err != nil || len(items) != 1 || items[0].Number != 1 || items[0].Output != reservation.Output ||
+		items[0].Components != recording.ComponentDataOnly {
 		t.Fatalf("restarted items=%+v err=%v", items, err)
 	}
 }
@@ -157,6 +159,7 @@ func TestReservationSettingsSchemaRejectsInvalidAndScannerRejectsCorruption(t *t
 		`UPDATE reservations SET duration_seconds=86400 WHERE id=?`,
 		`UPDATE reservations SET output_folder=replace(hex(zeroblob(257)), '00', 'a') WHERE id=?`,
 		`UPDATE reservations SET output_template=replace(hex(zeroblob(513)), '00', 'a') WHERE id=?`,
+		`UPDATE reservations SET component_mode=5 WHERE id=?`,
 	} {
 		if _, err := store.writer.Exec(statement, created.ID.Bytes()); err == nil {
 			t.Fatalf("invalid SQL was accepted: %s", statement)
@@ -481,14 +484,16 @@ func TestReservationUpdateCancelAndRecordingStatus(t *testing.T) {
 		NetworkID: reservation.Program.NetworkID, TransportStreamID: reservation.Program.TransportStreamID,
 		ServiceID: reservation.Program.ServiceID, EventID: reservation.Program.EventID,
 		Start: reservation.Program.Start, Duration: reservation.Program.Duration, Priority: 5,
-		Output: recording.OutputSettings{Folder: "更新後", Template: "$SDYYYY$-$Title$"},
+		Output:     recording.OutputSettings{Folder: "更新後", Template: "$SDYYYY$-$Title$"},
+		Components: recording.ComponentCaptionsOnly,
 	}}
 	now := reservation.CreatedAt.Add(time.Second)
 	if err := store.UpdateReservation(context.Background(), change, now); err != nil {
 		t.Fatal(err)
 	}
 	items, err := store.ActiveReservations(context.Background(), 1, 0)
-	if err != nil || len(items) != 1 || items[0].Priority != 5 || items[0].Version != 2 || items[0].Output != change.Request.Output {
+	if err != nil || len(items) != 1 || items[0].Priority != 5 || items[0].Version != 2 || items[0].Output != change.Request.Output ||
+		items[0].Components != recording.ComponentCaptionsOnly {
 		t.Fatalf("items=%+v err=%v", items, err)
 	}
 	change.Request.EventID++
@@ -1124,6 +1129,7 @@ func reservationForTest(t *testing.T, store *Store) recording.Reservation {
 	created := time.Date(2026, 8, 5, 0, 0, 0, 0, time.UTC)
 	return recording.Reservation{
 		ID: testID(t, 116), Version: 1, State: recording.ReservationActive, Priority: 5,
+		Components:      recording.ComponentBoth,
 		RequestedFollow: true, CreatedAt: created, UpdatedAt: created,
 		Program: recording.ProgramSnapshot{
 			ProgramInstanceID: programs[0].InstanceID, ProgramRevisionID: programs[0].RevisionID, BackendID: backendID,

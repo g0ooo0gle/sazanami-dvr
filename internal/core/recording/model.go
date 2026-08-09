@@ -87,6 +87,7 @@ type ReservationRequest struct {
 	Disabled          bool
 	Margins           *RecordingMargins
 	Output            OutputSettings
+	Components        ComponentMode
 }
 
 // ReservationChangeはKonomiTVが返す完全な予約情報から、変更対象と照合条件を分離した値である。
@@ -108,7 +109,7 @@ func (request ReservationRequest) Validate() error {
 	if request.Start.IsZero() || request.Start.Location() != time.UTC || request.Start.UnixMilli() < 0 ||
 		request.Duration < time.Second || request.Duration > 24*time.Hour || request.Duration%time.Second != 0 ||
 		request.Priority < 1 || request.Priority > 5 || validateRecordingTime(request.Start, request.Duration, request.Margins) != nil ||
-		request.Output.Validate() != nil {
+		request.Output.Validate() != nil || !request.Components.Valid() {
 		return errors.New("recording: invalid reservation request")
 	}
 	return nil
@@ -127,6 +128,7 @@ type Reservation struct {
 	Disabled        bool
 	Margins         *RecordingMargins
 	Output          OutputSettings
+	Components      ComponentMode
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
 	FinishedAt      *time.Time
@@ -193,7 +195,8 @@ func (reservation Reservation) ValidateNew() error {
 	}
 	if program.Start.IsZero() || program.Start.Location() != time.UTC || program.Start.UnixMilli() < 0 ||
 		program.Duration < time.Second || program.Duration > 24*time.Hour || program.Duration%time.Second != 0 ||
-		validateRecordingTime(program.Start, program.Duration, reservation.Margins) != nil || reservation.Output.Validate() != nil {
+		validateRecordingTime(program.Start, program.Duration, reservation.Margins) != nil || reservation.Output.Validate() != nil ||
+		!reservation.Components.Valid() {
 		return errors.New("recording: invalid reservation time")
 	}
 	if reservation.CreatedAt.IsZero() || reservation.CreatedAt.Location() != time.UTC ||
@@ -287,6 +290,8 @@ const (
 	ReasonStreamCancelled TerminalReason = "STREAM_CANCELLED"
 	// ReasonStreamReconnectExhaustedは上限の3回まで開き直してもストリームが回復しなかったことを表す。
 	ReasonStreamReconnectExhausted TerminalReason = "STREAM_RECONNECT_EXHAUSTED"
+	// ReasonStreamFormatInvalidは字幕・データ放送を安全に選別できないTS形式だったことを表す。
+	ReasonStreamFormatInvalid TerminalReason = "STREAM_FORMAT_INVALID"
 	// ReasonFileCreateFailedは安全な部分ファイルを作れなかったことを表す。
 	ReasonFileCreateFailed TerminalReason = "FILE_CREATE_FAILED"
 	// ReasonFileWriteFailedは部分ファイルへ完全に書き込めなかったことを表す。
@@ -316,7 +321,7 @@ func (reason TerminalReason) Valid() bool {
 	switch reason {
 	case ReasonCompleted, ReasonCompletedAfterReconnect, ReasonLateStartExpired, ReasonRecordingSlotUnavailable,
 		ReasonStreamNotFound, ReasonStreamUnavailable, ReasonStreamTimeout,
-		ReasonStreamEndedEarly, ReasonStreamCancelled, ReasonStreamReconnectExhausted, ReasonFileCreateFailed,
+		ReasonStreamEndedEarly, ReasonStreamCancelled, ReasonStreamReconnectExhausted, ReasonStreamFormatInvalid, ReasonFileCreateFailed,
 		ReasonFileWriteFailed, ReasonFileSyncFailed, ReasonFinalNameConflict,
 		ReasonFinalPublicationFailed, ReasonFinalDatabaseFailed,
 		ReasonProcessInterrupted, ReasonProcessShutdown, ReasonUserRequestedStop, ReasonFileMissing, ReasonFileIntegrityMismatch:
