@@ -36,7 +36,7 @@ import (
 )
 
 var (
-	version       = "0.0.19"
+	version       = "0.0.20"
 	productCommit = ""
 )
 
@@ -51,6 +51,7 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 }
 
 func runContext(ctx context.Context, arguments []string, stdout, stderr io.Writer) int {
+	restrictProcessFileCreation()
 	if len(arguments) == 0 {
 		fmt.Fprintln(stdout, "Sazanami DVR: 自動的な待受やDB変更は開始しません")
 		return 0
@@ -112,6 +113,11 @@ func runContext(ctx context.Context, arguments []string, stdout, stderr io.Write
 		return 1
 	}
 	return 0
+}
+
+// restrictProcessFileCreationはSQLiteを含む新規ファイルからgroupとotherの権限を外す。
+func restrictProcessFileCreation() {
+	syscall.Umask(0o077)
 }
 
 func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr io.Writer) error {
