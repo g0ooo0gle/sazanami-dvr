@@ -185,6 +185,73 @@ func TestAddAcceptsDisabledAndMarginBoundariesAtomically(t *testing.T) {
 	}
 }
 
+func TestReservationOutputSettingsRoundTrip(t *testing.T) {
+	output := recording.OutputSettings{Folder: "ドラマ/新作", Template: "$SDYYYY$-$Title$-$ReserveID$"}
+	operations := &fakeOperations{}
+	handler := Handler{Operations: operations, Limits: codec.DefaultLimits()}
+	request := reservationRequestSettingsWithOutput(t, CommandAdd, Version, 0, 1, 3, true, 0, 0, 0, 1, output)
+	var response bytes.Buffer
+	if err := handler.Handle(context.Background(), request, &response); err != nil {
+		t.Fatal(err)
+	}
+	frame, err := codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
+	if err != nil || frame.Code != ResultSuccess || len(operations.added) != 1 || operations.added[0].Output != output {
+		t.Fatalf("frame=%+v added=%+v err=%v", frame, operations.added, err)
+	}
+
+	listed := listedReservation(42)
+	listed.Output = output
+	operations.reservations = []recording.Reservation{listed}
+	response.Reset()
+	if err := handler.Handle(context.Background(), listRequest(Version), &response); err != nil {
+		t.Fatal(err)
+	}
+	frame, err = codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
+	if err != nil || frame.Code != ResultSuccess {
+		t.Fatalf("frame=%+v err=%v", frame, err)
+	}
+	reader, _ := codec.NewReader(frame.Body, codec.DefaultLimits())
+	if version, err := reader.U16(); err != nil || version != Version {
+		t.Fatalf("version=%d err=%v", version, err)
+	}
+	count := 0
+	if err := reader.Vector(4, 1, func(items *codec.Reader, _ int) error {
+		count++
+		return readListedReservation(items, listed)
+	}); err != nil || count != 1 {
+		t.Fatalf("count=%d err=%v", count, err)
+	}
+}
+
+func TestReservationOutputRejectsUnsafePathMacroAndPluginsAtomically(t *testing.T) {
+	valid := recording.OutputSettings{Folder: "safe", Template: "$Title$"}
+	base := reservationRequestSettingsWithOutput(t, CommandAdd, Version, 0, 1, 3, true, 0, 0, 0, 1, valid)
+	tests := map[string][]byte{
+		"absolute-folder": reservationRequestSettingsWithOutput(t, CommandAdd, Version, 0, 1, 3, true, 0, 0, 0, 1,
+			recording.OutputSettings{Folder: "/unsafe", Template: "$Title$"}),
+		"parent-folder": reservationRequestSettingsWithOutput(t, CommandAdd, Version, 0, 1, 3, true, 0, 0, 0, 1,
+			recording.OutputSettings{Folder: "../unsafe", Template: "$Title$"}),
+		"unknown-macro": reservationRequestSettingsWithOutput(t, CommandAdd, Version, 0, 1, 3, true, 0, 0, 0, 1,
+			recording.OutputSettings{Folder: "safe", Template: "$Unknown$"}),
+		"write-plugin": replaceWireString(t, base, "Write_Default.dll", "Write_Invalid.dll"),
+		"name-plugin":  replaceWireString(t, base, "RecName_Macro.dll?$Title$", "RecName_Other.dll?$Title$"),
+	}
+	operations := &fakeOperations{}
+	handler := Handler{Operations: operations, Limits: codec.DefaultLimits()}
+	for name, request := range tests {
+		t.Run(name, func(t *testing.T) {
+			var response bytes.Buffer
+			if err := handler.Handle(context.Background(), request, &response); err != nil {
+				t.Fatal(err)
+			}
+			frame, err := codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
+			if err != nil || frame.Code != ResultFailure || len(operations.added) != 0 {
+				t.Fatalf("frame=%+v calls=%d err=%v", frame, len(operations.added), err)
+			}
+		})
+	}
+}
+
 func TestChangeReplacesAllBasicSettingsTogether(t *testing.T) {
 	operations := &fakeOperations{}
 	handler := Handler{Operations: operations, Limits: codec.DefaultLimits()}
@@ -423,6 +490,14 @@ func reservationRequest(t *testing.T, command int32, version uint16, reserveID i
 func reservationRequestSettings(t *testing.T, command int32, version uint16, reserveID int32,
 	recordingMode, priority uint8, follow bool, useMargins uint8, startMargin, endMargin int32, count int,
 ) []byte {
+	return reservationRequestSettingsWithOutput(t, command, version, reserveID, recordingMode, priority, follow,
+		useMargins, startMargin, endMargin, count, recording.OutputSettings{})
+}
+
+func reservationRequestSettingsWithOutput(t *testing.T, command int32, version uint16, reserveID int32,
+	recordingMode, priority uint8, follow bool, useMargins uint8, startMargin, endMargin int32, count int,
+	output recording.OutputSettings,
+) []byte {
 	t.Helper()
 	var itemBody bytes.Buffer
 	item, err := codec.NewWriter(&itemBody, codec.DefaultLimits())
@@ -465,7 +540,7 @@ func reservationRequestSettings(t *testing.T, command int32, version uint16, res
 	if err := item.SystemTime(start); err != nil {
 		t.Fatal(err)
 	}
-	writeInputSettings(t, item, recordingMode, priority, follow, useMargins, startMargin, endMargin)
+	writeInputSettingsWithOutput(t, item, recordingMode, priority, follow, useMargins, startMargin, endMargin, output)
 	if err := item.I32(0); err != nil {
 		t.Fatal(err)
 	}
@@ -492,8 +567,35 @@ func reservationRequestSettings(t *testing.T, command int32, version uint16, res
 func writeInputSettings(t *testing.T, writer *codec.Writer, mode, priority uint8, follow bool,
 	useMargins uint8, startMargin, endMargin int32,
 ) {
+	writeInputSettingsWithOutput(t, writer, mode, priority, follow, useMargins, startMargin, endMargin,
+		recording.OutputSettings{})
+}
+
+func writeInputSettingsWithOutput(t *testing.T, writer *codec.Writer, mode, priority uint8, follow bool,
+	useMargins uint8, startMargin, endMargin int32, output recording.OutputSettings,
+) {
 	t.Helper()
-	if err := writer.I32(51); err != nil {
+	var folder bytes.Buffer
+	if output != (recording.OutputSettings{}) {
+		fields := &bytes.Buffer{}
+		fieldWriter, err := codec.NewWriter(fields, codec.DefaultLimits())
+		if err != nil {
+			t.Fatal(err)
+		}
+		name := "RecName_Macro.dll"
+		if output.Template != "" {
+			name += "?" + output.Template
+		}
+		for _, value := range []string{output.Folder, "Write_Default.dll", name, ""} {
+			if err := fieldWriter.String(value); err != nil {
+				t.Fatal(err)
+			}
+		}
+		folderWriter, _ := codec.NewWriter(&folder, codec.DefaultLimits())
+		_ = folderWriter.I32(int32(4 + fields.Len()))
+		_ = folderWriter.Bytes(fields.Bytes())
+	}
+	if err := writer.I32(int32(51 + folder.Len())); err != nil {
 		t.Fatal(err)
 	}
 	for _, value := range []uint8{mode, priority, boolByte(follow)} {
@@ -504,7 +606,11 @@ func writeInputSettings(t *testing.T, writer *codec.Writer, mode, priority uint8
 	_ = writer.U32(0)
 	_ = writer.U8(0)
 	_ = writer.String("")
-	writeTestVector(t, writer, nil, 0)
+	if output == (recording.OutputSettings{}) {
+		writeTestVector(t, writer, nil, 0)
+	} else {
+		writeTestVector(t, writer, folder.Bytes(), 1)
+	}
 	_ = writer.U8(0)
 	_ = writer.U8(0)
 	_ = writer.U8(useMargins)
@@ -596,18 +702,25 @@ func readListedReservation(reader *codec.Reader, want recording.Reservation) err
 		}
 		settings, err := decodeSettings(item)
 		if err != nil || settings.priority != want.Priority || settings.follow != want.EffectiveFollow ||
-			settings.disabled != want.Disabled || !sameMargins(settings.margins, want.Margins) {
+			settings.disabled != want.Disabled || !sameMargins(settings.margins, want.Margins) || settings.output != want.Output {
 			return fmt.Errorf("settings=%+v err=%v", settings, err)
 		}
 		if _, err := item.I32(); err != nil {
 			return err
 		}
+		expectedFile, expected, expectedErr := recording.ScheduledOutputPath(want)
+		if expectedErr != nil {
+			return expectedErr
+		}
 		files := 0
 		if err := item.Vector(6, 1, func(file *codec.Reader, _ int) error {
 			files++
-			_, err := file.String()
+			value, err := file.String()
+			if err == nil && value != expectedFile {
+				return fmt.Errorf("file=%q want=%q", value, expectedFile)
+			}
 			return err
-		}); err != nil || files != 0 {
+		}); err != nil || files != boolCount(expected) {
 			return fmt.Errorf("files=%d err=%v", files, err)
 		}
 		_, err = item.I32()
@@ -636,4 +749,31 @@ func boolByte(value bool) uint8 {
 		return 1
 	}
 	return 0
+}
+
+func boolCount(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+func replaceWireString(t *testing.T, source []byte, before, after string) []byte {
+	t.Helper()
+	if len(before) != len(after) {
+		t.Fatal("置換するwire文字列の長さが異なります")
+	}
+	wire := func(value string) []byte {
+		var buffer bytes.Buffer
+		writer, err := codec.NewWriter(&buffer, codec.DefaultLimits())
+		if err != nil || writer.String(value) != nil {
+			t.Fatalf("wire string: %v", err)
+		}
+		return buffer.Bytes()
+	}
+	result := bytes.Replace(append([]byte(nil), source...), wire(before), wire(after), 1)
+	if bytes.Equal(result, source) {
+		t.Fatal("wire文字列を置換できませんでした")
+	}
+	return result
 }

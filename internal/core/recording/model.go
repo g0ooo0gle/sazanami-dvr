@@ -86,6 +86,7 @@ type ReservationRequest struct {
 	RequestedFollow   bool
 	Disabled          bool
 	Margins           *RecordingMargins
+	Output            OutputSettings
 }
 
 // ReservationChangeはKonomiTVが返す完全な予約情報から、変更対象と照合条件を分離した値である。
@@ -106,7 +107,8 @@ func (change ReservationChange) Validate() error {
 func (request ReservationRequest) Validate() error {
 	if request.Start.IsZero() || request.Start.Location() != time.UTC || request.Start.UnixMilli() < 0 ||
 		request.Duration < time.Second || request.Duration > 24*time.Hour || request.Duration%time.Second != 0 ||
-		request.Priority < 1 || request.Priority > 5 || validateRecordingTime(request.Start, request.Duration, request.Margins) != nil {
+		request.Priority < 1 || request.Priority > 5 || validateRecordingTime(request.Start, request.Duration, request.Margins) != nil ||
+		request.Output.Validate() != nil {
 		return errors.New("recording: invalid reservation request")
 	}
 	return nil
@@ -124,6 +126,7 @@ type Reservation struct {
 	EffectiveFollow bool
 	Disabled        bool
 	Margins         *RecordingMargins
+	Output          OutputSettings
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
 	FinishedAt      *time.Time
@@ -190,7 +193,7 @@ func (reservation Reservation) ValidateNew() error {
 	}
 	if program.Start.IsZero() || program.Start.Location() != time.UTC || program.Start.UnixMilli() < 0 ||
 		program.Duration < time.Second || program.Duration > 24*time.Hour || program.Duration%time.Second != 0 ||
-		validateRecordingTime(program.Start, program.Duration, reservation.Margins) != nil {
+		validateRecordingTime(program.Start, program.Duration, reservation.Margins) != nil || reservation.Output.Validate() != nil {
 		return errors.New("recording: invalid reservation time")
 	}
 	if reservation.CreatedAt.IsZero() || reservation.CreatedAt.Location() != time.UTC ||

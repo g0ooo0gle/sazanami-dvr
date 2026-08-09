@@ -520,7 +520,7 @@ func (executor Executor) Claim(ctx context.Context, reservation recording.Reserv
 	if err != nil {
 		return recording.Attempt{}, errors.New("recording: segment id generation failed")
 	}
-	plan, err := recording.NewFilePlan(reservation.Program.Start, attemptID)
+	plan, err := recording.NewReservationFilePlan(reservation, attemptID)
 	if err != nil {
 		return recording.Attempt{}, err
 	}

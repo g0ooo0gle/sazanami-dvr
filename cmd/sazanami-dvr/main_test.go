@@ -31,7 +31,7 @@ func TestVersion(t *testing.T) {
 	if code := run([]string{"--version"}, &output, &diagnostic); code != 0 {
 		t.Fatalf("code=%d err=%q", code, diagnostic.String())
 	}
-	if got, want := output.String(), "sazanami-dvr 0.0.18\n"; got != want {
+	if got, want := output.String(), "sazanami-dvr 0.0.19\n"; got != want {
 		t.Fatalf("version=%q want=%q", got, want)
 	}
 }
