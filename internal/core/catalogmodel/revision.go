@@ -11,6 +11,7 @@ import (
 
 const (
 	revisionPrefix      = "SZCATREV1"
+	revisionV2Prefix    = "SZCATREV2"
 	maxTitleBytes       = 4 * 1024
 	maxDescriptionBytes = 64 * 1024
 )
@@ -46,6 +47,44 @@ func EncodeRevisionV1(material RevisionMaterial) ([]byte, error) {
 // HashRevisionV1はcanonical encoding v1のSHA-256を返す。
 func HashRevisionV1(material RevisionMaterial) ([32]byte, error) {
 	encoded, err := EncodeRevisionV1(material)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	return sha256.Sum256(encoded), nil
+}
+
+// EncodeRevisionV2は基本項目とcanonical metadataを一つのrevision materialとして符号化する。
+func EncodeRevisionV2(material RevisionMaterial) ([]byte, error) {
+	base, err := EncodeRevisionV1(material)
+	if err != nil {
+		return nil, err
+	}
+	metadata, err := EncodeMetadataV1(material.Metadata)
+	if err != nil {
+		return nil, err
+	}
+	if len(metadata) == 0 {
+		return nil, errors.New("catalogmodel: revision v2 requires metadata")
+	}
+	var output bytes.Buffer
+	output.Grow(len(revisionV2Prefix) + 8 + len(base) + len(metadata))
+	output.WriteString(revisionV2Prefix)
+	var size [4]byte
+	binary.BigEndian.PutUint32(size[:], uint32(len(base)))
+	output.Write(size[:])
+	output.Write(base)
+	binary.BigEndian.PutUint32(size[:], uint32(len(metadata)))
+	output.Write(size[:])
+	output.Write(metadata)
+	return output.Bytes(), nil
+}
+
+// HashRevisionはmetadataが空なら既存v1、それ以外はv2のSHA-256を返す。
+func HashRevision(material RevisionMaterial) ([32]byte, error) {
+	if material.Metadata.Empty() {
+		return HashRevisionV1(material)
+	}
+	encoded, err := EncodeRevisionV2(material)
 	if err != nil {
 		return [32]byte{}, err
 	}

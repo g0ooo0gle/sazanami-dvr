@@ -133,6 +133,7 @@ type RevisionMaterial struct {
 	Description *string
 	FreeAccess  FreeAccess
 	Validation  Validation
+	Metadata    ProgramMetadata
 }
 
 // ProgramRevisionはimmutableな番組revisionを表す。
