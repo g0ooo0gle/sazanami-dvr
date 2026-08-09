@@ -131,3 +131,20 @@ func TestMetadataDecodeRejectsCorruption(t *testing.T) {
 		})
 	}
 }
+
+func TestMetadataTotalByteBoundary(t *testing.T) {
+	items := []ExtendedItem{
+		{Heading: "a", Body: strings.Repeat("a", MaxExtendedBodyBytes)},
+		{Heading: "b", Body: strings.Repeat("b", MaxExtendedBodyBytes)},
+		{Heading: "c", Body: strings.Repeat("c", MaxExtendedBodyBytes)},
+		{Heading: "d", Body: strings.Repeat("d", 65_486)},
+	}
+	encoded, err := EncodeMetadataV1(ProgramMetadata{Extended: items})
+	if err != nil || len(encoded) != MaxMetadataBytes {
+		t.Fatalf("boundary bytes=%d err=%v", len(encoded), err)
+	}
+	items[3].Body += "x"
+	if _, err := EncodeMetadataV1(ProgramMetadata{Extended: items}); err == nil {
+		t.Fatal("metadata全体上限の一byte超過が受理されました")
+	}
+}

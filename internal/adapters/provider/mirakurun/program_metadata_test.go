@@ -35,6 +35,11 @@ func TestDecodeProgramMetadata(t *testing.T) {
 	if err != nil || len(without.Extended) != 0 || len(without.Genres) != 0 || without.Video != nil || len(without.Audios) != 0 {
 		t.Fatalf("項目欠落=%+v err=%v", without, err)
 	}
+	boundaryBody := strings.Repeat("a", 65_536)
+	boundary, err := decodeProgramText(fmt.Sprintf(`{"id":10000200003,"networkId":1,"serviceId":2,"eventId":3,"startAt":1,"duration":1000,"isFree":true,"extended":{"h":%q}}`, boundaryBody))
+	if err != nil || len(boundary.Extended) != 1 || len(boundary.Extended[0].Body) != 65_536 {
+		t.Fatalf("本文上限=%d err=%v", len(boundary.Extended), err)
+	}
 }
 
 func TestDecodeProgramMetadataFailures(t *testing.T) {
@@ -60,6 +65,7 @@ func TestDecodeProgramMetadataFailures(t *testing.T) {
 		{name: "extended duplicate", field: `"extended":{"a":"b","a":"c"}`, reason: provider.ReasonMalformed},
 		{name: "extended value type", field: `"extended":{"a":1}`, reason: provider.ReasonMalformed},
 		{name: "extended heading limit", field: `"extended":{"` + strings.Repeat("a", 4097) + `":"b"}`, reason: provider.ReasonOverLimit},
+		{name: "extended body limit", field: `"extended":{"a":"` + strings.Repeat("b", 65_537) + `"}`, reason: provider.ReasonOverLimit},
 		{name: "extended count", field: `"extended":{` + strings.Join(extended, ",") + `}`, reason: provider.ReasonOverLimit},
 		{name: "genres null", field: `"genres":null`, reason: provider.ReasonMalformed},
 		{name: "genre missing", field: `"genres":[{"lv1":1,"lv2":2,"un1":3}]`, reason: provider.ReasonMalformed},
