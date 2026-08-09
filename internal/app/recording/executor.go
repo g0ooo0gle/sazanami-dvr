@@ -26,7 +26,7 @@ type AttemptStore interface {
 	ClaimRecording(context.Context, recording.ClaimRequest) (recording.Attempt, error)
 	StartAttempt(context.Context, catalogmodel.ID, time.Time) error
 	RecordingStarted(context.Context, catalogmodel.ID, time.Time) error
-	UpdateRecordingProgress(context.Context, catalogmodel.ID, int64, time.Time) error
+	UpdateRecordingProgress(context.Context, catalogmodel.ID, int64, time.Time) (time.Time, error)
 	BeginFinalization(context.Context, recording.FinalizeRequest) error
 	MarkFinalPublished(context.Context, catalogmodel.ID, time.Time) error
 	MarkDirectorySynced(context.Context, catalogmodel.ID, time.Time) error
@@ -82,6 +82,8 @@ type Executor struct {
 type streamCopyResult struct {
 	ByteCount    int64
 	LastProgress time.Time
+	PlannedEnd   time.Time
+	MaximumEnd   time.Time
 	Reason       recording.TerminalReason
 	ReachedEnd   bool
 	Retryable    bool
@@ -126,9 +128,13 @@ func (executor Executor) Execute(ctx context.Context, reservation recording.Rese
 	if err != nil {
 		return executor.finishBeforeRecording(ctx, partial, attempt.ID, recording.ReasonStreamNotFound)
 	}
-	streamContext, cancel := executor.deadline(ctx, attempt.PlannedEnd)
+	maximumEnd := attempt.PlannedStart.Add(12 * time.Hour)
+	if attempt.PlannedEnd.After(maximumEnd) {
+		maximumEnd = attempt.PlannedEnd
+	}
+	streamContext, cancel := executor.deadline(ctx, maximumEnd)
 	defer cancel()
-	copyResult := streamCopyResult{LastProgress: executor.now()}
+	copyResult := streamCopyResult{LastProgress: executor.now(), PlannedEnd: attempt.PlannedEnd, MaximumEnd: maximumEnd}
 	started := false
 	reconnected := false
 	for connection := 0; ; connection++ {
@@ -139,7 +145,7 @@ func (executor Executor) Execute(ctx context.Context, reservation recording.Rese
 		if openErr != nil {
 			copyResult.Reason = streamFailureReason(openErr)
 			copyResult.Retryable = retryableStreamFailure(openErr, providerstream.Terminal{})
-			if !executor.prepareReconnect(streamContext, attempt.PlannedEnd, connection, copyResult.Retryable) {
+			if !executor.prepareReconnect(streamContext, copyResult.PlannedEnd, connection, copyResult.Retryable) {
 				if errors.Is(ctx.Err(), context.Canceled) {
 					copyResult.Reason = recording.ReasonProcessShutdown
 				} else if copyResult.Retryable && connection == len(reconnectDelays) {
@@ -171,7 +177,7 @@ func (executor Executor) Execute(ctx context.Context, reservation recording.Rese
 			copyResult.Reason = recording.ReasonProcessShutdown
 			return executor.finishPartial(ctx, partial, attempt.ID, copyResult.ByteCount, copyResult.Reason)
 		}
-		if !executor.prepareReconnect(streamContext, attempt.PlannedEnd, connection, copyResult.Retryable) {
+		if !executor.prepareReconnect(streamContext, copyResult.PlannedEnd, connection, copyResult.Retryable) {
 			if errors.Is(ctx.Err(), context.Canceled) {
 				copyResult.Reason = recording.ReasonProcessShutdown
 			} else if copyResult.Retryable && connection == len(reconnectDelays) {
@@ -239,7 +245,7 @@ func (executor Executor) copy(ctx context.Context, lease providerstream.Lease, f
 	result.Retryable = false
 	buffer := make([]byte, provider.MaxStreamChunk)
 	for {
-		if !executor.now().Before(attempt.PlannedEnd) {
+		if !executor.now().Before(result.PlannedEnd) {
 			result.Reason = recording.ReasonCompleted
 			result.ReachedEnd = true
 			return result
@@ -265,13 +271,16 @@ func (executor Executor) copy(ctx context.Context, lease providerstream.Lease, f
 		}
 		now := executor.now()
 		if now.Sub(result.LastProgress) >= progressInterval {
-			if err := executor.Store.UpdateRecordingProgress(context.WithoutCancel(ctx), attempt.ID, result.ByteCount, now); err != nil {
+			plannedEnd, err := executor.Store.UpdateRecordingProgress(context.WithoutCancel(ctx), attempt.ID, result.ByteCount, now)
+			if err != nil || plannedEnd.IsZero() || plannedEnd.Location() != time.UTC ||
+				plannedEnd.Before(result.PlannedEnd) || plannedEnd.After(result.MaximumEnd) {
 				result.Reason = recording.ReasonProcessInterrupted
 				return result
 			}
+			result.PlannedEnd = plannedEnd
 			result.LastProgress = now
 		}
-		if !now.Before(attempt.PlannedEnd) {
+		if !now.Before(result.PlannedEnd) {
 			result.Reason = recording.ReasonCompleted
 			result.ReachedEnd = true
 			return result
@@ -350,7 +359,7 @@ func retryableStreamFailure(err error, terminal providerstream.Terminal) bool {
 }
 
 func (executor Executor) finishPartial(ctx context.Context, file PartialFile, attemptID catalogmodel.ID, byteCount int64, reason recording.TerminalReason) (Result, error) {
-	if err := executor.Store.UpdateRecordingProgress(context.WithoutCancel(ctx), attemptID, byteCount, executor.now()); err != nil {
+	if _, err := executor.Store.UpdateRecordingProgress(context.WithoutCancel(ctx), attemptID, byteCount, executor.now()); err != nil {
 		_ = file.Sync()
 		_ = file.Close()
 		return Result{}, errors.New("recording: persist final progress")

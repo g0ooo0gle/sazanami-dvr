@@ -23,6 +23,7 @@ type attemptMemory struct {
 	claim       core.ClaimRequest
 	finish      core.FinishRequest
 	progress    []int64
+	progressEnd time.Time
 	operations  []string
 	finishErr   error
 	progressErr error
@@ -47,10 +48,13 @@ func (store *attemptMemory) RecordingStarted(context.Context, catalogmodel.ID, t
 	return nil
 }
 
-func (store *attemptMemory) UpdateRecordingProgress(_ context.Context, _ catalogmodel.ID, count int64, _ time.Time) error {
+func (store *attemptMemory) UpdateRecordingProgress(_ context.Context, _ catalogmodel.ID, count int64, _ time.Time) (time.Time, error) {
 	store.progress = append(store.progress, count)
 	store.operations = append(store.operations, "progress")
-	return store.progressErr
+	if store.progressEnd.IsZero() {
+		store.progressEnd = store.end
+	}
+	return store.progressEnd, store.progressErr
 }
 
 func (store *attemptMemory) BeginFinalization(context.Context, core.FinalizeRequest) error {
@@ -183,6 +187,64 @@ func TestExecutorPublishesOnlyAfterPlannedEnd(t *testing.T) {
 		!stream.request.RequireDescrambled || lease.cancel != 1 || lease.close != 1 {
 		t.Fatalf("finish=%+v opens=%d request=%+v cancel=%d close=%d",
 			store.finish, stream.opens, stream.request, lease.cancel, lease.close)
+	}
+}
+
+func TestExecutorUsesExtendedPlannedEnd(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	initialEnd := start.Add(time.Minute)
+	extendedEnd := start.Add(2 * time.Minute)
+	clock := &mutableClock{now: start}
+	store := &attemptMemory{start: start, end: initialEnd, progressEnd: extendedEnd}
+	reads := 0
+	lease := &fakeLease{read: func(destination []byte) (int, providerstream.Terminal, error) {
+		reads++
+		for index := 0; index < 188; index++ {
+			destination[index] = 0x47
+		}
+		switch reads {
+		case 1:
+			clock.now = start.Add(progressInterval)
+		case 2:
+			clock.now = initialEnd
+		default:
+			clock.now = extendedEnd
+		}
+		return 188, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
+	}}
+	executor := executorForTest(t, store, &fakeProvider{lease: lease}, clock, false)
+	executor.WithDeadline = func(ctx context.Context, deadline time.Time) (context.Context, context.CancelFunc) {
+		if !deadline.Equal(start.Add(12 * time.Hour)) {
+			t.Fatalf("deadline=%s", deadline)
+		}
+		return context.WithCancel(ctx)
+	}
+	result, err := executor.Execute(context.Background(), reservationForExecutor(t, start, time.Minute))
+	if err != nil || result.State != core.AttemptSucceeded || result.Reason != core.ReasonCompleted ||
+		reads != 3 || store.finish.ByteCount != 3*188 {
+		t.Fatalf("result=%+v reads=%d finish=%+v err=%v", result, reads, store.finish, err)
+	}
+}
+
+func TestExecutorRejectsInvalidPlannedEndUpdate(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	for _, plannedEnd := range []time.Time{start.Add(59 * time.Second), start.Add(12*time.Hour + time.Second)} {
+		t.Run(plannedEnd.Sub(start).String(), func(t *testing.T) {
+			clock := &mutableClock{now: start}
+			store := &attemptMemory{start: start, end: start.Add(time.Minute), progressEnd: plannedEnd}
+			lease := &fakeLease{read: func(destination []byte) (int, providerstream.Terminal, error) {
+				for index := 0; index < 188; index++ {
+					destination[index] = 0x47
+				}
+				clock.now = start.Add(progressInterval)
+				return 188, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
+			}}
+			executor := executorForTest(t, store, &fakeProvider{lease: lease}, clock, false)
+			result, err := executor.Execute(context.Background(), reservationForExecutor(t, start, time.Minute))
+			if err != nil || result.State != core.AttemptPartial || result.Reason != core.ReasonProcessInterrupted {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+		})
 	}
 }
 

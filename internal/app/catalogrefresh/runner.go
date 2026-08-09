@@ -9,7 +9,7 @@ import (
 
 const (
 	// DefaultIntervalは録画プロセスが番組表更新を繰り返す既定間隔である。
-	DefaultInterval = time.Hour
+	DefaultInterval = 5 * time.Minute
 	// MinimumIntervalはoperatorが設定できる最短更新間隔である。
 	MinimumInterval = 5 * time.Minute
 	// MaximumIntervalはoperatorが設定できる最長更新間隔である。
