@@ -10,6 +10,7 @@ import (
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/codec"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/filecopy2"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/programguide"
+	recordedadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/recorded"
 	reservationadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/reservation"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/status"
 )
@@ -22,7 +23,24 @@ type Router struct {
 	recording    bool
 	reservations *reservationadapter.Handler
 	automatic    *autoreservationadapter.Handler
+	recorded     *recordedadapter.Handler
 	limits       codec.Limits
+}
+
+// NewRecordingRouterCompleteは通常予約、自動予約、完成録画の対応済みcommandを接続する。
+func NewRecordingRouterComplete(snapshots SnapshotLoader, reservations reservationadapter.Operations,
+	automatic autoreservationadapter.Operations, recorded recordedadapter.Operations, clock status.Clock,
+	limits codec.Limits,
+) (*Router, error) {
+	if recorded == nil {
+		return nil, stable("recording-history-failed")
+	}
+	router, err := NewRecordingRouterWithAutomatic(snapshots, reservations, automatic, clock, limits)
+	if err != nil {
+		return nil, err
+	}
+	router.recorded = &recordedadapter.Handler{Operations: recorded, Limits: limits}
+	return router, nil
 }
 
 // NewRecordingRouterWithAutomaticは番組表、通常予約、自動予約の対応済みcommandを接続する。
@@ -105,6 +123,10 @@ func (router *Router) Handle(ctx context.Context, request []byte, destination io
 		autoreservationadapter.CommandDelete:
 		if router.automatic != nil {
 			return router.automatic.Handle(ctx, request, destination)
+		}
+	case recordedadapter.CommandList, recordedadapter.CommandGet:
+		if router.recorded != nil {
+			return router.recorded.Handle(ctx, request, destination)
 		}
 	default:
 	}

@@ -2,7 +2,7 @@
 
 Sazanami DVRは、Mirakurun／mirakcから番組情報と放送ストリームを受け取り、KonomiTVからの予約を録画する軽量なバックエンドです。Goで実装しており、一つの実行ファイルで動きます。
 
-現在のバージョンは **v0.0.8（ベータ版）** です。基本的な録画の流れは動きますが、対応範囲はまだ限定的です。
+現在のバージョンは **v0.0.9（ベータ版）** です。基本的な録画の流れは動きますが、対応範囲はまだ限定的です。
 
 ## 現在できること
 
@@ -19,6 +19,8 @@ Sazanami DVRは、Mirakurun／mirakcから番組情報と放送ストリーム�
 - 明示した1～8件の上限内で、重なった予約を別々のストリームとファイルへ録画する
 - 録画中の一時的な通信切断では、同じ部分ファイルのまま最大3回再接続する
 - 再起動後も予約と録画結果を引き継ぐ
+- 成功・失敗を含む録画履歴を、読み取り専用のHTTP APIで確認する
+- Komorebi向けに完成録画の一覧と詳細を返し、元のTSファイルをHTTPで直接再生する
 - 保存済みの番組表と運用状態を、同じPCのWebUIで確認する
 - DBの移行、バックアップ、復元を明示的なコマンドで行う
 
@@ -28,6 +30,8 @@ MirakurunとKonomiTV v0.14.1を使い、番組表の表示、予約、録画中�
 
 番組時刻の追従は、録画開始前と録画中の終了時刻延長を合成データで自動確認しています。実放送で実際に時刻が変わる場面は、まだ確認できていません。複数同時録画は、自動テストと実環境の両方で確認済みです。
 
+v0.0.9で追加した録画履歴、Komorebi向け一覧・詳細、直接再生、シークは自動テスト済みです。Android TV上のKomorebiから使う実環境確認は、まだ行っていません。
+
 ## 主な制限
 
 - 同時録画の既定値は一件。2～8件へ増やす場合は、Mirakurunと保存先の能力を確認して明示指定が必要
@@ -36,10 +40,10 @@ MirakurunとKonomiTV v0.14.1を使い、番組表の表示、予約、録画中�
 - 自動予約で実行できる検索条件と録画設定は初版の安全な組み合わせに限定。未対応の条件は保存するが予約を作らない
 - 録画中に追従するのは、開始時刻が変わらない同じ番組の延長だけ。短縮や開始時刻変更には未対応
 - 録画ストリームの再接続は最大3回。通信が切れていた間の欠損は補完しない
-- KonomiTVへ録画済み番組の一覧やファイルを返す機能は未対応
-- Komorebiは未検証。現在の対応状況は[互換実装表](docs/compatibility.md)に記載
+- KonomiTVの録画済み一覧は従来どおりKonomiTV自身が管理。Sazanamiの録画履歴APIとは別の経路
+- Komorebi向けの録画一覧と直接再生は自動テスト済みだが、Android TV実機では未確認。詳しくは[互換実装表](docs/compatibility.md)に記載
 - WebUIから予約、番組情報の更新、録画開始はできない
-- LAN公開、ユーザー認証、TLS終端は未対応
+- 録画プロセスは明示設定でLAN待受が可能。ユーザー認証とTLS終端は未対応
 - チューナーやDVBデバイスを直接制御しない
 
 ## 必要なもの
@@ -90,7 +94,8 @@ mkdir -m 700 <recording-root>
   --channel-map <channel-map> \
   --provider mirakurun \
   --base-url <mirakurun-url> \
-  --listen 127.0.0.1:4510
+  --listen 127.0.0.1:4510 \
+  --http-listen 127.0.0.1:40773
 ```
 
 このプロセスは、起動直後と既定5分ごとにMirakurunの版、サービス、番組を確認します。更新が成功すると、保存済みの自動予約条件も評価します。録画用の放送ストリームは、予約の開始5秒前になったときだけ開きます。更新間隔は`--catalog-refresh-interval`で5分から24時間の範囲に変更できます。停止には`SIGINT`または`SIGTERM`を使います。詳しくは[録画機能の運用手順](docs/recording-operations.md)を参照してください。
@@ -138,11 +143,11 @@ sazanami-dvr db recover --data-root <data-root> --operation-id <uuid>
 | コマンド | ネットワーク動作 |
 |---|---|
 | `catalog sync` | Mirakurunのサービス・番組APIへ一度接続する |
-| `recording serve` | KonomiTV向けに待ち受け、起動直後と一定間隔で番組表を更新し、予約時刻だけ放送ストリームへ接続する |
+| `recording serve` | CtrlCmdと録画履歴HTTPを待ち受け、起動直後と一定間隔で番組表を更新し、予約時刻だけ放送ストリームへ接続する |
 | `ctrlcmd serve` | チャンネル確認用に待ち受ける |
 | `ui serve` | 運用WebUIを表示する |
 
-待受先は`127.0.0.1`または`::1`に限定しています。ただし認証はありません。同じPC上の信頼できない利用者やプロセスから操作される可能性がある環境では使用しないでください。
+待受先の既定値は`127.0.0.1`です。`recording serve`だけは、`--listen`と`--http-listen`へ宅内IPまたは`0.0.0.0`を明示するとLANから利用できます。認証とTLSはないため、信頼できる宅内LANだけで使い、ルーターのポート転送やインターネットへの直接公開は行わないでください。単独の`ctrlcmd serve`とWebUIは端末内限定です。
 
 ## 開発
 
@@ -169,6 +174,7 @@ internal/app/                  番組同期、予約、録画、復旧の手順
 internal/adapters/ctrlcmd/     KonomiTV向けCtrlCmd形式との変換
 internal/adapters/provider/    Mirakurun接続とテスト用の接続処理
 internal/adapters/recordingfs/ 録画ファイルの作成と完成処理
+internal/adapters/recordinghttp/ 録画履歴と完成録画のHTTP読出し
 internal/adapters/sqlite/      SQLiteへの保存、バックアップ、復元
 internal/adapters/webui/       ローカル専用の運用画面
 ```

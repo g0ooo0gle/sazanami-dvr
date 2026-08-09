@@ -31,7 +31,7 @@ func TestVersion(t *testing.T) {
 	if code := run([]string{"--version"}, &output, &diagnostic); code != 0 {
 		t.Fatalf("code=%d err=%q", code, diagnostic.String())
 	}
-	if got, want := output.String(), "sazanami-dvr 0.0.8\n"; got != want {
+	if got, want := output.String(), "sazanami-dvr 0.0.9\n"; got != want {
 		t.Fatalf("version=%q want=%q", got, want)
 	}
 }
@@ -315,6 +315,7 @@ func TestRecordingServeRefreshesCatalogWithoutOpeningStreamBeforeReservationTime
 	}))
 	defer providerServer.Close()
 	address := unusedLoopbackAddress(t)
+	httpAddress := unusedLoopbackAddress(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	output := newNotifyingWriter()
 	diagnostic := newNotifyingWriter()
@@ -322,7 +323,7 @@ func TestRecordingServeRefreshesCatalogWithoutOpeningStreamBeforeReservationTime
 	arguments := []string{
 		"recording", "serve", "--data-root", root, "--recording-root", recordingRoot,
 		"--channel-map", channelMap, "--provider", "mirakurun", "--base-url", providerServer.URL,
-		"--listen", address,
+		"--listen", address, "--http-listen", httpAddress,
 	}
 	go func() { done <- runContext(ctx, arguments, output, diagnostic) }()
 	select {
@@ -377,6 +378,18 @@ func TestRecordingServeRefreshesCatalogWithoutOpeningStreamBeforeReservationTime
 		cancel()
 		t.Fatalf("予約一覧取得でstreamへ%d回接続しました", streamCalls.Load())
 	}
+	httpResponse, err := http.Get("http://" + httpAddress + "/api/recordings")
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	responseBytes, readErr := io.ReadAll(httpResponse.Body)
+	closeErr := httpResponse.Body.Close()
+	if readErr != nil || closeErr != nil || httpResponse.StatusCode != http.StatusOK ||
+		!bytes.Contains(responseBytes, []byte(`"recordings":[]`)) {
+		cancel()
+		t.Fatalf("history status=%d body=%s read=%v close=%v", httpResponse.StatusCode, responseBytes, readErr, closeErr)
+	}
 	cancel()
 	select {
 	case code := <-done:
@@ -386,7 +399,7 @@ func TestRecordingServeRefreshesCatalogWithoutOpeningStreamBeforeReservationTime
 	case <-time.After(5 * time.Second):
 		t.Fatal("録画processの終了がtimeoutしました")
 	}
-	for _, private := range []string{root, recordingRoot, channelMap, providerServer.URL, backendID.String(), "service:ctrlcmd"} {
+	for _, private := range []string{root, recordingRoot, channelMap, providerServer.URL, httpAddress, backendID.String(), "service:ctrlcmd"} {
 		if strings.Contains(output.String(), private) || strings.Contains(diagnostic.String(), private) {
 			t.Fatalf("録画processの出力に非公開値が含まれます: %q", private)
 		}
@@ -399,10 +412,25 @@ func TestRecordingServeRejectsUnsafeListenBeforeOpeningRoots(t *testing.T) {
 	code := runContext(context.Background(), []string{
 		"recording", "serve", "--data-root", private, "--recording-root", private + "/recordings",
 		"--channel-map", private + "/channels.json", "--provider", "mirakurun",
-		"--base-url", "http://127.0.0.1:40773", "--listen", "0.0.0.0:4510",
+		"--base-url", "http://127.0.0.1:40773", "--listen", "203.0.113.39:4510",
 	}, &output, &diagnostic)
-	if code != 1 || !strings.Contains(diagnostic.String(), "loopback-listen-required") || strings.Contains(diagnostic.String(), private) {
+	if code != 1 || !strings.Contains(diagnostic.String(), "local-ctrlcmd-listen-required") || strings.Contains(diagnostic.String(), private) {
 		t.Fatalf("code=%d diagnostic=%q", code, diagnostic.String())
+	}
+}
+
+func TestRecordingServeAcceptsLANAddressesBeforeOpeningRoots(t *testing.T) {
+	for _, addresses := range [][2]string{{"10.1.1.39:4510", "10.1.1.39:40773"}, {"0.0.0.0:4510", "0.0.0.0:40773"}} {
+		var output, diagnostic bytes.Buffer
+		private := "/private/not-for-output"
+		code := runContext(context.Background(), []string{
+			"recording", "serve", "--data-root", private, "--recording-root", private + "/recordings",
+			"--channel-map", private + "/channels.json", "--provider", "mirakurun",
+			"--base-url", "http://127.0.0.1:40773", "--listen", addresses[0], "--http-listen", addresses[1],
+		}, &output, &diagnostic)
+		if code != 1 || !strings.Contains(diagnostic.String(), "current-database-required") || strings.Contains(diagnostic.String(), private) {
+			t.Fatalf("addresses=%v code=%d diagnostic=%q", addresses, code, diagnostic.String())
+		}
 	}
 }
 

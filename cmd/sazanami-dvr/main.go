@@ -21,6 +21,7 @@ import (
 	ctrlcmdruntime "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/runtime"
 	mirakurunadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/provider/mirakurun"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/recordingfs"
+	recordinghttpadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/recordinghttp"
 	sqliteadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/sqlite"
 	webuiadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/webui"
 	autoreservationapp "github.com/g0ooo0gle/sazanami-dvr/internal/app/autoreservation"
@@ -34,7 +35,7 @@ import (
 )
 
 var (
-	version       = "0.0.8"
+	version       = "0.0.9"
 	productCommit = ""
 )
 
@@ -92,7 +93,7 @@ func runContext(ctx context.Context, arguments []string, stdout, stderr io.Write
 	}
 	if arguments[0] == "recording" {
 		if len(arguments) < 2 || arguments[1] != "serve" {
-			fmt.Fprintln(stderr, "使用方法: sazanami-dvr recording serve --data-root <dir> --recording-root <dir> --channel-map <file> --provider mirakurun --base-url <url> [--max-concurrent-recordings 1]")
+			fmt.Fprintln(stderr, "使用方法: sazanami-dvr recording serve --data-root <dir> --recording-root <dir> --channel-map <file> --provider mirakurun --base-url <url> [--http-listen 127.0.0.1:40773] [--max-concurrent-recordings 1]")
 			return 2
 		}
 		if err := runRecordingCommand(ctx, arguments[2:], stdout, stderr); err != nil {
@@ -120,7 +121,8 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	channelMap := flags.String("channel-map", "", "data root直下のチャンネル設定JSON")
 	providerName := flags.String("provider", "", "stream provider")
 	baseURL := flags.String("base-url", "", "Mirakurunのoperator設定URL")
-	listenAddress := flags.String("listen", ctrlcmdapp.DefaultAddress, "numeric loopbackの待受アドレス")
+	listenAddress := flags.String("listen", ctrlcmdapp.DefaultAddress, "loopback、private IPまたは全interfaceのCtrlCmd待受アドレス")
+	httpListenAddress := flags.String("http-listen", recordinghttpadapter.DefaultAddress, "loopback、private IPまたは全interfaceのHTTP待受アドレス")
 	refreshInterval := flags.Duration("catalog-refresh-interval", catalogrefresh.DefaultInterval, "番組表を更新する間隔")
 	maximumRecordings := flags.Int("max-concurrent-recordings", recordingapp.DefaultMaximumConcurrentRecordings, "同時録画数（1～8）")
 	if err := flags.Parse(arguments); err != nil {
@@ -135,7 +137,10 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	config := ctrlcmdapp.RecordingConfig()
 	config.Address = *listenAddress
 	if err := validateCtrlCmdListen(config); err != nil {
-		return errorsStable("loopback-listen-required")
+		return errorsStable("local-ctrlcmd-listen-required")
+	}
+	if err := recordinghttpadapter.ValidateListenAddress(*httpListenAddress, false); err != nil {
+		return errorsStable("local-http-listen-required")
 	}
 	startupContext, startupCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer startupCancel()
@@ -206,7 +211,7 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 		Catalog: snapshots, Store: store, Clock: recordingClock, NewID: catalogmodel.NewID, OnAdded: scheduler.Notify,
 	}
 	automaticRules := autoreservationapp.RuleService{Store: store, Clock: recordingClock, NewID: catalogmodel.NewID}
-	router, err := ctrlcmdruntime.NewRecordingRouterWithAutomatic(snapshots, reservations, automaticRules,
+	router, err := ctrlcmdruntime.NewRecordingRouterComplete(snapshots, reservations, automaticRules, store,
 		ctrlcmdruntime.SystemClock{}, codec.DefaultLimits())
 	if err != nil {
 		return errorsStable("recording-router-failed")
@@ -222,11 +227,33 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	defer listener.Close()
 	serviceContext, serviceCancel := context.WithCancel(ctx)
 	defer serviceCancel()
+	httpHandler, err := recordinghttpadapter.NewHandler(store, recordingHTTPFiles{root: recordingRoot})
+	if err != nil {
+		return errorsStable("recording-http-handler-invalid")
+	}
+	httpServer := recordinghttpadapter.NewServer(*httpListenAddress, httpHandler)
+	httpServer.BaseContext = func(net.Listener) context.Context { return serviceContext }
+	httpListener, err := (&net.ListenConfig{}).Listen(startupContext, "tcp", *httpListenAddress)
+	if err != nil || recordinghttpadapter.ValidateListener(httpListener, false) != nil {
+		if httpListener != nil {
+			_ = httpListener.Close()
+		}
+		return errorsStable("recording-http-listen-failed")
+	}
+	defer httpListener.Close()
 	serverDone := make(chan error, 1)
 	schedulerDone := make(chan error, 1)
 	refreshDone := make(chan error, 1)
+	httpDone := make(chan error, 1)
 	go func() { serverDone <- server.Serve(serviceContext, listener) }()
 	go func() { schedulerDone <- scheduler.Run(serviceContext) }()
+	go func() {
+		err := httpServer.Serve(httpListener)
+		if errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		}
+		httpDone <- err
+	}()
 	refreshOperation := &recordingCatalogRefresh{
 		dataRoot: *dataRoot, channelMap: *channelMap, provider: catalogAdapter,
 		store: store, holder: snapshots, clock: clock,
@@ -246,10 +273,10 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 		Interval: *refreshInterval, Sync: refreshOperation.sync, Observe: observeCatalogRefresh(stdout, stderr),
 	}
 	go func() { refreshDone <- refresher.Run(serviceContext) }()
-	fmt.Fprintf(stdout, "録画プロセスをloopback限定で開始しました: services=%d catalog_refresh_interval=%s max_concurrent_recordings=%d\n",
-		snapshot.Count(), refreshInterval.String(), *maximumRecordings)
-	var serverErr, schedulerErr, refreshErr error
-	serverFinished, schedulerFinished, refreshFinished := false, false, false
+	fmt.Fprintf(stdout, "録画プロセスを開始しました: ctrlcmd_scope=%s http_scope=%s services=%d catalog_refresh_interval=%s max_concurrent_recordings=%d\n",
+		recordingListenScope(*listenAddress), recordingListenScope(*httpListenAddress), snapshot.Count(), refreshInterval.String(), *maximumRecordings)
+	var serverErr, schedulerErr, refreshErr, httpErr error
+	serverFinished, schedulerFinished, refreshFinished, httpFinished := false, false, false, false
 	select {
 	case serverErr = <-serverDone:
 		serverFinished = true
@@ -257,13 +284,19 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 		schedulerFinished = true
 	case refreshErr = <-refreshDone:
 		refreshFinished = true
+	case httpErr = <-httpDone:
+		httpFinished = true
 	case <-ctx.Done():
 	}
 	serviceCancel()
 	_ = listener.Close()
+	shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	_ = httpServer.Shutdown(shutdownContext)
+	shutdownCancel()
+	_ = httpListener.Close()
 	shutdown := time.NewTimer(30 * time.Second)
 	defer shutdown.Stop()
-	for !serverFinished || !schedulerFinished || !refreshFinished {
+	for !serverFinished || !schedulerFinished || !refreshFinished || !httpFinished {
 		select {
 		case serverErr = <-serverDone:
 			serverFinished = true
@@ -271,6 +304,8 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 			schedulerFinished = true
 		case refreshErr = <-refreshDone:
 			refreshFinished = true
+		case httpErr = <-httpDone:
+			httpFinished = true
 		case <-shutdown.C:
 			return errorsStable("recording-shutdown-timeout")
 		}
@@ -285,7 +320,28 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	if refreshErr != nil {
 		return errorsStable("recording-catalog-refresh-failed")
 	}
+	if httpErr != nil {
+		return errorsStable("recording-http-listen-failed")
+	}
 	return nil
+}
+
+type recordingHTTPFiles struct{ root *recordingfs.Root }
+
+// OpenFinalは録画保存先adapterの完成fileをHTTP境界の最小interfaceへ渡す。
+func (files recordingHTTPFiles) OpenFinal(plan corerecording.FilePlan, size int64) (recordinghttpadapter.FinalFile, error) {
+	if files.root == nil {
+		return nil, errors.New("recording file root unavailable")
+	}
+	return files.root.OpenFinal(plan, size)
+}
+
+func recordingListenScope(address string) string {
+	host, _, err := net.SplitHostPort(address)
+	if err == nil && net.ParseIP(host).IsLoopback() {
+		return "loopback"
+	}
+	return "private-lan"
 }
 
 func runCtrlCmdCommand(ctx context.Context, command string, arguments []string, stdout, stderr io.Writer) error {

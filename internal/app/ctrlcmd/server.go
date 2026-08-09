@@ -64,20 +64,20 @@ func (s *Server) Listen() (net.Listener, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := validateBoundAddress(listener.Addr()); err != nil {
+	if err := validateBoundAddress(listener.Addr(), s.config.AllowLAN); err != nil {
 		_ = listener.Close()
 		return nil, err
 	}
 	return listener, nil
 }
 
-// Serveはcontextがcancelされるかlistenerが閉じるまで、上限付きでloopback接続を受け付ける。
+// Serveはcontextがcancelされるかlistenerが閉じるまで、許可済みaddressから上限付きで接続を受け付ける。
 // listenerのCloseは呼び出し元の責任とする。Acceptを確実に解除するにはCloseを使用する。
 func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	if ctx == nil || listener == nil {
 		return errors.New("ctrlcmd: nil serve dependency")
 	}
-	if err := validateBoundAddress(listener.Addr()); err != nil {
+	if err := validateBoundAddress(listener.Addr(), s.config.AllowLAN); err != nil {
 		return err
 	}
 	for {

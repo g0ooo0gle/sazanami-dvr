@@ -19,6 +19,10 @@ const (
 	MaxPage = 256
 	// MaxRecoveryPageは再起動時にDBから一度に照合する録画処理の最大件数である。
 	MaxRecoveryPage = 100
+	// MaxHistoryPageは録画履歴を一度にDBから読む最大件数である。
+	MaxHistoryPage = 256
+	// MaxHistoryItemsはCtrlCmdへ列挙できる録画履歴の最大件数である。
+	MaxHistoryItems = 16_384
 )
 
 var (
@@ -339,6 +343,76 @@ type Attempt struct {
 	PlannedEnd    time.Time
 	ByteCount     int64
 	Plan          FilePlan
+}
+
+// HistoryItemは一回の終了済み録画を外部形式から独立して読み出すための保存済み事実である。
+// FilePlanはadapter内の安全なfile解決にだけ使い、HTTPやCtrlCmdへ直接公開しない。
+type HistoryItem struct {
+	Number            int32
+	State             AttemptState
+	Reason            TerminalReason
+	Title             string
+	StationName       string
+	NetworkID         uint16
+	TransportStreamID uint16
+	ServiceID         uint16
+	EventID           uint16
+	PlannedStart      time.Time
+	PlannedEnd        time.Time
+	ActualStart       *time.Time
+	ActualEnd         *time.Time
+	ByteCount         int64
+	Plan              FilePlan
+	SegmentState      SegmentState
+	Availability      Availability
+	FileSynced        bool
+	FinalPublished    bool
+	DirectorySynced   bool
+}
+
+// ValidateはDBから読んだ履歴が終了状態と時刻、file計画の不変条件を満たすか確認する。
+func (item HistoryItem) Validate() error {
+	if item.Number < 1 || !terminalAttemptState(item.State) || !item.Reason.Valid() ||
+		!validText(item.Title, 0, 4096) || !validText(item.StationName, 0, 4096) || item.ByteCount < 0 ||
+		item.PlannedStart.IsZero() || item.PlannedStart.Location() != time.UTC ||
+		item.PlannedEnd.Location() != time.UTC || !item.PlannedEnd.After(item.PlannedStart) ||
+		item.PlannedEnd.Sub(item.PlannedStart) > 24*time.Hour || item.Plan.Validate() != nil {
+		return errors.New("recording: invalid history item")
+	}
+	if (item.ActualStart == nil) != (item.ActualEnd == nil) {
+		return errors.New("recording: incomplete history time")
+	}
+	if item.ActualStart != nil && (item.ActualStart.Location() != time.UTC || item.ActualEnd.Location() != time.UTC ||
+		item.ActualEnd.Before(*item.ActualStart) || item.ActualEnd.Sub(*item.ActualStart) > 24*time.Hour) {
+		return errors.New("recording: invalid actual history time")
+	}
+	switch item.SegmentState {
+	case SegmentPlanned, SegmentWriting, SegmentPartial, SegmentFinalized:
+	default:
+		return errors.New("recording: invalid history segment state")
+	}
+	switch item.Availability {
+	case AvailabilityPlanned, AvailabilityPartial, AvailabilityFinal, AvailabilityMissing, AvailabilityMismatched:
+	default:
+		return errors.New("recording: invalid history availability")
+	}
+	return nil
+}
+
+// Playableは完成済み録画としてCtrlCmdとHTTPへ公開できる場合だけtrueを返す。
+func (item HistoryItem) Playable() bool {
+	return item.Validate() == nil && item.State == AttemptSucceeded && item.Reason.successful() &&
+		item.ActualStart != nil && item.ActualEnd.Sub(*item.ActualStart) >= time.Second && item.ByteCount >= 188 && item.SegmentState == SegmentFinalized &&
+		item.Availability == AvailabilityFinal && item.FileSynced && item.FinalPublished && item.DirectorySynced
+}
+
+func terminalAttemptState(state AttemptState) bool {
+	switch state {
+	case AttemptSucceeded, AttemptPartial, AttemptFailed, AttemptCancelled, AttemptMissed:
+		return true
+	default:
+		return false
+	}
 }
 
 // RecoveryItemは再起動時にDBと録画ファイルを照合するための、保存済みの事実である。

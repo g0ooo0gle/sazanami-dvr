@@ -78,6 +78,45 @@ func TestFilePlanAndRecordingRequests(t *testing.T) {
 	}
 }
 
+func TestHistoryItemRequiresEveryCompletedRecordingCondition(t *testing.T) {
+	start := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+	end := start.Add(time.Hour)
+	valid := HistoryItem{Number: 1, State: AttemptSucceeded, Reason: ReasonCompleted, Title: "番組", StationName: "放送局",
+		NetworkID: 1, TransportStreamID: 2, ServiceID: 3, EventID: 4, PlannedStart: start, PlannedEnd: end,
+		ActualStart: &start, ActualEnd: &end, ByteCount: 188,
+		Plan:         FilePlan{PartialPath: "2026/08/x.ts.partial", FinalPath: "2026/08/x.ts"},
+		SegmentState: SegmentFinalized, Availability: AvailabilityFinal, FileSynced: true, FinalPublished: true, DirectorySynced: true}
+	if err := valid.Validate(); err != nil || !valid.Playable() {
+		t.Fatalf("valid=%+v err=%v", valid, err)
+	}
+	changes := []func(*HistoryItem){
+		func(item *HistoryItem) { item.State = AttemptPartial },
+		func(item *HistoryItem) { item.Reason = ReasonStreamUnavailable },
+		func(item *HistoryItem) { item.ActualStart, item.ActualEnd = nil, nil },
+		func(item *HistoryItem) { same := start; item.ActualEnd = &same },
+		func(item *HistoryItem) { item.ByteCount = 187 },
+		func(item *HistoryItem) { item.SegmentState = SegmentPartial },
+		func(item *HistoryItem) { item.Availability = AvailabilityMissing },
+		func(item *HistoryItem) { item.FileSynced = false },
+		func(item *HistoryItem) { item.FinalPublished = false },
+		func(item *HistoryItem) { item.DirectorySynced = false },
+	}
+	for index, change := range changes {
+		item := valid
+		change(&item)
+		if item.Playable() {
+			t.Fatalf("condition %d without required value is playable: %+v", index, item)
+		}
+	}
+	for _, state := range []AttemptState{AttemptSucceeded, AttemptPartial, AttemptFailed, AttemptCancelled, AttemptMissed} {
+		item := valid
+		item.State = state
+		if err := item.Validate(); err != nil {
+			t.Fatalf("terminal state %s: %v", state, err)
+		}
+	}
+}
+
 func validReservation(t *testing.T) Reservation {
 	t.Helper()
 	created := time.Date(2026, 8, 5, 0, 0, 0, 0, time.UTC)

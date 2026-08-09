@@ -18,6 +18,7 @@ import (
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/codec"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/filecopy2"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/programguide"
+	recordedadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/recorded"
 	reservationadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/reservation"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/status"
 	coreautoreservation "github.com/g0ooo0gle/sazanami-dvr/internal/core/autoreservation"
@@ -40,6 +41,16 @@ type recordingCatalog struct {
 type emptyReservationOperations struct{}
 
 type emptyAutomaticReservationOperations struct{}
+
+type emptyRecordedOperations struct{}
+
+func (emptyRecordedOperations) CompletedRecordings(context.Context, int, int32) ([]recording.HistoryItem, error) {
+	return nil, nil
+}
+
+func (emptyRecordedOperations) RecordingHistoryItem(context.Context, int32) (*recording.HistoryItem, error) {
+	return nil, nil
+}
 
 func (emptyAutomaticReservationOperations) Add(context.Context, coreautoreservation.SearchCondition,
 	coreautoreservation.RecordingSettings,
@@ -374,6 +385,31 @@ func TestRecordingRouterDispatchesAutomaticReservationList(t *testing.T) {
 	binary.LittleEndian.PutUint32(request[0:4], uint32(autoreservationadapter.CommandList))
 	binary.LittleEndian.PutUint32(request[4:8], 2)
 	binary.LittleEndian.PutUint16(request[8:10], autoreservationadapter.Version)
+	var response bytes.Buffer
+	if err := router.Handle(context.Background(), request, &response); err != nil {
+		t.Fatal(err)
+	}
+	frame, err := codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
+	if err != nil || frame.Code != 1 {
+		t.Fatalf("frame=%+v err=%v", frame, err)
+	}
+}
+
+func TestRecordingRouterDispatchesCompletedRecordingList(t *testing.T) {
+	root, path, base, _ := validFixture(t)
+	snapshot, err := BuildSnapshot(context.Background(), root, path, &recordingCatalog{fakeCatalog: base})
+	if err != nil {
+		t.Fatal(err)
+	}
+	router, err := NewRecordingRouterComplete(snapshot, emptyReservationOperations{},
+		emptyAutomaticReservationOperations{}, emptyRecordedOperations{}, SystemClock{}, codec.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := make([]byte, 10)
+	binary.LittleEndian.PutUint32(request[0:4], uint32(recordedadapter.CommandList))
+	binary.LittleEndian.PutUint32(request[4:8], 2)
+	binary.LittleEndian.PutUint16(request[8:10], recordedadapter.Version)
 	var response bytes.Buffer
 	if err := router.Handle(context.Background(), request, &response); err != nil {
 		t.Fatal(err)

@@ -5,6 +5,7 @@ package recordingfs
 import (
 	"bytes"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -132,6 +133,116 @@ func TestRecordingRootRejectsSymlinkAndConcurrentOwner(t *testing.T) {
 	defer root.Close()
 	if _, err := OpenRoot(realRoot); err == nil {
 		t.Fatal("同じ録画rootの二重所有が受理されました")
+	}
+}
+
+func TestOpenFinalChecksPublishedFileAndExpectedSize(t *testing.T) {
+	rootPath := filepath.Join(t.TempDir(), "recordings")
+	root, err := OpenRoot(rootPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	plan, err := recording.NewFilePlan(time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC), fileID(t, 9))
+	if err != nil {
+		t.Fatal(err)
+	}
+	partial, err := root.CreatePartial(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := bytes.Repeat([]byte{0x47}, 188)
+	if _, err := partial.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := partial.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.LinkFinal(plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.RemovePartial(plan); err != nil {
+		t.Fatal(err)
+	}
+	file, err := root.OpenFinal(plan, 188)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(file)
+	if err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("bytes=%d err=%v", len(got), err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := root.OpenFinal(plan, 189); err == nil {
+		t.Fatal("size mismatch accepted")
+	}
+	if err := os.Chmod(filepath.Join(rootPath, filepath.FromSlash(plan.FinalPath)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := root.OpenFinal(plan, 188); err == nil {
+		t.Fatal("unsafe mode accepted")
+	}
+}
+
+func TestOpenFinalRejectsSymlinkAndDetectsReplacementAfterOpen(t *testing.T) {
+	rootPath := filepath.Join(t.TempDir(), "recordings")
+	root, err := OpenRoot(rootPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	plan, err := recording.NewFilePlan(time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC), fileID(t, 10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	partial, err := root.CreatePartial(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := bytes.Repeat([]byte{0x47}, 188)
+	if _, err := partial.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := partial.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.LinkFinal(plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.RemovePartial(plan); err != nil {
+		t.Fatal(err)
+	}
+	finalPath := filepath.Join(rootPath, filepath.FromSlash(plan.FinalPath))
+	opened, err := root.OpenFinal(plan, 188)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldPath := finalPath + ".old"
+	if err := os.Rename(finalPath, oldPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(finalPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.Read(make([]byte, 1)); err == nil {
+		t.Fatal("open後のfile差替えが検出されませんでした")
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(finalPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(oldPath, finalPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := root.OpenFinal(plan, 188); err == nil {
+		t.Fatal("symlinkの完成fileが受理されました")
 	}
 }
 
