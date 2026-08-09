@@ -57,9 +57,9 @@ CtrlCmd録画済み情報は、録画番号、仮想path、番組名、実開始
 
 resolverが返す画像URLは、完成録画の存在を確認してから製品が生成する中立なPNGを返す。チャプターURLは空の200応答、tile JSONは一枚分の最小情報を返す。実サムネイル、実チャプター、実タイル対応として表示しない。
 
-### CRR-010: HTTP待受
+### CRR-010: CtrlCmdとHTTPの待受
 
-録画常駐processはHTTP接続口を同じprocess内で所有する。既定はnumeric loopbackとする。利用者がnumeric private IPを明示した場合だけLAN待受を許可する。hostname、空host、unspecified、multicast、link-local、global IP、port 0を拒否する。
+録画常駐processはCtrlCmdとHTTP接続口を同じprocess内で所有する。両方の既定はnumeric loopbackとする。利用者がそれぞれのnumeric private IPを明示した場合だけLAN待受を許可する。hostname、空host、unspecified、multicast、link-local、global IP、port 0を拒否する。単独の`ctrlcmd serve`はloopback限定を維持する。
 
 HTTPはheader 16 KiB、header期限5秒、要求読取10秒、idle 30秒、同時録画配信8件を上限とする。待ちqueueは作らず、上限到達時は503を返す。
 
