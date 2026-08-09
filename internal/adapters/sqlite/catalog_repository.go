@@ -256,7 +256,7 @@ func (store *Store) ProgramsByServiceForGeneration(ctx context.Context, backendI
 		)
 		SELECT pi.id, pr.id, po.provider_service_locator, po.provider_event_locator, po.raw_event_id,
 		       pr.revision_number, pr.content_hash, pr.start_at_utc_ms, pr.duration_ms,
-		       pr.title, pr.description, pr.free_access, pr.validation_state, po.classification
+		       pr.title, pr.description, pr.free_access, pr.validation_state, pr.metadata, po.classification
 		FROM program_observations po
 		JOIN selected_sync cs ON cs.id=po.sync_id
 		JOIN program_instances pi ON pi.id=po.program_instance_id
@@ -287,7 +287,7 @@ func (store *Store) ProgramsForServiceForGeneration(ctx context.Context, backend
 		)
 		SELECT pi.id, pr.id, po.provider_service_locator, po.provider_event_locator, po.raw_event_id,
 		       pr.revision_number, pr.content_hash, pr.start_at_utc_ms, pr.duration_ms,
-		       pr.title, pr.description, pr.free_access, pr.validation_state, po.classification
+		       pr.title, pr.description, pr.free_access, pr.validation_state, pr.metadata, po.classification
 		FROM program_observations po
 		JOIN selected_sync cs ON cs.id=po.sync_id
 		JOIN program_instances pi ON pi.id=po.program_instance_id
@@ -316,7 +316,7 @@ func (store *Store) ProgramsMatchingGeneration(ctx context.Context, backendID, g
 		)
 		SELECT pi.id, pr.id, po.provider_service_locator, po.provider_event_locator, po.raw_event_id,
 		       pr.revision_number, pr.content_hash, pr.start_at_utc_ms, pr.duration_ms,
-		       pr.title, pr.description, pr.free_access, pr.validation_state, po.classification
+		       pr.title, pr.description, pr.free_access, pr.validation_state, pr.metadata, po.classification
 		FROM program_observations po
 		JOIN selected_sync cs ON cs.id=po.sync_id
 		JOIN program_instances pi ON pi.id=po.program_instance_id
@@ -345,7 +345,7 @@ func (store *Store) CurrentPrograms(ctx context.Context, backendID catalogmodel.
 		)
 		SELECT pi.id, pr.id, po.provider_service_locator, po.provider_event_locator, po.raw_event_id,
 		       pr.revision_number, pr.content_hash, pr.start_at_utc_ms, pr.duration_ms,
-		       pr.title, pr.description, pr.free_access, pr.validation_state, po.classification
+		       pr.title, pr.description, pr.free_access, pr.validation_state, pr.metadata, po.classification
 		FROM program_observations po
 		JOIN current_sync cs ON cs.id=po.sync_id
 		JOIN program_instances pi ON pi.id=po.program_instance_id
@@ -356,36 +356,7 @@ func (store *Store) CurrentPrograms(ctx context.Context, backendID catalogmodel.
 		return nil, sanitize("query-current-programs", err)
 	}
 	defer rows.Close()
-	result := make([]catalogmodel.CurrentProgram, 0, limit)
-	for rows.Next() {
-		var item catalogmodel.CurrentProgram
-		var instanceID, revisionID, hash []byte
-		var rawEventID, start, duration sql.NullInt64
-		var title, description sql.NullString
-		var free sql.NullInt64
-		var validation string
-		if err := rows.Scan(&instanceID, &revisionID, &item.ServiceLocator, &item.EventLocator, &rawEventID,
-			&item.RevisionNumber, &hash, &start, &duration, &title, &description, &free,
-			&validation, &item.Classification); err != nil {
-			return nil, sanitize("scan-current-program", err)
-		}
-		if err := copyExact(item.InstanceID[:], instanceID); err != nil {
-			return nil, err
-		}
-		if err := copyExact(item.RevisionID[:], revisionID); err != nil {
-			return nil, err
-		}
-		if err := copyExact(item.Hash[:], hash); err != nil {
-			return nil, err
-		}
-		item.RawEventID = nullableInt64(rawEventID)
-		item.Material = materialFromSQL(start, duration, title, description, free, validation)
-		result = append(result, item)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, sanitize("iterate-current-programs", err)
-	}
-	return result, nil
+	return scanCurrentPrograms(rows, limit)
 }
 
 // CurrentProgramsByServiceは最新の完成済み番組表を放送サービスとeventの順に256件以下で読む。
@@ -403,7 +374,7 @@ func (store *Store) CurrentProgramsByService(ctx context.Context, backendID cata
 		)
 		SELECT pi.id, pr.id, po.provider_service_locator, po.provider_event_locator, po.raw_event_id,
 		       pr.revision_number, pr.content_hash, pr.start_at_utc_ms, pr.duration_ms,
-		       pr.title, pr.description, pr.free_access, pr.validation_state, po.classification
+		       pr.title, pr.description, pr.free_access, pr.validation_state, pr.metadata, po.classification
 		FROM program_observations po
 		JOIN current_sync cs ON cs.id=po.sync_id
 		JOIN program_instances pi ON pi.id=po.program_instance_id
@@ -433,7 +404,7 @@ func (store *Store) CurrentProgramsForService(ctx context.Context, backendID cat
 		)
 		SELECT pi.id, pr.id, po.provider_service_locator, po.provider_event_locator, po.raw_event_id,
 		       pr.revision_number, pr.content_hash, pr.start_at_utc_ms, pr.duration_ms,
-		       pr.title, pr.description, pr.free_access, pr.validation_state, po.classification
+		       pr.title, pr.description, pr.free_access, pr.validation_state, pr.metadata, po.classification
 		FROM program_observations po
 		JOIN current_sync cs ON cs.id=po.sync_id
 		JOIN program_instances pi ON pi.id=po.program_instance_id
@@ -462,7 +433,7 @@ func (store *Store) CurrentProgramsMatching(ctx context.Context, backendID catal
 		)
 		SELECT pi.id, pr.id, po.provider_service_locator, po.provider_event_locator, po.raw_event_id,
 		       pr.revision_number, pr.content_hash, pr.start_at_utc_ms, pr.duration_ms,
-		       pr.title, pr.description, pr.free_access, pr.validation_state, po.classification
+		       pr.title, pr.description, pr.free_access, pr.validation_state, pr.metadata, po.classification
 		FROM program_observations po
 		JOIN current_sync cs ON cs.id=po.sync_id
 		JOIN program_instances pi ON pi.id=po.program_instance_id
@@ -585,7 +556,7 @@ func (store *Store) CurrentProgramsInWindow(ctx context.Context, backendID catal
 		)
 		SELECT pi.id, pr.id, po.provider_service_locator, po.provider_event_locator, po.raw_event_id,
 		       pr.revision_number, pr.content_hash, pr.start_at_utc_ms, pr.duration_ms,
-		       pr.title, pr.description, pr.free_access, pr.validation_state, po.classification
+		       pr.title, pr.description, pr.free_access, pr.validation_state, pr.metadata, po.classification
 		FROM program_observations po
 		JOIN current_sync cs ON cs.id=po.sync_id
 		JOIN program_instances pi ON pi.id=po.program_instance_id
@@ -611,14 +582,14 @@ func scanCurrentPrograms(rows *sql.Rows, capacity int) ([]catalogmodel.CurrentPr
 	result := make([]catalogmodel.CurrentProgram, 0, capacity)
 	for rows.Next() {
 		var item catalogmodel.CurrentProgram
-		var instanceID, revisionID, hash []byte
+		var instanceID, revisionID, hash, metadata []byte
 		var rawEventID, start, duration sql.NullInt64
 		var title, description sql.NullString
 		var free sql.NullInt64
 		var validation string
 		if err := rows.Scan(&instanceID, &revisionID, &item.ServiceLocator, &item.EventLocator, &rawEventID,
 			&item.RevisionNumber, &hash, &start, &duration, &title, &description, &free,
-			&validation, &item.Classification); err != nil {
+			&validation, &metadata, &item.Classification); err != nil {
 			return nil, sanitize("scan-current-program", err)
 		}
 		if err := copyExact(item.InstanceID[:], instanceID); err != nil {
@@ -631,7 +602,11 @@ func scanCurrentPrograms(rows *sql.Rows, capacity int) ([]catalogmodel.CurrentPr
 			return nil, err
 		}
 		item.RawEventID = nullableInt64(rawEventID)
-		item.Material = materialFromSQL(start, duration, title, description, free, validation)
+		material, err := materialFromSQL(start, duration, title, description, free, validation, metadata)
+		if err != nil {
+			return nil, err
+		}
+		item.Material = material
 		result = append(result, item)
 	}
 	if err := rows.Err(); err != nil {
@@ -746,7 +721,7 @@ func storeProgram(ctx context.Context, tx *sql.Tx, syncID catalogmodel.ID, backe
 	if err := copyExact(serviceID[:], serviceIDBytes); err != nil {
 		return err
 	}
-	hash, hashErr := catalogmodel.HashRevisionV1(observation.Material)
+	hash, hashErr := catalogmodel.HashRevision(observation.Material)
 	if hashErr != nil || observation.Material.Validation == catalogmodel.ValidationInvalid {
 		_, err := tx.ExecContext(ctx, `
 			INSERT INTO program_observations(sync_id, provider_service_locator, provider_event_locator,
@@ -777,17 +752,17 @@ func storeProgram(ctx context.Context, tx *sql.Tx, syncID catalogmodel.ID, backe
 
 	var revisionID catalogmodel.ID
 	var revisionIDBytes []byte
-	var latestHash []byte
+	var latestHash, previousMetadata []byte
 	var revisionNumber int64
 	var previousStart, previousDuration, previousFree sql.NullInt64
 	var previousTitle, previousDescription sql.NullString
 	var previousValidation string
 	if err := tx.QueryRowContext(ctx, `
 		SELECT id, content_hash, revision_number, start_at_utc_ms, duration_ms, title, description,
-		       free_access, validation_state FROM program_revisions
+		       free_access, validation_state, metadata FROM program_revisions
 		WHERE program_instance_id=? ORDER BY revision_number DESC LIMIT 1`, instanceID.Bytes()).
 		Scan(&revisionIDBytes, &latestHash, &revisionNumber, &previousStart, &previousDuration,
-			&previousTitle, &previousDescription, &previousFree, &previousValidation); err != nil {
+			&previousTitle, &previousDescription, &previousFree, &previousValidation, &previousMetadata); err != nil {
 		return sanitize("read-latest-revision", err)
 	}
 	if err := copyExact(revisionID[:], revisionIDBytes); err != nil {
@@ -803,8 +778,11 @@ func storeProgram(ctx context.Context, tx *sql.Tx, syncID catalogmodel.ID, backe
 		}
 		return insertProgramObservation(ctx, tx, syncID, observation, hash, instanceID, revisionID, catalogmodel.SameContent)
 	}
-	previousMaterial := materialFromSQL(previousStart, previousDuration, previousTitle, previousDescription,
-		previousFree, previousValidation)
+	previousMaterial, err := materialFromSQL(previousStart, previousDuration, previousTitle, previousDescription,
+		previousFree, previousValidation, previousMetadata)
+	if err != nil {
+		return err
+	}
 	var previousEventPointer *int64
 	if previousEventID.Valid {
 		previousEventPointer = &previousEventID.Int64
@@ -877,12 +855,16 @@ func insertRevision(ctx context.Context, tx *sql.Tx, revisionID, instanceID cata
 	case catalogmodel.FreeYes:
 		free = 1
 	}
-	_, err := tx.ExecContext(ctx, `
+	metadata, err := catalogmodel.EncodeMetadataV1(material.Metadata)
+	if err != nil {
+		return errors.New("sqlite: invalid program metadata")
+	}
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO program_revisions(id, program_instance_id, revision_number, content_hash,
-		 start_at_utc_ms, duration_ms, title, description, free_access, validation_state, created_at_utc_ms)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, revisionID.Bytes(), instanceID.Bytes(), number, hash[:],
+		 start_at_utc_ms, duration_ms, title, description, free_access, validation_state, created_at_utc_ms, metadata)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, revisionID.Bytes(), instanceID.Bytes(), number, hash[:],
 		material.StartUTCMS, material.DurationMS, material.Title, material.Description, free,
-		validationText(material.Validation), createdAt)
+		validationText(material.Validation), createdAt, nullableBytes(metadata))
 	if err != nil {
 		return sanitize("insert-program-revision", err)
 	}
@@ -989,7 +971,7 @@ func validationText(value catalogmodel.Validation) string {
 	}
 }
 
-func materialFromSQL(start, duration sql.NullInt64, title, description sql.NullString, free sql.NullInt64, validation string) catalogmodel.RevisionMaterial {
+func materialFromSQL(start, duration sql.NullInt64, title, description sql.NullString, free sql.NullInt64, validation string, metadata []byte) (catalogmodel.RevisionMaterial, error) {
 	material := catalogmodel.RevisionMaterial{Validation: catalogmodel.ValidationInvalid}
 	if start.Valid {
 		material.StartUTCMS = &start.Int64
@@ -1013,7 +995,19 @@ func materialFromSQL(start, duration sql.NullInt64, title, description sql.NullS
 	} else if validation == "PROVISIONAL" {
 		material.Validation = catalogmodel.ValidationProvisional
 	}
-	return material
+	decoded, err := catalogmodel.DecodeMetadataV1(metadata)
+	if err != nil {
+		return catalogmodel.RevisionMaterial{}, errors.New("sqlite: corrupt program metadata")
+	}
+	material.Metadata = decoded
+	return material, nil
+}
+
+func nullableBytes(value []byte) any {
+	if len(value) == 0 {
+		return nil
+	}
+	return value
 }
 
 func copyExact(destination, source []byte) error {

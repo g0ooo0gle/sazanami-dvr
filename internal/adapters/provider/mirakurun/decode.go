@@ -160,6 +160,14 @@ func decodeProgram(decoder *json.Decoder, provenance provider.Provenance) (catal
 			result.Title, err = readString(decoder, 4_096)
 		case "description":
 			result.Description, err = readString(decoder, 65_536)
+		case "extended":
+			result.Extended, err = decodeExtended(decoder)
+		case "genres":
+			result.Genres, err = decodeGenres(decoder)
+		case "video":
+			result.Video, err = decodeVideo(decoder)
+		case "audios":
+			result.Audios, err = decodeAudios(decoder)
 		default:
 			count := 0
 			err = skipValue(decoder, 0, &count)
@@ -199,6 +207,273 @@ func decodeProgram(decoder *json.Decoder, provenance provider.Provenance) (catal
 		result.Validation = provider.ValidationUnknown
 	}
 	return result, nil
+}
+
+func decodeExtended(decoder *json.Decoder) ([]catalog.ProgramExtended, error) {
+	seen, err := beginObject(decoder)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]catalog.ProgramExtended, 0, 8)
+	for decoder.More() {
+		heading, keyErr := readObjectKey(decoder, seen)
+		if keyErr != nil {
+			return nil, keyErr
+		}
+		if len(items) >= 64 {
+			return nil, provider.NewFailure(provider.ReasonOverLimit, "program-extended-count-over-limit")
+		}
+		if len(heading) > 4_096 {
+			return nil, provider.NewFailure(provider.ReasonOverLimit, "program-extended-heading-over-limit")
+		}
+		body, bodyErr := readString(decoder, 65_536)
+		if bodyErr != nil {
+			return nil, bodyErr
+		}
+		items = append(items, catalog.ProgramExtended{Heading: heading, Body: body})
+	}
+	if err := endObject(decoder); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+func decodeGenres(decoder *json.Decoder) ([]catalog.ProgramGenre, error) {
+	if err := beginArray(decoder); err != nil {
+		return nil, err
+	}
+	items := make([]catalog.ProgramGenre, 0, 8)
+	for decoder.More() {
+		if len(items) >= 64 {
+			return nil, provider.NewFailure(provider.ReasonOverLimit, "program-genre-count-over-limit")
+		}
+		item, err := decodeGenre(decoder)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	if err := endArray(decoder); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+func decodeGenre(decoder *json.Decoder) (catalog.ProgramGenre, error) {
+	seen, err := beginObject(decoder)
+	if err != nil {
+		return catalog.ProgramGenre{}, err
+	}
+	var item catalog.ProgramGenre
+	var hasLevel1, hasLevel2, hasUser1, hasUser2 bool
+	for decoder.More() {
+		key, keyErr := readObjectKey(decoder, seen)
+		if keyErr != nil {
+			return catalog.ProgramGenre{}, keyErr
+		}
+		switch key {
+		case "lv1":
+			value, valueErr := readUint(decoder, math.MaxUint8)
+			err, item.Level1, hasLevel1 = valueErr, uint8(value), valueErr == nil
+		case "lv2":
+			value, valueErr := readUint(decoder, math.MaxUint8)
+			err, item.Level2, hasLevel2 = valueErr, uint8(value), valueErr == nil
+		case "un1":
+			value, valueErr := readUint(decoder, math.MaxUint8)
+			err, item.User1, hasUser1 = valueErr, uint8(value), valueErr == nil
+		case "un2":
+			value, valueErr := readUint(decoder, math.MaxUint8)
+			err, item.User2, hasUser2 = valueErr, uint8(value), valueErr == nil
+		default:
+			count := 0
+			err = skipValue(decoder, 0, &count)
+		}
+		if err != nil {
+			return catalog.ProgramGenre{}, err
+		}
+	}
+	if err := endObject(decoder); err != nil {
+		return catalog.ProgramGenre{}, err
+	}
+	if !hasLevel1 || !hasLevel2 || !hasUser1 || !hasUser2 {
+		return catalog.ProgramGenre{}, provider.NewFailure(provider.ReasonMalformed, "program-genre-required-field-missing")
+	}
+	return item, nil
+}
+
+func decodeVideo(decoder *json.Decoder) (*catalog.ProgramVideo, error) {
+	seen, err := beginObject(decoder)
+	if err != nil {
+		return nil, err
+	}
+	var item catalog.ProgramVideo
+	var hasType, hasResolution, hasStream, hasComponent bool
+	for decoder.More() {
+		key, keyErr := readObjectKey(decoder, seen)
+		if keyErr != nil {
+			return nil, keyErr
+		}
+		switch key {
+		case "type":
+			_, err = readString(decoder, 32)
+			hasType = err == nil
+		case "resolution":
+			_, err = readString(decoder, 32)
+			hasResolution = err == nil
+		case "streamContent":
+			value, valueErr := readUint(decoder, math.MaxUint8)
+			err, item.StreamContent, hasStream = valueErr, uint8(value), valueErr == nil
+		case "componentType":
+			value, valueErr := readUint(decoder, math.MaxUint8)
+			err, item.ComponentType, hasComponent = valueErr, uint8(value), valueErr == nil
+		default:
+			count := 0
+			err = skipValue(decoder, 0, &count)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := endObject(decoder); err != nil {
+		return nil, err
+	}
+	if !hasType || !hasResolution || !hasStream || !hasComponent {
+		return nil, provider.NewFailure(provider.ReasonMalformed, "program-video-required-field-missing")
+	}
+	return &item, nil
+}
+
+func decodeAudios(decoder *json.Decoder) ([]catalog.ProgramAudio, error) {
+	if err := beginArray(decoder); err != nil {
+		return nil, err
+	}
+	items := make([]catalog.ProgramAudio, 0, 2)
+	for decoder.More() {
+		if len(items) >= 16 {
+			return nil, provider.NewFailure(provider.ReasonOverLimit, "program-audio-count-over-limit")
+		}
+		item, err := decodeAudio(decoder)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	if err := endArray(decoder); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+func decodeAudio(decoder *json.Decoder) (catalog.ProgramAudio, error) {
+	seen, err := beginObject(decoder)
+	if err != nil {
+		return catalog.ProgramAudio{}, err
+	}
+	var item catalog.ProgramAudio
+	var hasType, hasTag, hasMain, hasRate, hasLanguages bool
+	for decoder.More() {
+		key, keyErr := readObjectKey(decoder, seen)
+		if keyErr != nil {
+			return catalog.ProgramAudio{}, keyErr
+		}
+		switch key {
+		case "componentType":
+			value, valueErr := readUint(decoder, math.MaxUint8)
+			err, item.ComponentType, hasType = valueErr, uint8(value), valueErr == nil
+		case "componentTag":
+			value, valueErr := readUint(decoder, math.MaxUint8)
+			err, item.ComponentTag, hasTag = valueErr, uint8(value), valueErr == nil
+		case "isMain":
+			item.Main, err = readBool(decoder)
+			hasMain = err == nil
+		case "samplingRate":
+			value, valueErr := readUint(decoder, math.MaxUint32)
+			err, item.SamplingRate, hasRate = valueErr, uint32(value), valueErr == nil
+			if err == nil && !validAudioSamplingRate(item.SamplingRate) {
+				err = provider.NewFailure(provider.ReasonMalformed, "program-audio-sampling-rate-invalid")
+			}
+		case "langs":
+			item.Languages, err = decodeLanguages(decoder)
+			hasLanguages = err == nil
+		default:
+			count := 0
+			err = skipValue(decoder, 0, &count)
+		}
+		if err != nil {
+			return catalog.ProgramAudio{}, err
+		}
+	}
+	if err := endObject(decoder); err != nil {
+		return catalog.ProgramAudio{}, err
+	}
+	if !hasType || !hasTag || !hasMain || !hasRate || !hasLanguages {
+		return catalog.ProgramAudio{}, provider.NewFailure(provider.ReasonMalformed, "program-audio-required-field-missing")
+	}
+	return item, nil
+}
+
+func decodeLanguages(decoder *json.Decoder) ([]string, error) {
+	if err := beginArray(decoder); err != nil {
+		return nil, err
+	}
+	languages := make([]string, 0, 2)
+	for decoder.More() {
+		if len(languages) >= 2 {
+			return nil, provider.NewFailure(provider.ReasonOverLimit, "program-audio-language-count-over-limit")
+		}
+		language, err := readString(decoder, 3)
+		if err != nil {
+			return nil, err
+		}
+		if !validAudioLanguage(language) {
+			return nil, provider.NewFailure(provider.ReasonMalformed, "program-audio-language-invalid")
+		}
+		languages = append(languages, language)
+	}
+	if err := endArray(decoder); err != nil {
+		return nil, err
+	}
+	return languages, nil
+}
+
+func beginArray(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if delimiter, ok := token.(json.Delim); !ok || delimiter != '[' {
+		return provider.NewFailure(provider.ReasonMalformed, "json-array-required")
+	}
+	return nil
+}
+
+func endArray(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if delimiter, ok := token.(json.Delim); !ok || delimiter != ']' {
+		return provider.NewFailure(provider.ReasonMalformed, "json-array-end-required")
+	}
+	return nil
+}
+
+func validAudioSamplingRate(rate uint32) bool {
+	switch rate {
+	case 16_000, 22_050, 24_000, 32_000, 44_100, 48_000:
+		return true
+	default:
+		return false
+	}
+}
+
+func validAudioLanguage(language string) bool {
+	switch language {
+	case "jpn", "eng", "deu", "fra", "ita", "rus", "zho", "kor", "spa", "etc":
+		return true
+	default:
+		return false
+	}
 }
 
 func beginObject(decoder *json.Decoder) (map[string]struct{}, error) {

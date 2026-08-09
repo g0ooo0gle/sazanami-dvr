@@ -46,6 +46,39 @@ type ProgramObservation struct {
 	FreeAccess          *bool
 	RevisionFingerprint string
 	Validation          provider.ValidationState
+	Extended            []ProgramExtended
+	Genres              []ProgramGenre
+	Video               *ProgramVideo
+	Audios              []ProgramAudio
+}
+
+// ProgramExtendedはproviderから観測した番組詳細の見出しと本文を表す。
+type ProgramExtended struct {
+	Heading string
+	Body    string
+}
+
+// ProgramGenreはproviderから観測した番組ジャンルの分類値を表す。
+type ProgramGenre struct {
+	Level1 uint8
+	Level2 uint8
+	User1  uint8
+	User2  uint8
+}
+
+// ProgramVideoはproviderから観測した映像componentを表す。
+type ProgramVideo struct {
+	StreamContent uint8
+	ComponentType uint8
+}
+
+// ProgramAudioはproviderから観測した音声componentを表す。
+type ProgramAudio struct {
+	ComponentType uint8
+	ComponentTag  uint8
+	Main          bool
+	SamplingRate  uint32
+	Languages     []string
 }
 
 // ServicePageはserviceのbounded pageと終端有無を返す。
@@ -87,6 +120,17 @@ func CloneProgramPage(page ProgramPage) ProgramPage {
 		if page.Items[i].FreeAccess != nil {
 			value := *page.Items[i].FreeAccess
 			items[i].FreeAccess = &value
+		}
+		items[i].Extended = append([]ProgramExtended(nil), page.Items[i].Extended...)
+		items[i].Genres = append([]ProgramGenre(nil), page.Items[i].Genres...)
+		if page.Items[i].Video != nil {
+			value := *page.Items[i].Video
+			items[i].Video = &value
+		}
+		items[i].Audios = make([]ProgramAudio, len(page.Items[i].Audios))
+		for audioIndex := range page.Items[i].Audios {
+			items[i].Audios[audioIndex] = page.Items[i].Audios[audioIndex]
+			items[i].Audios[audioIndex].Languages = append([]string(nil), page.Items[i].Audios[audioIndex].Languages...)
 		}
 	}
 	return ProgramPage{Items: items, End: page.End}

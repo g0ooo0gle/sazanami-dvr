@@ -297,6 +297,26 @@ func convertProgram(observation providercatalog.ProgramObservation) (catalogmode
 		Title: pointer(observation.Title), Description: pointer(observation.Description),
 		Validation: convertValidation(observation.Validation), FreeAccess: catalogmodel.FreeUnknown,
 	}
+	for _, item := range observation.Extended {
+		material.Metadata.Extended = append(material.Metadata.Extended, catalogmodel.ExtendedItem{Heading: item.Heading, Body: item.Body})
+	}
+	for _, item := range observation.Genres {
+		material.Metadata.Genres = append(material.Metadata.Genres, catalogmodel.Genre{Level1: item.Level1, Level2: item.Level2, User1: item.User1, User2: item.User2})
+	}
+	if observation.Video != nil {
+		material.Metadata.Video = &catalogmodel.Video{StreamContent: observation.Video.StreamContent, ComponentType: observation.Video.ComponentType}
+	}
+	for _, item := range observation.Audios {
+		material.Metadata.Audios = append(material.Metadata.Audios, catalogmodel.Audio{
+			ComponentType: item.ComponentType, ComponentTag: item.ComponentTag, Main: item.Main,
+			SamplingRate: item.SamplingRate, Languages: append([]string(nil), item.Languages...),
+		})
+	}
+	normalized, normalizeErr := catalogmodel.NormalizeMetadata(material.Metadata)
+	if normalizeErr != nil {
+		return catalogmodel.ProgramObservation{}, errors.New("catalogsync: invalid program metadata")
+	}
+	material.Metadata = normalized
 	if observation.FreeAccess != nil {
 		if *observation.FreeAccess {
 			material.FreeAccess = catalogmodel.FreeYes
