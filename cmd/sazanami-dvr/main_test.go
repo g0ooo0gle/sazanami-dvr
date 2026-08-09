@@ -31,7 +31,7 @@ func TestVersion(t *testing.T) {
 	if code := run([]string{"--version"}, &output, &diagnostic); code != 0 {
 		t.Fatalf("code=%d err=%q", code, diagnostic.String())
 	}
-	if got, want := output.String(), "sazanami-dvr 0.0.16\n"; got != want {
+	if got, want := output.String(), "sazanami-dvr 0.0.17\n"; got != want {
 		t.Fatalf("version=%q want=%q", got, want)
 	}
 }
@@ -281,14 +281,40 @@ func TestCtrlCmdRejectsInvalidConfigAndOwnerLockBeforeListen(t *testing.T) {
 }
 
 func TestCtrlCmdRejectsUnsafeListenBeforeDatabase(t *testing.T) {
-	for _, address := range []string{"0.0.0.0:4510", "192.0.2.39:4510", "localhost:4510", "127.0.0.1:0", "127.0.0.1:not-a-port"} {
+	for _, address := range []string{"192.0.2.39:4510", "169.254.1.39:4510", "224.0.0.1:4510", "localhost:4510", "127.0.0.1:0", "127.0.0.1:65536", "127.0.0.1:not-a-port"} {
 		var output, diagnostic bytes.Buffer
 		code := runContext(context.Background(), []string{
 			"ctrlcmd", "serve", "--data-root", "/private/not-for-output", "--channel-map", "/private/not-for-output/channels.json", "--listen", address,
 		}, &output, &diagnostic)
-		if code != 1 || !strings.Contains(diagnostic.String(), "loopback-listen-required") || strings.Contains(diagnostic.String(), "/private") {
+		if code != 1 || !strings.Contains(diagnostic.String(), "local-ctrlcmd-listen-required") || strings.Contains(diagnostic.String(), "/private") {
 			t.Fatalf("address=%q code=%d diagnostic=%q", address, code, diagnostic.String())
 		}
+	}
+}
+
+func TestCtrlCmdAcceptsLANListenBeforeDatabase(t *testing.T) {
+	for _, address := range []string{"0.0.0.0:4510", "[::]:4510", "10.254.254.39:4510", "[fd00::39]:4510"} {
+		var output, diagnostic bytes.Buffer
+		code := runContext(context.Background(), []string{
+			"ctrlcmd", "serve", "--data-root", "/private/not-for-output", "--channel-map", "/private/not-for-output/channels.json", "--listen", address,
+		}, &output, &diagnostic)
+		if code != 1 || !strings.Contains(diagnostic.String(), "current-database-required") || strings.Contains(diagnostic.String(), "/private") {
+			t.Fatalf("address=%q code=%d diagnostic=%q", address, code, diagnostic.String())
+		}
+	}
+}
+
+func TestCtrlCmdLANNoticeDoesNotExposeAddress(t *testing.T) {
+	var output bytes.Buffer
+	writeCtrlCmdLANNotice(&output, "10.254.254.39:4510")
+	text := output.String()
+	if strings.Count(text, "認証なし") != 1 || strings.Contains(text, "10.254.254.39") {
+		t.Fatalf("notice=%q", text)
+	}
+	output.Reset()
+	writeCtrlCmdLANNotice(&output, "127.0.0.1:4510")
+	if output.Len() != 0 {
+		t.Fatalf("loopback notice=%q", output.String())
 	}
 }
 

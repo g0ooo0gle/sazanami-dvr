@@ -47,9 +47,18 @@ type constantClock struct{ instant time.Time }
 
 func (c constantClock) Now() time.Time { return c.instant }
 
-func testConfig() Config {
+func testConfig(t *testing.T) Config {
+	t.Helper()
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := probe.Addr().String()
+	if err := probe.Close(); err != nil {
+		t.Fatal(err)
+	}
 	config := DefaultConfig()
-	config.Address = "127.0.0.1:0"
+	config.Address = address
 	config.HeaderTimeout = 250 * time.Millisecond
 	config.ConnectionLifetime = time.Second
 	return config
@@ -94,11 +103,12 @@ func stopServer(t *testing.T, listener net.Listener, cancel context.CancelFunc, 
 
 func TestConfigRejectsUnsafeOrUnboundedValues(t *testing.T) {
 	cases := map[string]func(*Config){
-		"wildcard v4":      func(c *Config) { c.Address = "0.0.0.0:4510" },
-		"wildcard v6":      func(c *Config) { c.Address = "[::]:4510" },
-		"non-loopback":     func(c *Config) { c.Address = "192.0.2.1:4510" },
+		"global address":   func(c *Config) { c.Address = "192.0.2.1:4510" },
 		"hostname":         func(c *Config) { c.Address = "localhost:4510" },
 		"missing port":     func(c *Config) { c.Address = "127.0.0.1" },
+		"port zero":        func(c *Config) { c.Address = "127.0.0.1:0" },
+		"port over":        func(c *Config) { c.Address = "127.0.0.1:65536" },
+		"port non-number":  func(c *Config) { c.Address = "127.0.0.1:not-a-port" },
 		"connections zero": func(c *Config) { c.MaxConnections = 0 },
 		"connections over": func(c *Config) { c.MaxConnections = DefaultConnections + 1 },
 		"handlers zero":    func(c *Config) { c.MaxHandlers = 0 },
@@ -116,7 +126,9 @@ func TestConfigRejectsUnsafeOrUnboundedValues(t *testing.T) {
 			}
 		})
 	}
-	for _, address := range []string{"127.0.0.1:4510", "[::1]:4510"} {
+	for _, address := range []string{
+		DefaultAddress, "127.0.0.1:4510", "[::1]:4510", "10.254.254.39:4510", "192.168.1.39:4510", "[fd00::39]:4510", "[::]:4510",
+	} {
 		config := DefaultConfig()
 		config.Address = address
 		if err := config.Validate(); err != nil {
@@ -152,7 +164,7 @@ func TestLoopbackEndToEndSyntheticJourney(t *testing.T) {
 		Source: normalSource{},
 		Clock:  constantClock{instant: time.Date(2026, 7, 31, 0, 0, 0, 123_000_000, time.UTC)},
 	}
-	server, err := NewServer(testConfig(), handler)
+	server, err := NewServer(testConfig(t), handler)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +206,7 @@ func TestMalformedLengthClosesWithoutHandler(t *testing.T) {
 		mu.Unlock()
 		return nil
 	})
-	server, _ := NewServer(testConfig(), handler)
+	server, _ := NewServer(testConfig(t), handler)
 	listener, cancel, done := startServer(t, server)
 	for _, declared := range []uint32{^uint32(0), 1*1024*1024 + 1} {
 		connection, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second)
@@ -219,7 +231,7 @@ func TestMalformedLengthClosesWithoutHandler(t *testing.T) {
 }
 
 func TestHeaderTimeoutIsAbsoluteAndBounded(t *testing.T) {
-	config := testConfig()
+	config := testConfig(t)
 	config.HeaderTimeout = 40 * time.Millisecond
 	config.ConnectionLifetime = 100 * time.Millisecond
 	server, _ := NewServer(config, handlerFunc(func(context.Context, []byte, io.Writer) error { return nil }))
@@ -252,7 +264,7 @@ func TestLongLivedCapabilityClearsOnlyNormalConnectionDeadline(t *testing.T) {
 		{name: "normal", long: false, success: false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			config := testConfig()
+			config := testConfig(t)
 			config.HeaderTimeout = 20 * time.Millisecond
 			config.ConnectionLifetime = 40 * time.Millisecond
 			server, err := NewServer(config, longHandler{delay: 80 * time.Millisecond, long: test.long})
@@ -302,7 +314,7 @@ func TestHandlerSaturationFailsClosed(t *testing.T) {
 		_, err := destination.Write([]byte{1})
 		return err
 	})
-	config := testConfig()
+	config := testConfig(t)
 	config.MaxConnections = 2
 	config.MaxHandlers = 1
 	server, _ := NewServer(config, handler)
@@ -341,8 +353,8 @@ func (l inertListener) Accept() (net.Conn, error) { return nil, errors.New("must
 func (l inertListener) Close() error              { return nil }
 func (l inertListener) Addr() net.Addr            { return l.address }
 
-func TestServeRejectsNonLoopbackListenerBeforeAccept(t *testing.T) {
-	server, _ := NewServer(testConfig(), handlerFunc(func(context.Context, []byte, io.Writer) error { return nil }))
+func TestServeRejectsGlobalListenerBeforeAccept(t *testing.T) {
+	server, _ := NewServer(testConfig(t), handlerFunc(func(context.Context, []byte, io.Writer) error { return nil }))
 	err := server.Serve(context.Background(), inertListener{address: &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 4510}})
 	if err == nil {
 		t.Fatal("non-loopback listener accepted")
@@ -350,7 +362,7 @@ func TestServeRejectsNonLoopbackListenerBeforeAccept(t *testing.T) {
 }
 
 func TestNewServerRejectsNilHandler(t *testing.T) {
-	if _, err := NewServer(testConfig(), nil); err == nil {
+	if _, err := NewServer(testConfig(t), nil); err == nil {
 		t.Fatal("nil handler accepted")
 	}
 }

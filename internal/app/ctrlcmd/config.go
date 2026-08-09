@@ -4,11 +4,12 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strconv"
 	"time"
 )
 
 const (
-	DefaultAddress       = "127.0.0.1:4510"
+	DefaultAddress       = "0.0.0.0:4510"
 	DefaultConnections   = 32
 	DefaultHandlers      = 16
 	DefaultHeaderTimeout = 2 * time.Second
@@ -33,11 +34,10 @@ type Config struct {
 func RecordingConfig() Config {
 	config := DefaultConfig()
 	config.ConnectionLifetime = MaximumLifetime
-	config.AllowLAN = true
 	return config
 }
 
-// DefaultConfigはloopback限定の既定値を返す。
+// DefaultConfigは認証なしのLAN待受と、1接続ごとの固定上限を返す。
 func DefaultConfig() Config {
 	return Config{
 		Address:            DefaultAddress,
@@ -46,6 +46,7 @@ func DefaultConfig() Config {
 		MaxRequestBody:     1 * 1024 * 1024,
 		HeaderTimeout:      DefaultHeaderTimeout,
 		ConnectionLifetime: DefaultLifetime,
+		AllowLAN:           true,
 	}
 }
 
@@ -54,6 +55,10 @@ func (c Config) Validate() error {
 	host, port, err := net.SplitHostPort(c.Address)
 	if err != nil || port == "" {
 		return fmt.Errorf("ctrlcmd: listen address must include an explicit host and port")
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65_535 {
+		return fmt.Errorf("ctrlcmd: listen port is outside accepted scope")
 	}
 	ip, err := netip.ParseAddr(host)
 	if err != nil || !acceptedAddress(ip, c.AllowLAN) {

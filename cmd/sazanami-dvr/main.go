@@ -36,7 +36,7 @@ import (
 )
 
 var (
-	version       = "0.0.16"
+	version       = "0.0.17"
 	productCommit = ""
 )
 
@@ -287,6 +287,7 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	go func() { refreshDone <- refresher.Run(serviceContext) }()
 	fmt.Fprintf(stdout, "録画プロセスを開始しました: ctrlcmd_scope=%s http_scope=%s services=%d catalog_refresh_interval=%s max_concurrent_recordings=%d\n",
 		recordingListenScope(*listenAddress), recordingListenScope(*httpListenAddress), snapshot.Count(), refreshInterval.String(), *maximumRecordings)
+	writeCtrlCmdLANNotice(stdout, *listenAddress)
 	var serverErr, schedulerErr, refreshErr, httpErr error
 	serverFinished, schedulerFinished, refreshFinished, httpFinished := false, false, false, false
 	select {
@@ -357,6 +358,14 @@ func recordingListenScope(address string) string {
 	return "private-lan"
 }
 
+// writeCtrlCmdLANNoticeは認証なしのLAN公開時だけ、接続先を含まない注意を一度表示する。
+func writeCtrlCmdLANNotice(destination io.Writer, address string) {
+	if recordingListenScope(address) == "loopback" {
+		return
+	}
+	fmt.Fprintln(destination, "注意: CtrlCmdは認証なしでLANへ公開されています。インターネットへ直接公開しないでください。狭く使う場合は --listen 127.0.0.1:4510 を指定します。")
+}
+
 func runCtrlCmdCommand(ctx context.Context, command string, arguments []string, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("ctrlcmd "+command, flag.ContinueOnError)
 	flags.SetOutput(stderr)
@@ -364,7 +373,7 @@ func runCtrlCmdCommand(ctx context.Context, command string, arguments []string, 
 	channelMap := flags.String("channel-map", "", "data root直下のチャンネル設定JSON")
 	listenAddress := ctrlcmdapp.DefaultAddress
 	if command == "serve" {
-		flags.StringVar(&listenAddress, "listen", ctrlcmdapp.DefaultAddress, "numeric loopbackの待受アドレス")
+		flags.StringVar(&listenAddress, "listen", ctrlcmdapp.DefaultAddress, "loopback、private IPまたは全interfaceの待受アドレス")
 	}
 	if err := flags.Parse(arguments); err != nil {
 		return errorsStable("invalid-command-arguments")
@@ -376,7 +385,7 @@ func runCtrlCmdCommand(ctx context.Context, command string, arguments []string, 
 	config.Address = listenAddress
 	if command == "serve" {
 		if err := validateCtrlCmdListen(config); err != nil {
-			return errorsStable("loopback-listen-required")
+			return errorsStable("local-ctrlcmd-listen-required")
 		}
 	}
 
@@ -414,7 +423,8 @@ func runCtrlCmdCommand(ctx context.Context, command string, arguments []string, 
 	defer listener.Close()
 	serveErrors := make(chan error, 1)
 	go func() { serveErrors <- server.Serve(ctx, listener) }()
-	fmt.Fprintf(stdout, "CtrlCmd待受をloopback限定で開始しました: services=%d\n", snapshot.Count())
+	fmt.Fprintf(stdout, "CtrlCmd待受を開始しました: scope=%s services=%d\n", recordingListenScope(listenAddress), snapshot.Count())
+	writeCtrlCmdLANNotice(stdout, listenAddress)
 	select {
 	case serveErr := <-serveErrors:
 		server.Wait()
@@ -434,15 +444,7 @@ func runCtrlCmdCommand(ctx context.Context, command string, arguments []string, 
 }
 
 func validateCtrlCmdListen(config ctrlcmdapp.Config) error {
-	if err := config.Validate(); err != nil {
-		return err
-	}
-	_, port, err := net.SplitHostPort(config.Address)
-	portNumber, parseErr := strconv.Atoi(port)
-	if err != nil || parseErr != nil || portNumber < 1 || portNumber > 65_535 {
-		return errors.New("invalid CtrlCmd listen address")
-	}
-	return nil
+	return config.Validate()
 }
 
 func runCatalogSyncCommand(ctx context.Context, arguments []string, stdout, stderr io.Writer) error {
