@@ -33,7 +33,7 @@ import (
 )
 
 var (
-	version       = "0.0.6"
+	version       = "0.0.7"
 	productCommit = ""
 )
 
@@ -91,7 +91,7 @@ func runContext(ctx context.Context, arguments []string, stdout, stderr io.Write
 	}
 	if arguments[0] == "recording" {
 		if len(arguments) < 2 || arguments[1] != "serve" {
-			fmt.Fprintln(stderr, "使用方法: sazanami-dvr recording serve --data-root <dir> --recording-root <dir> --channel-map <file> --provider mirakurun --base-url <url>")
+			fmt.Fprintln(stderr, "使用方法: sazanami-dvr recording serve --data-root <dir> --recording-root <dir> --channel-map <file> --provider mirakurun --base-url <url> [--max-concurrent-recordings 1]")
 			return 2
 		}
 		if err := runRecordingCommand(ctx, arguments[2:], stdout, stderr); err != nil {
@@ -121,12 +121,14 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	baseURL := flags.String("base-url", "", "Mirakurunのoperator設定URL")
 	listenAddress := flags.String("listen", ctrlcmdapp.DefaultAddress, "numeric loopbackの待受アドレス")
 	refreshInterval := flags.Duration("catalog-refresh-interval", catalogrefresh.DefaultInterval, "番組表を更新する間隔")
+	maximumRecordings := flags.Int("max-concurrent-recordings", recordingapp.DefaultMaximumConcurrentRecordings, "同時録画数（1～8）")
 	if err := flags.Parse(arguments); err != nil {
 		return errorsStable("invalid-command-arguments")
 	}
 	if *dataRoot == "" || *recordingRootPath == "" || *channelMap == "" || *providerName != "mirakurun" ||
 		*baseURL == "" || *refreshInterval < catalogrefresh.MinimumInterval || *refreshInterval > catalogrefresh.MaximumInterval ||
-		flags.NArg() != 0 {
+		*maximumRecordings < recordingapp.DefaultMaximumConcurrentRecordings ||
+		*maximumRecordings > recordingapp.MaximumConcurrentRecordings || flags.NArg() != 0 {
 		return errorsStable("recording-arguments-required")
 	}
 	config := ctrlcmdapp.RecordingConfig()
@@ -162,7 +164,7 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	if err != nil {
 		return errorsStable("recording-snapshot-failed")
 	}
-	streamAdapter, err := mirakurunadapter.NewStream(*baseURL)
+	streamAdapter, err := mirakurunadapter.NewStreamWithLimit(*baseURL, *maximumRecordings)
 	if err != nil {
 		return errorsStable("provider-configuration-invalid")
 	}
@@ -195,7 +197,7 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	if err := recovery.Run(startupContext); err != nil {
 		return errorsStable("recording-recovery-failed")
 	}
-	scheduler, err := recordingapp.NewScheduler(store, executor, recordingClock)
+	scheduler, err := recordingapp.NewScheduler(store, executor, recordingClock, *maximumRecordings)
 	if err != nil {
 		return errorsStable("recording-scheduler-invalid")
 	}
@@ -233,8 +235,8 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 		Interval: *refreshInterval, Sync: refreshOperation.sync, Observe: observeCatalogRefresh(stdout, stderr),
 	}
 	go func() { refreshDone <- refresher.Run(serviceContext) }()
-	fmt.Fprintf(stdout, "録画プロセスをloopback限定で開始しました: services=%d catalog_refresh_interval=%s\n",
-		snapshot.Count(), refreshInterval.String())
+	fmt.Fprintf(stdout, "録画プロセスをloopback限定で開始しました: services=%d catalog_refresh_interval=%s max_concurrent_recordings=%d\n",
+		snapshot.Count(), refreshInterval.String(), *maximumRecordings)
 	var serverErr, schedulerErr, refreshErr error
 	serverFinished, schedulerFinished, refreshFinished := false, false, false
 	select {

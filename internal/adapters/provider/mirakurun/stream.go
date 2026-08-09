@@ -26,14 +26,17 @@ type streamLimits struct {
 
 var productionStreamLimits = streamLimits{connectHeader: 10 * time.Second, readIdle: 10 * time.Second}
 
+const maximumConcurrentStreams = 8
+
 // StreamAdapterはMirakurun互換のservice streamだけを開く専用HTTP clientを所有する。
 type StreamAdapter struct {
 	base   url.URL
 	client *http.Client
 	limits streamLimits
 
-	mu     sync.Mutex
-	active bool
+	mu                sync.Mutex
+	active            int
+	maximumConcurrent int
 }
 
 // NewStreamは安全設定を固定したstream adapterを作る。生成時にはnetworkへ接続しない。
@@ -41,19 +44,28 @@ func NewStream(baseURL string) (*StreamAdapter, error) {
 	return newStreamAdapter(baseURL, productionStreamLimits)
 }
 
+// NewStreamWithLimitは明示上限まで独立した録画streamを開けるadapterを作る。
+func NewStreamWithLimit(baseURL string, maximumConcurrent int) (*StreamAdapter, error) {
+	return newStreamAdapterWithLimit(baseURL, productionStreamLimits, maximumConcurrent)
+}
+
 func newStreamAdapter(baseURL string, limits streamLimits) (*StreamAdapter, error) {
+	return newStreamAdapterWithLimit(baseURL, limits, 1)
+}
+
+func newStreamAdapterWithLimit(baseURL string, limits streamLimits, maximumConcurrent int) (*StreamAdapter, error) {
 	base, _, err := normalizeBaseURL(baseURL)
 	if err != nil {
 		return nil, err
 	}
-	if limits.connectHeader <= 0 || limits.readIdle <= 0 {
+	if limits.connectHeader <= 0 || limits.readIdle <= 0 || maximumConcurrent < 1 || maximumConcurrent > maximumConcurrentStreams {
 		return nil, provider.NewFailure(provider.ReasonInternal, "invalid-stream-http-limits")
 	}
 	dialer := &net.Dialer{Timeout: limits.connectHeader, KeepAlive: 30 * time.Second}
 	transport := &http.Transport{
 		Proxy: nil, DialContext: dialer.DialContext, ForceAttemptHTTP2: false,
 		TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{},
-		MaxIdleConns: 1, MaxIdleConnsPerHost: 1, MaxConnsPerHost: 1,
+		MaxIdleConns: maximumConcurrent, MaxIdleConnsPerHost: maximumConcurrent, MaxConnsPerHost: maximumConcurrent,
 		IdleConnTimeout: 30 * time.Second, TLSHandshakeTimeout: limits.connectHeader,
 		ResponseHeaderTimeout: limits.connectHeader, ExpectContinueTimeout: time.Second,
 		MaxResponseHeaderBytes: headerLimit, DisableCompression: true,
@@ -61,7 +73,7 @@ func newStreamAdapter(baseURL string, limits streamLimits) (*StreamAdapter, erro
 	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
 	}}
-	return &StreamAdapter{base: base, client: client, limits: limits}, nil
+	return &StreamAdapter{base: base, client: client, limits: limits, maximumConcurrent: maximumConcurrent}, nil
 }
 
 // OpenStreamは指定serviceの復号済みMPEG-TSをpriority 0で一度だけ開く。
@@ -78,15 +90,17 @@ func (adapter *StreamAdapter) OpenStream(ctx context.Context, request providerst
 		return nil, provider.NewFailure(provider.ReasonRejected, "stream-request-out-of-profile")
 	}
 	adapter.mu.Lock()
-	if adapter.active {
+	if adapter.active >= adapter.maximumConcurrent {
 		adapter.mu.Unlock()
 		return nil, provider.NewFailure(provider.ReasonRejected, "stream-request-already-active")
 	}
-	adapter.active = true
+	adapter.active++
 	adapter.mu.Unlock()
 	release := func() {
 		adapter.mu.Lock()
-		adapter.active = false
+		if adapter.active > 0 {
+			adapter.active--
+		}
 		adapter.mu.Unlock()
 	}
 
