@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/channel"
+	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/filecopy2"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/catalogmodel"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/provider"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/recording"
@@ -177,6 +178,22 @@ func (snapshot *Snapshot) Current(ctx context.Context) (channel.Snapshot, error)
 	return snapshot.value, nil
 }
 
+// CurrentLogosは現在の完成済みスナップショットから、ロゴ生成に必要な項目だけをコピーする。
+func (snapshot *Snapshot) CurrentLogos(ctx context.Context) ([]filecopy2.LogoService, error) {
+	if snapshot == nil || ctx == nil || ctx.Err() != nil {
+		return nil, stable("logo-service-unavailable")
+	}
+	services := make([]filecopy2.LogoService, 0, len(snapshot.value.Services))
+	for _, service := range snapshot.value.Services {
+		if ctx.Err() != nil {
+			return nil, stable("logo-service-unavailable")
+		}
+		services = append(services, filecopy2.LogoService{ProviderLocator: service.ProviderLocator,
+			NetworkID: service.NetworkID, ServiceID: service.ServiceID})
+	}
+	return services, nil
+}
+
 // Countは起動時に確定したチャンネル数を返す。
 func (snapshot *Snapshot) Count() int {
 	if snapshot == nil {
@@ -203,6 +220,31 @@ func (snapshot *Snapshot) ResolveLiveService(ctx context.Context, networkID, tra
 	target, err := provider.NewTuningTarget(locator)
 	if err != nil {
 		return provider.TuningTarget{}, stable("live-service-unavailable")
+	}
+	return target, nil
+}
+
+// ResolveLogoServiceはnetwork IDとservice IDが一意に決まる場合だけ、
+// Mirakurunの局ロゴ取得に使う数値service IDを返す。
+func (snapshot *Snapshot) ResolveLogoService(ctx context.Context, networkID, serviceID uint16) (provider.TuningTarget, error) {
+	if snapshot == nil || ctx == nil || ctx.Err() != nil {
+		return provider.TuningTarget{}, stable("logo-service-unavailable")
+	}
+	locator := ""
+	for _, service := range snapshot.value.Services {
+		if service.NetworkID == networkID && service.ServiceID == serviceID {
+			if locator != "" {
+				return provider.TuningTarget{}, stable("logo-service-unavailable")
+			}
+			locator = service.ProviderLocator
+		}
+	}
+	if !canonicalServiceLocator(locator) {
+		return provider.TuningTarget{}, stable("logo-service-unavailable")
+	}
+	target, err := provider.NewTuningTarget(locator)
+	if err != nil {
+		return provider.TuningTarget{}, stable("logo-service-unavailable")
 	}
 	return target, nil
 }

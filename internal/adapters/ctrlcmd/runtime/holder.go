@@ -63,3 +63,12 @@ func (holder *SnapshotHolder) ResolveLiveService(ctx context.Context, networkID,
 	}
 	return snapshot.ResolveLiveService(ctx, networkID, transportStreamID, serviceID)
 }
+
+// ResolveLogoServiceは要求開始時に公開されている一世代だけで局ロゴの放送局を照合する。
+func (holder *SnapshotHolder) ResolveLogoService(ctx context.Context, networkID, serviceID uint16) (provider.TuningTarget, error) {
+	snapshot := holder.Load()
+	if snapshot == nil {
+		return provider.TuningTarget{}, stable("logo-service-unavailable")
+	}
+	return snapshot.ResolveLogoService(ctx, networkID, serviceID)
+}

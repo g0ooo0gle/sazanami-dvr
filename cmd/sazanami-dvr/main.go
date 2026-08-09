@@ -36,7 +36,7 @@ import (
 )
 
 var (
-	version       = "0.0.17"
+	version       = "0.0.18"
 	productCommit = ""
 )
 
@@ -186,6 +186,11 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 		return errorsStable("provider-configuration-invalid")
 	}
 	defer catalogAdapter.CloseIdleConnections()
+	logoAdapter, err := mirakurunadapter.NewLogo(*baseURL)
+	if err != nil {
+		return errorsStable("provider-configuration-invalid")
+	}
+	defer logoAdapter.CloseIdleConnections()
 	recordingClock := recordingapp.SystemClock{}
 	ownerID, err := catalogmodel.NewID()
 	if err != nil {
@@ -224,7 +229,7 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	}
 	defer liveManager.CloseAll()
 	router, err := ctrlcmdruntime.NewRecordingRouterWithLive(snapshots, reservations, automaticRules, store, liveManager,
-		ctrlcmdruntime.SystemClock{}, codec.DefaultLimits())
+		logoAdapter, ctrlcmdruntime.SystemClock{}, codec.DefaultLimits())
 	if err != nil {
 		return errorsStable("recording-router-failed")
 	}
@@ -239,7 +244,7 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	defer listener.Close()
 	serviceContext, serviceCancel := context.WithCancel(ctx)
 	defer serviceCancel()
-	httpHandler, err := recordinghttpadapter.NewHandler(store, recordingHTTPFiles{root: recordingRoot})
+	httpHandler, err := recordinghttpadapter.NewHandlerWithLogos(store, recordingHTTPFiles{root: recordingRoot}, snapshots, logoAdapter)
 	if err != nil {
 		return errorsStable("recording-http-handler-invalid")
 	}

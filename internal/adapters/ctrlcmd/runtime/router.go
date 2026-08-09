@@ -28,6 +28,7 @@ type Router struct {
 	automatic    *autoreservationadapter.Handler
 	recorded     *recordedadapter.Handler
 	live         *liveadapter.Handler
+	logos        filecopy2.LogoProvider
 	searchGate   chan struct{}
 	limits       codec.Limits
 }
@@ -35,16 +36,20 @@ type Router struct {
 // NewRecordingRouterWithLiveは完成済み録画までのcommandへ上限付きライブ中継を追加する。
 func NewRecordingRouterWithLive(snapshots SnapshotLoader, reservations reservationadapter.Operations,
 	automatic autoreservationadapter.Operations, recorded recordedadapter.Operations, live liveadapter.Operations,
-	clock status.Clock, limits codec.Limits,
+	logos filecopy2.LogoProvider, clock status.Clock, limits codec.Limits,
 ) (*Router, error) {
 	if live == nil {
 		return nil, stable("live-handler-failed")
+	}
+	if logos == nil {
+		return nil, stable("logo-handler-failed")
 	}
 	router, err := NewRecordingRouterComplete(snapshots, reservations, automatic, recorded, clock, limits)
 	if err != nil {
 		return nil, err
 	}
 	router.live = &liveadapter.Handler{Operations: live, Limits: limits}
+	router.logos = logos
 	return router, nil
 }
 
@@ -126,7 +131,11 @@ func (router *Router) Handle(ctx context.Context, request []byte, destination io
 		}
 		return (channel.Handler{Source: snapshot, Limits: router.limits}).Handle(ctx, request, destination)
 	case filecopy2.Command:
-		return (filecopy2.Handler{Limits: router.limits}).Handle(ctx, request, destination)
+		snapshot := router.snapshots.Load()
+		if snapshot == nil {
+			return stable("channel-snapshot-failed")
+		}
+		return (filecopy2.Handler{Source: snapshot, Logos: router.logos, Limits: router.limits}).Handle(ctx, request, destination)
 	case programguide.Command:
 		if router.recording {
 			snapshot := router.snapshots.Load()
