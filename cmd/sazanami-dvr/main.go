@@ -28,6 +28,7 @@ import (
 	"github.com/g0ooo0gle/sazanami-dvr/internal/app/catalogrefresh"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/app/catalogsync"
 	ctrlcmdapp "github.com/g0ooo0gle/sazanami-dvr/internal/app/ctrlcmd"
+	"github.com/g0ooo0gle/sazanami-dvr/internal/app/liverelay"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/app/opsui"
 	recordingapp "github.com/g0ooo0gle/sazanami-dvr/internal/app/recording"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/catalogmodel"
@@ -35,7 +36,7 @@ import (
 )
 
 var (
-	version       = "0.0.9"
+	version       = "0.0.10"
 	productCommit = ""
 )
 
@@ -175,6 +176,11 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 		return errorsStable("provider-configuration-invalid")
 	}
 	defer streamAdapter.CloseIdleConnections()
+	liveStreamAdapter, err := mirakurunadapter.NewStreamWithLimit(*baseURL, liverelay.MaximumSessions)
+	if err != nil {
+		return errorsStable("provider-configuration-invalid")
+	}
+	defer liveStreamAdapter.CloseIdleConnections()
 	catalogAdapter, err := mirakurunadapter.New(*baseURL)
 	if err != nil {
 		return errorsStable("provider-configuration-invalid")
@@ -211,7 +217,12 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 		Catalog: snapshots, Store: store, Clock: recordingClock, NewID: catalogmodel.NewID, OnAdded: scheduler.Notify,
 	}
 	automaticRules := autoreservationapp.RuleService{Store: store, Clock: recordingClock, NewID: catalogmodel.NewID}
-	router, err := ctrlcmdruntime.NewRecordingRouterComplete(snapshots, reservations, automaticRules, store,
+	liveManager, err := liverelay.NewManager(snapshots, liveStreamAdapter)
+	if err != nil {
+		return errorsStable("live-manager-invalid")
+	}
+	defer liveManager.CloseAll()
+	router, err := ctrlcmdruntime.NewRecordingRouterWithLive(snapshots, reservations, automaticRules, store, liveManager,
 		ctrlcmdruntime.SystemClock{}, codec.DefaultLimits())
 	if err != nil {
 		return errorsStable("recording-router-failed")
@@ -289,6 +300,7 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	case <-ctx.Done():
 	}
 	serviceCancel()
+	liveManager.CloseAll()
 	_ = listener.Close()
 	shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	_ = httpServer.Shutdown(shutdownContext)

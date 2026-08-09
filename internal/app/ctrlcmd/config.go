@@ -14,6 +14,8 @@ const (
 	DefaultHeaderTimeout = 2 * time.Second
 	DefaultLifetime      = 4 * time.Second
 	MaximumLifetime      = 14 * time.Second
+	// LongWriteTimeoutは長時間接続でclientの受信が止まったときの送信進捗上限である。
+	LongWriteTimeout = 10 * time.Second
 )
 
 // ConfigはCtrlCmd listenerと1接続のresource上限をまとめる。

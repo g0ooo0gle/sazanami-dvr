@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/binary"
 	"io"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/channel"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/codec"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/filecopy2"
+	liveadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/live"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/programguide"
 	recordedadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/recorded"
 	reservationadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/reservation"
@@ -24,7 +26,24 @@ type Router struct {
 	reservations *reservationadapter.Handler
 	automatic    *autoreservationadapter.Handler
 	recorded     *recordedadapter.Handler
+	live         *liveadapter.Handler
 	limits       codec.Limits
+}
+
+// NewRecordingRouterWithLiveは完成済み録画までのcommandへ上限付きライブ中継を追加する。
+func NewRecordingRouterWithLive(snapshots SnapshotLoader, reservations reservationadapter.Operations,
+	automatic autoreservationadapter.Operations, recorded recordedadapter.Operations, live liveadapter.Operations,
+	clock status.Clock, limits codec.Limits,
+) (*Router, error) {
+	if live == nil {
+		return nil, stable("live-handler-failed")
+	}
+	router, err := NewRecordingRouterComplete(snapshots, reservations, automatic, recorded, clock, limits)
+	if err != nil {
+		return nil, err
+	}
+	router.live = &liveadapter.Handler{Operations: live, Limits: limits}
+	return router, nil
 }
 
 // NewRecordingRouterCompleteは通常予約、自動予約、完成録画の対応済みcommandを接続する。
@@ -128,9 +147,19 @@ func (router *Router) Handle(ctx context.Context, request []byte, destination io
 		if router.recorded != nil {
 			return router.recorded.Handle(ctx, request, destination)
 		}
+	case liveadapter.CommandSelect, liveadapter.CommandRelay, liveadapter.CommandClose:
+		if router.live != nil {
+			return router.live.Handle(ctx, request, destination)
+		}
 	default:
 	}
 	return &codec.Error{Category: codec.Unsupported, Reason: "command-out-of-profile"}
+}
+
+// LongLivedはライブ中継が接続済みの301要求だけを長時間接続として識別する。
+func (router *Router) LongLived(request []byte) bool {
+	return router != nil && router.live != nil && len(request) >= codec.HeaderSize &&
+		int32(binary.LittleEndian.Uint32(request[:4])) == liveadapter.CommandRelay
 }
 
 type normalStatus struct{}

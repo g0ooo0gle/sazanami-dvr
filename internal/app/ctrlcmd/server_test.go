@@ -20,6 +20,23 @@ func (f handlerFunc) Handle(ctx context.Context, request []byte, destination io.
 	return f(ctx, request, destination)
 }
 
+type longHandler struct {
+	delay time.Duration
+	long  bool
+}
+
+func (handler longHandler) Handle(ctx context.Context, _ []byte, destination io.Writer) error {
+	select {
+	case <-time.After(handler.delay):
+		_, err := destination.Write([]byte{1})
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (handler longHandler) LongLived([]byte) bool { return handler.long }
+
 type normalSource struct{}
 
 func (normalSource) Current(context.Context) (status.StartupStatus, error) {
@@ -222,6 +239,57 @@ func TestHeaderTimeoutIsAbsoluteAndBounded(t *testing.T) {
 	stopServer(t, listener, cancel, done, server)
 	if server.Metrics().Failed != 1 {
 		t.Fatalf("metrics=%+v", server.Metrics())
+	}
+}
+
+func TestLongLivedCapabilityClearsOnlyNormalConnectionDeadline(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		long    bool
+		success bool
+	}{
+		{name: "long lived", long: true, success: true},
+		{name: "normal", long: false, success: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			config := testConfig()
+			config.HeaderTimeout = 20 * time.Millisecond
+			config.ConnectionLifetime = 40 * time.Millisecond
+			server, err := NewServer(config, longHandler{delay: 80 * time.Millisecond, long: test.long})
+			if err != nil {
+				t.Fatal(err)
+			}
+			listener, cancel, done := startServer(t, server)
+			connection, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := connection.Write(request2200()); err != nil {
+				t.Fatal(err)
+			}
+			_ = connection.SetReadDeadline(time.Now().Add(time.Second))
+			response := make([]byte, 1)
+			_, readErr := io.ReadFull(connection, response)
+			if test.success && (readErr != nil || response[0] != 1) {
+				t.Fatalf("response=%v err=%v", response, readErr)
+			}
+			if !test.success && readErr == nil {
+				t.Fatal("通常接続が期限後も成功しました")
+			}
+			_ = connection.Close()
+			stopServer(t, listener, cancel, done, server)
+		})
+	}
+}
+
+func TestRollingDeadlineWriterStopsStalledClient(t *testing.T) {
+	serverSide, clientSide := net.Pipe()
+	defer serverSide.Close()
+	defer clientSide.Close()
+	started := time.Now()
+	written, err := (rollingDeadlineWriter{connection: serverSide, timeout: 20 * time.Millisecond}).Write([]byte{1})
+	if written != 0 || err == nil || time.Since(started) < 10*time.Millisecond || time.Since(started) > time.Second {
+		t.Fatalf("written=%d elapsed=%s err=%v", written, time.Since(started), err)
 	}
 }
 

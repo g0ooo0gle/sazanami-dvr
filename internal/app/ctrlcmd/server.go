@@ -19,6 +19,12 @@ type FrameHandler interface {
 	Handle(context.Context, []byte, io.Writer) error
 }
 
+// LongLivedFrameHandlerは通常の一問一答より長く同じ接続を使う要求だけを識別する。
+// 要求の解釈と実際の終了上限はhandler側が所有する。
+type LongLivedFrameHandler interface {
+	LongLived([]byte) bool
+}
+
 // Metricsはprocess内で保持するbounded serverの累積counterである。
 type Metrics struct {
 	Accepted  uint64
@@ -147,13 +153,39 @@ func (s *Server) serveConnection(parent context.Context, connection net.Conn) {
 		s.rejected.Add(1)
 		return
 	}
-	requestContext, cancel := context.WithDeadline(parent, deadline)
+	requestContext := parent
+	var destination io.Writer = connection
+	var cancel context.CancelFunc
+	longLived, ok := s.handler.(LongLivedFrameHandler)
+	if ok && longLived.LongLived(request) {
+		if err := connection.SetDeadline(time.Time{}); err != nil {
+			s.failed.Add(1)
+			return
+		}
+		requestContext, cancel = context.WithCancel(parent)
+		destination = rollingDeadlineWriter{connection: connection, timeout: LongWriteTimeout}
+	} else {
+		requestContext, cancel = context.WithDeadline(parent, deadline)
+	}
 	defer cancel()
-	if err := s.handler.Handle(requestContext, request, connection); err != nil {
+	if err := s.handler.Handle(requestContext, request, destination); err != nil {
 		s.failed.Add(1)
 		return
 	}
 	s.completed.Add(1)
+}
+
+type rollingDeadlineWriter struct {
+	connection net.Conn
+	timeout    time.Duration
+}
+
+// Writeは長時間接続の各送信へ進捗期限を設定し直し、受信停止したclientを上限内で解放する。
+func (writer rollingDeadlineWriter) Write(data []byte) (int, error) {
+	if err := writer.connection.SetWriteDeadline(time.Now().Add(writer.timeout)); err != nil {
+		return 0, err
+	}
+	return writer.connection.Write(data)
 }
 
 // Waitは受付済みconnectionの処理終了を待つ。先にlistenerを閉じてServeを終了させる必要がある。
