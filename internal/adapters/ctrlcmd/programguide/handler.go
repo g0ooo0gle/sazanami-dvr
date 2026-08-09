@@ -192,7 +192,7 @@ func measure(ctx context.Context, source Source, services []channel.Service, que
 		if !programMatchesQuery(program, query) {
 			return nil
 		}
-		eventSize, eligible, err := serializedEventSize(program, limits)
+		eventSize, eligible, err := EventStructureSize(program, limits)
 		if err != nil || !selected || !eligible {
 			return err
 		}
@@ -226,7 +226,9 @@ func programMatchesQuery(program catalogmodel.CurrentProgram, query programQuery
 	return query.start <= fileTime && fileTime < query.end
 }
 
-func serializedEventSize(program catalogmodel.CurrentProgram, limits codec.Limits) (int64, bool, error) {
+// EventStructureSizeは一件の番組をCtrlCmd EventInfoへ変換できるか確認し、構造全体のbyte数を返す。
+// 番組表と番組検索が同じ適格条件と応答形式を使うための小さい共有境界である。
+func EventStructureSize(program catalogmodel.CurrentProgram, limits codec.Limits) (int64, bool, error) {
 	material := program.Material
 	if program.RawEventID == nil || *program.RawEventID < 0 || *program.RawEventID > 65_535 ||
 		material.StartUTCMS == nil || *material.StartUTCMS < 0 || material.DurationMS == nil ||
@@ -283,7 +285,7 @@ func writePrograms(ctx context.Context, writer *codec.Writer, source Source, ser
 		if !programMatchesQuery(program, query) {
 			return nil
 		}
-		_, eligible, sizeErr := serializedEventSize(program, limits)
+		_, eligible, sizeErr := EventStructureSize(program, limits)
 		if sizeErr != nil || !selected || !eligible {
 			return sizeErr
 		}
@@ -306,7 +308,7 @@ func writePrograms(ctx context.Context, writer *codec.Writer, source Source, ser
 			nextService++
 			activeService = index
 		}
-		if err := writeEvent(writer, services[index], program, limits); err != nil {
+		if err := WriteEvent(writer, services[index], program, limits); err != nil {
 			return err
 		}
 		written[index]++
@@ -329,8 +331,9 @@ func writePrograms(ctx context.Context, writer *codec.Writer, source Source, ser
 	return nil
 }
 
-func writeEvent(writer *codec.Writer, service channel.Service, program catalogmodel.CurrentProgram, limits codec.Limits) error {
-	eventSize, eligible, err := serializedEventSize(program, limits)
+// WriteEventは事前に測定した一件の番組をCtrlCmd EventInfoとして逐次出力する。
+func WriteEvent(writer *codec.Writer, service channel.Service, program catalogmodel.CurrentProgram, limits codec.Limits) error {
+	eventSize, eligible, err := EventStructureSize(program, limits)
 	if err != nil || !eligible {
 		return failure(codec.Internal, "invalid-program-during-write", 0)
 	}

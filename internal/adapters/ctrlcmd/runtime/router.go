@@ -12,6 +12,7 @@ import (
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/filecopy2"
 	liveadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/live"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/programguide"
+	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/programsearch"
 	recordedadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/recorded"
 	reservationadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/reservation"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/status"
@@ -27,6 +28,7 @@ type Router struct {
 	automatic    *autoreservationadapter.Handler
 	recorded     *recordedadapter.Handler
 	live         *liveadapter.Handler
+	searchGate   chan struct{}
 	limits       codec.Limits
 }
 
@@ -98,9 +100,10 @@ func NewRouter(snapshots SnapshotLoader, clock status.Clock, limits codec.Limits
 		return nil, stable("channel-snapshot-failed")
 	}
 	return &Router{
-		status:    status.Handler{Source: normalStatus{}, Clock: clock, Limits: limits},
-		snapshots: snapshots,
-		limits:    limits,
+		status:     status.Handler{Source: normalStatus{}, Clock: clock, Limits: limits},
+		snapshots:  snapshots,
+		searchGate: make(chan struct{}, 1),
+		limits:     limits,
 	}, nil
 }
 
@@ -132,6 +135,15 @@ func (router *Router) Handle(ctx context.Context, request []byte, destination io
 				return stable("recording-snapshot-failed")
 			}
 			return guide.Handle(ctx, request, destination)
+		}
+	case programsearch.Command:
+		if router.recording {
+			snapshot := router.snapshots.Load()
+			search, searchErr := programsearch.NewHandler(snapshot, router.limits, router.searchGate)
+			if searchErr != nil {
+				return stable("recording-snapshot-failed")
+			}
+			return search.Handle(ctx, request, destination)
 		}
 	case reservationadapter.CommandList, reservationadapter.CommandAdd, reservationadapter.CommandChange,
 		reservationadapter.CommandDelete, reservationadapter.CommandRecordingOpen, reservationadapter.CommandRecordingClose:

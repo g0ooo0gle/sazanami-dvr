@@ -63,6 +63,7 @@ func TestPackageBoundaries(t *testing.T) {
 			if !strings.HasPrefix(relative, "internal/adapters/ctrlcmd/channel/") &&
 				!strings.HasPrefix(relative, "internal/adapters/ctrlcmd/runtime/") &&
 				!strings.HasPrefix(relative, "internal/adapters/ctrlcmd/programguide/") &&
+				!strings.HasPrefix(relative, "internal/adapters/ctrlcmd/programsearch/") &&
 				name == "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/channel" {
 				t.Errorf("%s: CtrlCmd channel型はruntime／番組表以外からimportできません", relative)
 			}

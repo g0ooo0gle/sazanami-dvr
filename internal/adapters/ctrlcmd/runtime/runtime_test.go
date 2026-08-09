@@ -19,6 +19,7 @@ import (
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/filecopy2"
 	liveadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/live"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/programguide"
+	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/programsearch"
 	recordedadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/recorded"
 	reservationadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/reservation"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/status"
@@ -699,6 +700,14 @@ func TestRouterLoadsSnapshotOncePerCatalogRequest(t *testing.T) {
 	if loader.loads != 1 {
 		t.Fatalf("program loads=%d", loader.loads)
 	}
+
+	loader.loads = 0
+	if err := router.Handle(context.Background(), commandFrame(programsearch.Command, emptyProgramSearchBody()), &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if loader.loads != 1 {
+		t.Fatalf("search loads=%d", loader.loads)
+	}
 }
 
 func TestRouterDispatchesOnlyAcceptedCommands(t *testing.T) {
@@ -807,6 +816,7 @@ func TestRecordingRouterKeepsKonomiTVCoreProfile(t *testing.T) {
 		{name: "チャンネル設定", command: channel.CommandFileCopy, body: fileBody},
 		{name: "サービス一覧", command: channel.CommandEnumService},
 		{name: "番組表", command: programguide.Command, body: programBody},
+		{name: "番組検索", command: programsearch.Command, body: emptyProgramSearchBody()},
 		{name: "予約一覧", command: reservationadapter.CommandList, body: listBody},
 		{name: "録画設定", command: filecopy2.Command, body: fileCopy2Body},
 	}
@@ -844,4 +854,25 @@ func commandFrame(command int32, body []byte) []byte {
 	binary.LittleEndian.PutUint32(request[4:8], uint32(len(body)))
 	copy(request[codec.HeaderSize:], body)
 	return request
+}
+
+func emptyProgramSearchBody() []byte {
+	condition := make([]byte, 68)
+	binary.LittleEndian.PutUint32(condition[0:4], uint32(len(condition)))
+	position := 4
+	for range 2 {
+		binary.LittleEndian.PutUint32(condition[position:position+4], 6)
+		position += 6
+	}
+	position += 8
+	for range 5 {
+		binary.LittleEndian.PutUint32(condition[position:position+4], 8)
+		position += 8
+	}
+	// 最後の4 byteはfuzzy、分類除外、時間帯除外、無料条件のzero値である。
+	body := make([]byte, 8+len(condition))
+	binary.LittleEndian.PutUint32(body[0:4], uint32(len(body)))
+	binary.LittleEndian.PutUint32(body[4:8], 1)
+	copy(body[8:], condition)
+	return body
 }
