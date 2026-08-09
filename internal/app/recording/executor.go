@@ -3,6 +3,7 @@ package recording
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"time"
 
@@ -13,9 +14,12 @@ import (
 )
 
 const (
-	progressInterval = 5 * time.Second
-	minimumUsefulTS  = 188
+	progressInterval          = 5 * time.Second
+	minimumUsefulTS           = 188
+	minimumReconnectRemaining = 60 * time.Second
 )
+
+var reconnectDelays = [...]time.Duration{time.Second, 2 * time.Second, 4 * time.Second}
 
 // AttemptStoreは一回の録画処理を、短いDB更新で順方向へ進めるインターフェースである。
 type AttemptStore interface {
@@ -61,7 +65,8 @@ type Result struct {
 	Reason recording.TerminalReason
 }
 
-// Executorは一つの予約の実行権をDBで取得し、ストリームを一度だけ開いて録画ファイルへ保存する。
+// Executorは一つの予約の実行権をDBで取得し、同じ部分ファイルへ録画ストリームを保存する。
+// 一時的な切断時は古いleaseを閉じた後だけ、固定した小さい上限内で開き直す。
 type Executor struct {
 	Store        AttemptStore
 	Stream       providerstream.Provider
@@ -71,6 +76,15 @@ type Executor struct {
 	OwnerID      catalogmodel.ID
 	Generation   int64
 	WithDeadline func(context.Context, time.Time) (context.Context, context.CancelFunc)
+	Wait         func(context.Context, time.Duration) error
+}
+
+type streamCopyResult struct {
+	ByteCount    int64
+	LastProgress time.Time
+	Reason       recording.TerminalReason
+	ReachedEnd   bool
+	Retryable    bool
 }
 
 // Missはストリームを開かず、実行できなかった予約を終了状態へ進める。
@@ -110,31 +124,63 @@ func (executor Executor) Execute(ctx context.Context, reservation recording.Rese
 	}
 	target, err := provider.NewTuningTarget(reservation.Program.ProviderServiceLocator)
 	if err != nil {
-		return executor.finishOpenFailure(ctx, partial, attempt.ID, recording.ReasonStreamNotFound)
+		return executor.finishBeforeRecording(ctx, partial, attempt.ID, recording.ReasonStreamNotFound)
 	}
 	streamContext, cancel := executor.deadline(ctx, attempt.PlannedEnd)
 	defer cancel()
-	lease, err := executor.Stream.OpenStream(streamContext, providerstream.Request{
-		Target: target, Usage: providerstream.UsageRecording, PriorityPolicy: "0", RequireDescrambled: true,
-		CorrelationID: attempt.ID.String(),
-	})
-	if err != nil {
-		return executor.finishOpenFailure(ctx, partial, attempt.ID, streamFailureReason(err))
-	}
-	defer lease.Close()
-	if err := executor.Store.RecordingStarted(ctx, attempt.ID, executor.now()); err != nil {
-		_ = lease.Cancel()
-		_ = partial.Close()
-		return Result{}, errors.New("recording: persist recording start")
-	}
-	byteCount, reason, reachedEnd, _ := executor.copy(streamContext, lease, partial, attempt)
-	if !reachedEnd {
-		if errors.Is(ctx.Err(), context.Canceled) {
-			reason = recording.ReasonProcessShutdown
+	copyResult := streamCopyResult{LastProgress: executor.now()}
+	started := false
+	reconnected := false
+	for connection := 0; ; connection++ {
+		lease, openErr := executor.Stream.OpenStream(streamContext, providerstream.Request{
+			Target: target, Usage: providerstream.UsageRecording, PriorityPolicy: "0", RequireDescrambled: true,
+			CorrelationID: streamCorrelationID(attempt.ID, connection),
+		})
+		if openErr != nil {
+			copyResult.Reason = streamFailureReason(openErr)
+			copyResult.Retryable = retryableStreamFailure(openErr, providerstream.Terminal{})
+			if !executor.prepareReconnect(streamContext, attempt.PlannedEnd, connection, copyResult.Retryable) {
+				if errors.Is(ctx.Err(), context.Canceled) {
+					copyResult.Reason = recording.ReasonProcessShutdown
+				} else if copyResult.Retryable && connection == len(reconnectDelays) {
+					copyResult.Reason = recording.ReasonStreamReconnectExhausted
+				}
+				return executor.finishStreamFailure(ctx, partial, attempt.ID, copyResult.ByteCount, copyResult.Reason, started)
+			}
+			continue
 		}
-		return executor.finishPartial(ctx, partial, attempt.ID, byteCount, reason)
+		if connection > 0 {
+			reconnected = true
+		}
+		if !started {
+			if err := executor.Store.RecordingStarted(ctx, attempt.ID, executor.now()); err != nil {
+				_ = lease.Cancel()
+				_ = lease.Close()
+				_ = partial.Close()
+				return Result{}, errors.New("recording: persist recording start")
+			}
+			started = true
+		}
+		copyResult = executor.copy(streamContext, lease, partial, attempt, copyResult)
+		_ = lease.Cancel()
+		_ = lease.Close()
+		if copyResult.ReachedEnd {
+			break
+		}
+		if errors.Is(ctx.Err(), context.Canceled) {
+			copyResult.Reason = recording.ReasonProcessShutdown
+			return executor.finishPartial(ctx, partial, attempt.ID, copyResult.ByteCount, copyResult.Reason)
+		}
+		if !executor.prepareReconnect(streamContext, attempt.PlannedEnd, connection, copyResult.Retryable) {
+			if errors.Is(ctx.Err(), context.Canceled) {
+				copyResult.Reason = recording.ReasonProcessShutdown
+			} else if copyResult.Retryable && connection == len(reconnectDelays) {
+				copyResult.Reason = recording.ReasonStreamReconnectExhausted
+			}
+			return executor.finishPartial(ctx, partial, attempt.ID, copyResult.ByteCount, copyResult.Reason)
+		}
 	}
-	_ = lease.Cancel()
+	byteCount := copyResult.ByteCount
 	if err := partial.Sync(); err != nil {
 		return executor.finishPartialAfterClose(ctx, partial, attempt.ID, byteCount, recording.ReasonFileSyncFailed)
 	}
@@ -174,8 +220,12 @@ func (executor Executor) Execute(ctx context.Context, reservation recording.Rese
 	if err := executor.Store.MarkDirectorySynced(ctx, attempt.ID, executor.now()); err != nil {
 		return Result{State: recording.AttemptFinalizing, Reason: recording.ReasonFinalDatabaseFailed}, err
 	}
+	reason := recording.ReasonCompleted
+	if reconnected {
+		reason = recording.ReasonCompletedAfterReconnect
+	}
 	finish := recording.FinishRequest{
-		AttemptID: attempt.ID, State: recording.AttemptSucceeded, Reason: recording.ReasonCompleted,
+		AttemptID: attempt.ID, State: recording.AttemptSucceeded, Reason: reason,
 		ByteCount: byteCount, Availability: recording.AvailabilityFinal, Now: executor.now(),
 	}
 	if err := executor.Store.FinishAttempt(ctx, finish); err != nil {
@@ -184,50 +234,69 @@ func (executor Executor) Execute(ctx context.Context, reservation recording.Rese
 	return Result{State: finish.State, Reason: finish.Reason}, nil
 }
 
-func (executor Executor) copy(ctx context.Context, lease providerstream.Lease, file PartialFile, attempt recording.Attempt) (int64, recording.TerminalReason, bool, error) {
+func (executor Executor) copy(ctx context.Context, lease providerstream.Lease, file PartialFile, attempt recording.Attempt, result streamCopyResult) streamCopyResult {
+	result.ReachedEnd = false
+	result.Retryable = false
 	buffer := make([]byte, provider.MaxStreamChunk)
-	var total int64
-	lastProgress := executor.now()
 	for {
 		if !executor.now().Before(attempt.PlannedEnd) {
-			return total, recording.ReasonCompleted, true, nil
+			result.Reason = recording.ReasonCompleted
+			result.ReachedEnd = true
+			return result
 		}
 		read, terminal, err := lease.Read(ctx, buffer)
 		if read < 0 || read > len(buffer) {
-			return total, recording.ReasonStreamUnavailable, false, errors.New("recording: invalid stream read count")
+			result.Reason = recording.ReasonStreamUnavailable
+			return result
 		}
 		if read > 0 {
-			if total > math.MaxInt64-int64(read) {
-				return total, recording.ReasonFileWriteFailed, false, errors.New("recording: byte count overflow")
+			if result.ByteCount > math.MaxInt64-int64(read) {
+				result.Reason = recording.ReasonFileWriteFailed
+				return result
 			}
 			written, writeErr := file.Write(buffer[:read])
 			if written > 0 && written <= read {
-				total += int64(written)
+				result.ByteCount += int64(written)
 			}
 			if writeErr != nil || written != read {
-				return total, recording.ReasonFileWriteFailed, false, errors.New("recording: partial write failed")
+				result.Reason = recording.ReasonFileWriteFailed
+				return result
 			}
 		}
 		now := executor.now()
-		if now.Sub(lastProgress) >= progressInterval {
-			if err := executor.Store.UpdateRecordingProgress(context.WithoutCancel(ctx), attempt.ID, total, now); err != nil {
-				return total, recording.ReasonProcessInterrupted, false, errors.New("recording: persist progress")
+		if now.Sub(result.LastProgress) >= progressInterval {
+			if err := executor.Store.UpdateRecordingProgress(context.WithoutCancel(ctx), attempt.ID, result.ByteCount, now); err != nil {
+				result.Reason = recording.ReasonProcessInterrupted
+				return result
 			}
-			lastProgress = now
+			result.LastProgress = now
 		}
 		if !now.Before(attempt.PlannedEnd) {
-			return total, recording.ReasonCompleted, true, nil
+			result.Reason = recording.ReasonCompleted
+			result.ReachedEnd = true
+			return result
 		}
 		if err != nil || terminal.Done {
-			return total, streamTerminalReason(err, terminal), false, err
+			result.Reason = streamTerminalReason(err, terminal)
+			result.Retryable = retryableStreamFailure(err, terminal)
+			return result
 		}
 		if read == 0 {
-			return total, recording.ReasonStreamUnavailable, false, errors.New("recording: stream made no progress")
+			result.Reason = recording.ReasonStreamUnavailable
+			result.Retryable = true
+			return result
 		}
 	}
 }
 
-func (executor Executor) finishOpenFailure(ctx context.Context, file PartialFile, attemptID catalogmodel.ID, reason recording.TerminalReason) (Result, error) {
+func (executor Executor) finishStreamFailure(ctx context.Context, file PartialFile, attemptID catalogmodel.ID, byteCount int64, reason recording.TerminalReason, started bool) (Result, error) {
+	if !started {
+		return executor.finishBeforeRecording(ctx, file, attemptID, reason)
+	}
+	return executor.finishPartial(ctx, file, attemptID, byteCount, reason)
+}
+
+func (executor Executor) finishBeforeRecording(ctx context.Context, file PartialFile, attemptID catalogmodel.ID, reason recording.TerminalReason) (Result, error) {
 	if err := file.Sync(); err != nil {
 		reason = recording.ReasonFileSyncFailed
 	}
@@ -235,6 +304,49 @@ func (executor Executor) finishOpenFailure(ctx context.Context, file PartialFile
 		reason = recording.ReasonFileSyncFailed
 	}
 	return executor.finishByCount(context.WithoutCancel(ctx), attemptID, 0, reason, true)
+}
+
+func (executor Executor) prepareReconnect(ctx context.Context, plannedEnd time.Time, connection int, retryable bool) bool {
+	if !retryable || connection >= len(reconnectDelays) || ctx.Err() != nil ||
+		plannedEnd.Sub(executor.now()) < minimumReconnectRemaining {
+		return false
+	}
+	return executor.wait(ctx, reconnectDelays[connection]) == nil
+}
+
+func (executor Executor) wait(ctx context.Context, delay time.Duration) error {
+	if executor.Wait != nil {
+		return executor.Wait(ctx, delay)
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func streamCorrelationID(attemptID catalogmodel.ID, connection int) string {
+	if connection == 0 {
+		return attemptID.String()
+	}
+	return fmt.Sprintf("%s-reconnect-%d", attemptID.String(), connection)
+}
+
+func retryableStreamFailure(err error, terminal providerstream.Terminal) bool {
+	if provider.IsReason(err, provider.ReasonUnavailable) || provider.IsReason(err, provider.ReasonTimeout) ||
+		provider.IsReason(err, provider.ReasonEarlyEOF) {
+		return true
+	}
+	switch terminal.Reason {
+	case providerstream.TerminalCleanEnd, providerstream.TerminalEarlyEOF,
+		providerstream.TerminalTimeout, providerstream.TerminalPeer:
+		return true
+	default:
+		return false
+	}
 }
 
 func (executor Executor) finishPartial(ctx context.Context, file PartialFile, attemptID catalogmodel.ID, byteCount int64, reason recording.TerminalReason) (Result, error) {

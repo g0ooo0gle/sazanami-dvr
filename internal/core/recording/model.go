@@ -175,6 +175,8 @@ type TerminalReason string
 const (
 	// ReasonCompletedは完成ファイルとDBの確定が終わった正常終了を表す。
 	ReasonCompleted TerminalReason = "COMPLETED"
+	// ReasonCompletedAfterReconnectは録画ストリームを開き直した後の正常終了を表す。
+	ReasonCompletedAfterReconnect TerminalReason = "COMPLETED_AFTER_RECONNECT"
 	// ReasonLateStartExpiredは開始猶予を過ぎて録画を始めなかったことを表す。
 	ReasonLateStartExpired TerminalReason = "LATE_START_EXPIRED"
 	// ReasonRecordingSlotUnavailableは一件だけの録画枠を取得できなかったことを表す。
@@ -189,6 +191,8 @@ const (
 	ReasonStreamEndedEarly TerminalReason = "STREAM_ENDED_EARLY"
 	// ReasonStreamCancelledはコンテキストによってストリームが停止したことを表す。
 	ReasonStreamCancelled TerminalReason = "STREAM_CANCELLED"
+	// ReasonStreamReconnectExhaustedは上限の3回まで開き直してもストリームが回復しなかったことを表す。
+	ReasonStreamReconnectExhausted TerminalReason = "STREAM_RECONNECT_EXHAUSTED"
 	// ReasonFileCreateFailedは安全な部分ファイルを作れなかったことを表す。
 	ReasonFileCreateFailed TerminalReason = "FILE_CREATE_FAILED"
 	// ReasonFileWriteFailedは部分ファイルへ完全に書き込めなかったことを表す。
@@ -214,9 +218,9 @@ const (
 // ValidはDBへ保存できる固定の終了理由かを返す。
 func (reason TerminalReason) Valid() bool {
 	switch reason {
-	case ReasonCompleted, ReasonLateStartExpired, ReasonRecordingSlotUnavailable,
+	case ReasonCompleted, ReasonCompletedAfterReconnect, ReasonLateStartExpired, ReasonRecordingSlotUnavailable,
 		ReasonStreamNotFound, ReasonStreamUnavailable, ReasonStreamTimeout,
-		ReasonStreamEndedEarly, ReasonStreamCancelled, ReasonFileCreateFailed,
+		ReasonStreamEndedEarly, ReasonStreamCancelled, ReasonStreamReconnectExhausted, ReasonFileCreateFailed,
 		ReasonFileWriteFailed, ReasonFileSyncFailed, ReasonFinalNameConflict,
 		ReasonFinalPublicationFailed, ReasonFinalDatabaseFailed,
 		ReasonProcessInterrupted, ReasonProcessShutdown, ReasonFileMissing, ReasonFileIntegrityMismatch:
@@ -224,6 +228,10 @@ func (reason TerminalReason) Valid() bool {
 	default:
 		return false
 	}
+}
+
+func (reason TerminalReason) successful() bool {
+	return reason == ReasonCompleted || reason == ReasonCompletedAfterReconnect
 }
 
 // AvailabilityはDBから見た録画ファイルの現在状態である。
@@ -369,20 +377,20 @@ func (request FinishRequest) Validate() error {
 	}
 	switch request.State {
 	case AttemptSucceeded:
-		if request.Reason != ReasonCompleted || request.ByteCount < 188 || request.Availability != AvailabilityFinal {
+		if !request.Reason.successful() || request.ByteCount < 188 || request.Availability != AvailabilityFinal {
 			return errors.New("recording: invalid successful finish")
 		}
 	case AttemptPartial:
-		if request.Reason == ReasonCompleted || request.ByteCount < 188 || request.Availability != AvailabilityPartial {
+		if request.Reason.successful() || request.ByteCount < 188 || request.Availability != AvailabilityPartial {
 			return errors.New("recording: invalid partial finish")
 		}
 	case AttemptFailed, AttemptCancelled:
-		if request.Reason == ReasonCompleted || (request.Availability != AvailabilityPartial &&
+		if request.Reason.successful() || (request.Availability != AvailabilityPartial &&
 			request.Availability != AvailabilityMissing && request.Availability != AvailabilityMismatched) {
 			return errors.New("recording: invalid unsuccessful finish")
 		}
 	case AttemptMissed:
-		if request.Reason == ReasonCompleted || request.ByteCount != 0 || request.Availability != AvailabilityMissing {
+		if request.Reason.successful() || request.ByteCount != 0 || request.Availability != AvailabilityMissing {
 			return errors.New("recording: invalid empty finish")
 		}
 	default:
