@@ -147,5 +147,14 @@ func TestHandlerAppliesMetadataAndFuzzyConditions(t *testing.T) {
 }
 
 func wireNibbles(first, second uint8) uint16 {
-	return uint16(second)<<8 | uint16(first)
+	return uint16(first)<<8 | uint16(second)
+}
+
+func TestKonomiTVContentNibbleOrder(t *testing.T) {
+	metadata := catalogmodel.ProgramMetadata{Genres: []catalogmodel.Genre{{Level1: 1, Level2: 2}}}
+	major := preparedCondition{search: core.SearchCondition{Contents: []core.ContentRange{{Content: 0x01ff}}}}
+	reversed := preparedCondition{search: core.SearchCondition{Contents: []core.ContentRange{{Content: 0xff01}}}}
+	if !major.matchesContents(metadata) || reversed.matchesContents(metadata) {
+		t.Fatal("KonomiTVが送る大分類・中分類のバイト順を解釈できません")
+	}
 }
