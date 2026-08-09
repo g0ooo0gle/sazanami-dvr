@@ -1,4 +1,4 @@
-// Package ctrlcmdはloopback専用のCtrlCmd受付境界を提供する。
+// Package ctrlcmdは認証なしのCtrlCmd受付と、接続ごとの固定上限を提供する。
 package ctrlcmd
 
 import (
@@ -34,7 +34,7 @@ type Metrics struct {
 	Active    int64
 }
 
-// Serverはloopback接続と同時handler数を別々の上限で管理する。
+// Serverは接続数と同時handler数を別々の上限で管理する。
 type Server struct {
 	config      Config
 	handler     FrameHandler

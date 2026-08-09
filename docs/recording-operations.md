@@ -35,7 +35,6 @@ sazanami-dvr recording serve \
   --channel-map <channel-map> \
   --provider mirakurun \
   --base-url <mirakurun-url> \
-  --listen 127.0.0.1:4510 \
   --http-listen 127.0.0.1:40773
 ```
 
@@ -50,12 +49,11 @@ sazanami-dvr recording serve \
 
 待受開始後、Mirakurunの版、サービス、番組を直ちに確認します。録画streamは余白を反映した予定開始時刻に、ライブstreamはクライアントから301を受けた場合だけ開きます。
 
-Android TVなど別の端末から使う場合は、CtrlCmdとHTTPの両方をLANで待ち受けます。IPを固定したくない場合は、複数のLANインターフェースをまとめて待ち受けられます。
+CtrlCmdは既定でIPv4の全interfaceに待ち受けます。Android TVなど別の端末から録画ファイルも直接再生する場合だけ、HTTPもLANで待ち受けます。
 
 ```text
 sazanami-dvr recording serve \
   <ほかの引数> \
-  --listen 0.0.0.0:4510 \
   --http-listen 0.0.0.0:40773
 ```
 

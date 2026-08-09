@@ -1,12 +1,12 @@
 # KonomiTVと接続する
 
 この手順では、KonomiTVの番組表からSazanami DVRへ予約を送り、完成した録画ファイルをKonomiTVで
-見つけられる構成にします。KonomiTVとSazanami DVRは、同じUbuntu上で直接動かしてください。
+見つけられる構成にします。KonomiTVとSazanami DVRは、同じUbuntuまたは信頼できる同じLANで動かしてください。
 
 初回は「接続の分担」から「一件確認する」までを順に進めます。「うまくいかない場合」は、問題が起きた
 ときだけ参照してください。
 
-Sazanami DVRは同じPCからの接続を既定とします。LANで使う場合は待受アドレスを明示できます。KonomiTVをDockerコンテナへ入れると`127.0.0.1`の指す環境が分かれるため、初回確認ではDockerを使いません。
+Sazanami DVRのCtrlCmdは、既定で同じLANから接続できます。KonomiTVをDockerコンテナへ入れると`127.0.0.1`の指す環境が分かれるため、Sazanami DVRホストのLANアドレスを指定してください。同じPCだけで使う場合は、Sazanami DVRへ`--listen 127.0.0.1:4510`を明示できます。
 
 確認対象はKonomiTV v0.14.1です。画面の番組表から予約し、5分間録画したファイルを録画済み一覧から
 再生するところまで一件確認しました。自動予約はHTTP APIから条件の追加・一覧取得・変更・削除を行い、
@@ -21,7 +21,7 @@ KonomiTVではバックエンドに`EDCB`を選び、その接続先をSazanami 
 KonomiTV ──番組表・予約・ライブ視聴──> Sazanami DVR ──必要なstream──> Mirakurun / mirakc
 ```
 
-Sazanami DVRの待受は`127.0.0.1`のままです。LANへ公開する必要はありません。
+CtrlCmdは既定でLANへ公開されます。同じPCだけで使う場合は、起動時に`--listen 127.0.0.1:4510`を指定します。
 
 ## Sazanami DVRを先に起動する
 
@@ -52,9 +52,10 @@ sazanami-dvr recording serve \
   --recording-root <recording-root> \
   --channel-map <channel-map> \
   --provider mirakurun \
-  --base-url <mirakurun-url> \
-  --listen 127.0.0.1:4510
+  --base-url <mirakurun-url>
 ```
+
+この起動方法では、CtrlCmdを`0.0.0.0:4510`で待ち受けます。認証はないためインターネットへ直接公開しないでください。必要ならホストのファイアウォールで信頼できるLANに制限します。
 
 KonomiTVは起動時にバックエンドへ接続できるか確認するため、Sazanami DVRを先に起動してください。
 
@@ -77,7 +78,7 @@ KonomiTVの`config.yaml`で、次の項目を設定します。ほかの項目�
 general:
     backend: 'EDCB'
     always_receive_tv_from_mirakurun: false
-    edcb_url: 'tcp://127.0.0.1:4510/'
+    edcb_url: 'tcp://<sazanami-host>:4510/'
     mirakurun_url: '<mirakurun-url>'
 
 video:
@@ -88,6 +89,8 @@ video:
 `backend`が`Mirakurun`のままだと、KonomiTVの録画予約機能は利用できません。Sazanami DVRの完成ファイルは
 録画保存先の下へ`.ts`として作られます。KonomiTV v0.14.1は登録したフォルダを再帰的に監視し、60秒以上の
 TSファイルを録画済み番組の解析対象にします。
+
+`<sazanami-host>`にはSazanami DVRホストのLANアドレスを指定します。KonomiTVとSazanami DVRを同じPCで動かし、Sazanami DVRをloopback限定にした場合は`127.0.0.1`を使えます。
 
 `always_receive_tv_from_mirakurun: false`では、KonomiTVのライブ視聴もSazanami DVRを経由します。Sazanami DVRをライブ経路から外す場合だけ`true`にします。その場合も番組表と録画予約はSazanami DVRへ接続します。
 
@@ -113,7 +116,7 @@ TSファイルを録画済み番組の解析対象にします。
 
 | 表示や状態 | 確認すること |
 |---|---|
-| KonomiTVがEDCBへ接続できない | Sazanami DVRが先に起動し、`127.0.0.1:4510`で待ち受けているか |
+| KonomiTVがEDCBへ接続できない | Sazanami DVRが先に起動し、`<sazanami-host>:4510`へ同じLANから到達できるか |
 | 予約画面がHTTP 422になる | KonomiTVの`backend`が`EDCB`になっているか |
 | 番組表が空 | `catalog sync`と`ctrlcmd validate`が成功しているか |
 | ライブ視聴を開始できない | `always_receive_tv_from_mirakurun`、チャンネル設定のONID・TSID・SID、Mirakurunのstream応答を確認する |

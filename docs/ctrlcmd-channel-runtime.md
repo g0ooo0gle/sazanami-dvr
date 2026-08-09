@@ -1,6 +1,6 @@
 # CtrlCmdチャンネル待受の使い方
 
-この機能は、保存済みのMirakurunカタログと手動設定を照合し、KonomiTV向けのチャンネル情報を返します。待受は同じPCからだけ接続できるアドレスに限定しています。
+この機能は、保存済みのMirakurunカタログと手動設定を照合し、KonomiTV向けのチャンネル情報を返します。CtrlCmdは既定で同じLANから接続できます。
 
 現在実装しているのは、状態確認の2200、`ChSet5.txt`取得の1060、サービス一覧の1021です。番組表、予約、録画を使う場合は`recording serve`を起動してください。
 
@@ -51,11 +51,12 @@ sazanami-dvr ctrlcmd validate \
 ```console
 sazanami-dvr ctrlcmd serve \
   --data-root <data-root> \
-  --channel-map <data-root>/channels.json \
-  --listen 127.0.0.1:4510
+  --channel-map <data-root>/channels.json
 ```
 
-起動前に`validate`と同じ検査を行い、すべて成功した場合だけ待受を始めます。待受先には`127.0.0.1`または`::1`と、1〜65,535のポートを指定できます。ホスト名やLAN向けアドレスは指定できません。
+起動前に`validate`と同じ検査を行い、すべて成功した場合だけ`0.0.0.0:4510`で待受を始めます。認証とTLSはないため、インターネットへ直接公開しないでください。
+
+待受先には、numeric loopback、numeric private IP、`0.0.0.0`、`::`と、1〜65,535のポートを指定できます。ホスト名、link-local、multicast、global IPは指定できません。同じPCだけに絞る場合は`--listen 127.0.0.1:4510`を追加します。
 
 停止するには`SIGINT`または`SIGTERM`を送ります。受付済みの処理が期限内に終わるのを待ってから、DBのロックを解放します。
 
