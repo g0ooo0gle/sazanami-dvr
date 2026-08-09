@@ -21,6 +21,7 @@ type tsComponentFilter struct {
 	keepData          bool
 	initialized       bool
 	pmtPID            uint16
+	pmtContinuity     byte
 	dropped           map[uint16]bool
 	tail              []byte
 	discovery         []byte
@@ -143,6 +144,7 @@ func (filter *tsComponentFilter) replayInitial(data []byte, found discoveredPMT,
 		if index == found.firstPacket {
 			packets := packetizePMT(found.pmtPID, found.continuity, rewritten)
 			count, err := filter.writePacketList(packets)
+			filter.pmtContinuity = (found.continuity + byte(len(packets))) & 0x0f
 			written += count
 			if err != nil {
 				return written, err
@@ -209,11 +211,11 @@ func (filter *tsComponentFilter) processPacket(packet []byte) (int64, error) {
 	}
 	first := filter.updatePMTIndexes[0]
 	last := filter.updatePMTIndexes[len(filter.updatePMTIndexes)-1]
-	_, _, continuity, _ := tsPacketHeader(filter.updatePackets[first])
+	packets := packetizePMT(filter.pmtPID, filter.pmtContinuity, rewritten)
 	var written int64
 	for index, pending := range filter.updatePackets {
 		if index == first {
-			count, writeErr := filter.writePacketList(packetizePMT(filter.pmtPID, continuity, rewritten))
+			count, writeErr := filter.writePacketList(packets)
 			written += count
 			if writeErr != nil {
 				return written, writeErr
@@ -229,6 +231,7 @@ func (filter *tsComponentFilter) processPacket(packet []byte) (int64, error) {
 		}
 	}
 	filter.dropped = dropped
+	filter.pmtContinuity = (filter.pmtContinuity + byte(len(packets))) & 0x0f
 	filter.updatePackets = nil
 	filter.updatePMTIndexes = nil
 	filter.updateCollector = psiCollector{}
