@@ -68,16 +68,19 @@ func createReservationTx(ctx context.Context, tx *sql.Tx, reservation recording.
 		return recording.Reservation{}, ErrDuplicateReservation
 	}
 	createdMS := reservation.CreatedAt.UnixMilli()
+	margins := reservation.EffectiveMargins()
 	_, err := tx.ExecContext(ctx, `INSERT INTO reservations(
 		id, version, state, program_instance_id, program_revision_id, backend_instance_id,
 		provider_service_locator, tuning_target, network_id, transport_stream_id, service_id, event_id,
 		title, station_name, start_at_utc_ms, duration_seconds, requested_priority, requested_follow,
-		effective_follow, created_at_utc_ms, updated_at_utc_ms)
-		VALUES (?, 1, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+		effective_follow, created_at_utc_ms, updated_at_utc_ms, enabled, use_default_margins,
+		effective_start_margin_seconds, effective_end_margin_seconds)
+		VALUES (?, 1, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)`,
 		reservation.ID.Bytes(), p.ProgramInstanceID.Bytes(), p.ProgramRevisionID.Bytes(), p.BackendID.Bytes(),
 		p.ProviderServiceLocator, p.TuningTarget, p.NetworkID, p.TransportStreamID, p.ServiceID, p.EventID,
 		p.Title, p.StationName, p.Start.UnixMilli(), int64(p.Duration/time.Second), reservation.Priority,
-		reservation.RequestedFollow, createdMS, createdMS)
+		reservation.RequestedFollow, createdMS, createdMS, !reservation.Disabled, reservation.Margins == nil,
+		int64(margins.Start/time.Second), int64(margins.End/time.Second))
 	if err != nil {
 		return recording.Reservation{}, sanitize("create-reservation", err)
 	}
@@ -103,7 +106,8 @@ func (store *Store) ActiveReservations(ctx context.Context, limit int, after int
 		r.program_instance_id, r.program_revision_id, r.backend_instance_id, r.provider_service_locator,
 		r.tuning_target, r.network_id, r.transport_stream_id, r.service_id, r.event_id, r.title,
 		r.station_name, r.start_at_utc_ms, r.duration_seconds, r.requested_priority, r.requested_follow,
-		r.effective_follow, r.created_at_utc_ms, r.updated_at_utc_ms
+		r.effective_follow, r.created_at_utc_ms, r.updated_at_utc_ms, r.enabled, r.use_default_margins,
+		r.effective_start_margin_seconds, r.effective_end_margin_seconds
 		FROM ctrlcmd_reservation_ids m JOIN reservations r ON r.id=m.reservation_id
 		WHERE r.state='ACTIVE' AND m.reserve_id>? ORDER BY m.reserve_id LIMIT ?`, after, limit)
 	if err != nil {
@@ -221,15 +225,15 @@ func (store *Store) ApplyReservationFollow(ctx context.Context, request recordin
 func applyActiveRecordingExtension(ctx context.Context, tx *sql.Tx, request recording.ReservationFollowRequest,
 	targetStartMS, targetDurationMS int64,
 ) (bool, error) {
-	var reservationStartMS, reservationDurationSeconds, attemptEndMS int64
+	var reservationStartMS, reservationDurationSeconds, endMarginSeconds, attemptEndMS int64
 	var attemptID []byte
 	var attemptState recording.AttemptState
-	err := tx.QueryRowContext(ctx, `SELECT r.start_at_utc_ms, r.duration_seconds,
+	err := tx.QueryRowContext(ctx, `SELECT r.start_at_utc_ms, r.duration_seconds, r.effective_end_margin_seconds,
 		a.id, a.state, a.planned_end_utc_ms
 		FROM reservations r JOIN recording_attempts a ON a.reservation_id=r.id
 		WHERE r.id=? AND r.version=? AND r.state='ACTIVE' AND r.requested_follow=1
 		  AND r.program_revision_id=?`, request.ReservationID.Bytes(), request.ExpectedVersion,
-		request.ExpectedRevisionID.Bytes()).Scan(&reservationStartMS, &reservationDurationSeconds,
+		request.ExpectedRevisionID.Bytes()).Scan(&reservationStartMS, &reservationDurationSeconds, &endMarginSeconds,
 		&attemptID, &attemptState, &attemptEndMS)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
@@ -241,8 +245,8 @@ func applyActiveRecordingExtension(ctx context.Context, tx *sql.Tx, request reco
 		targetDurationMS < 60_000 || targetDurationMS > 12*60*60*1_000 || targetDurationMS%1_000 != 0 {
 		return false, nil
 	}
-	targetEndMS := targetStartMS + targetDurationMS
-	reservationEndMS := reservationStartMS + reservationDurationSeconds*1_000
+	targetEndMS := targetStartMS + targetDurationMS + endMarginSeconds*1_000
+	reservationEndMS := reservationStartMS + reservationDurationSeconds*1_000 + endMarginSeconds*1_000
 	if targetEndMS <= attemptEndMS || reservationEndMS != attemptEndMS {
 		return false, nil
 	}
@@ -299,15 +303,19 @@ func (store *Store) UpdateReservation(ctx context.Context, change recording.Rese
 		return errors.New("sqlite: invalid reservation update")
 	}
 	request := change.Request
+	margins := recording.Reservation{Margins: request.Margins}.EffectiveMargins()
 	result, err := store.writer.ExecContext(ctx, `UPDATE reservations SET requested_priority=?, requested_follow=?,
+		enabled=?, use_default_margins=?, effective_start_margin_seconds=?, effective_end_margin_seconds=?,
 		version=version+1, updated_at_utc_ms=? WHERE id=(
 			SELECT reservation_id FROM ctrlcmd_reservation_ids WHERE reserve_id=?
 		) AND state='ACTIVE' AND network_id=? AND transport_stream_id=? AND service_id=? AND event_id=?
 		AND start_at_utc_ms=? AND duration_seconds=? AND NOT EXISTS (
 			SELECT 1 FROM recording_attempts WHERE reservation_id=reservations.id
-		)`, request.Priority, request.RequestedFollow, now.UnixMilli(), change.Number, request.NetworkID,
+		) AND (?=0 OR start_at_utc_ms+(duration_seconds+?)*1000>?)`,
+		request.Priority, request.RequestedFollow, !request.Disabled, request.Margins == nil,
+		int64(margins.Start/time.Second), int64(margins.End/time.Second), now.UnixMilli(), change.Number, request.NetworkID,
 		request.TransportStreamID, request.ServiceID, request.EventID, request.Start.UnixMilli(),
-		int64(request.Duration/time.Second))
+		int64(request.Duration/time.Second), !request.Disabled, int64(margins.End/time.Second), now.UnixMilli())
 	if err != nil {
 		return sanitize("update-reservation", err)
 	}
@@ -427,21 +435,64 @@ func (store *Store) ReservationRecording(ctx context.Context, number int32) (boo
 	return active == 1, nil
 }
 
-// NextActiveReservationはまだ録画処理へ割り当てていない予約を開始時刻順に一件だけ返す。
-func (store *Store) NextActiveReservation(ctx context.Context) (*recording.Reservation, error) {
-	if store == nil || store.reader == nil || ctx == nil {
+// ExpireOneDisabledReservationは終了予定を過ぎた無効予約を、一回に一件だけ終了する。
+func (store *Store) ExpireOneDisabledReservation(ctx context.Context, now time.Time) (bool, error) {
+	if store == nil || store.writer == nil || ctx == nil || now.IsZero() || now.Location() != time.UTC || now.UnixMilli() < 0 {
+		return false, errors.New("sqlite: invalid disabled reservation expiration")
+	}
+	nowMS := now.UnixMilli()
+	result, err := store.writer.ExecContext(ctx, `UPDATE reservations SET state='FINISHED', version=version+1,
+		updated_at_utc_ms=?, finished_at_utc_ms=?, terminal_reason=?
+		WHERE id=(SELECT id FROM reservations WHERE state='ACTIVE' AND enabled=0
+		AND start_at_utc_ms + (duration_seconds + effective_end_margin_seconds) * 1000 <= ?
+		AND NOT EXISTS (SELECT 1 FROM recording_attempts WHERE reservation_id=reservations.id)
+		ORDER BY start_at_utc_ms + (duration_seconds + effective_end_margin_seconds) * 1000, id LIMIT 1)
+		AND state='ACTIVE'`, nowMS, nowMS, recording.ReservationReasonDisabledExpired, nowMS)
+	if err != nil {
+		return false, sanitize("expire-disabled-reservation", err)
+	}
+	return affected(result) == 1, nil
+}
+
+// NextDisabledReservationDeadlineは未来に残る無効予約のうち、最も早い終了予定を返す。
+func (store *Store) NextDisabledReservationDeadline(ctx context.Context, now time.Time) (*time.Time, error) {
+	if store == nil || store.reader == nil || ctx == nil || now.IsZero() || now.Location() != time.UTC || now.UnixMilli() < 0 {
+		return nil, errors.New("sqlite: invalid disabled reservation deadline query")
+	}
+	var deadlineMS int64
+	err := store.reader.QueryRowContext(ctx, `SELECT start_at_utc_ms+(duration_seconds+effective_end_margin_seconds)*1000
+		FROM reservations WHERE state='ACTIVE' AND enabled=0
+		AND start_at_utc_ms+(duration_seconds+effective_end_margin_seconds)*1000>?
+		AND NOT EXISTS (SELECT 1 FROM recording_attempts WHERE reservation_id=reservations.id)
+		ORDER BY start_at_utc_ms+(duration_seconds+effective_end_margin_seconds)*1000, id LIMIT 1`, now.UnixMilli()).Scan(&deadlineMS)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, sanitize("read-disabled-reservation-deadline", err)
+	}
+	deadline := time.UnixMilli(deadlineMS).UTC()
+	return &deadline, nil
+}
+
+// NextActiveReservationは未割当ての有効予約から、開始済みなら優先度、未来なら開始予定順で一件を返す。
+func (store *Store) NextActiveReservation(ctx context.Context, now time.Time) (*recording.Reservation, error) {
+	if store == nil || store.reader == nil || ctx == nil || now.IsZero() || now.Location() != time.UTC || now.UnixMilli() < 0 {
 		return nil, errors.New("sqlite: invalid next reservation query")
 	}
 	row := store.reader.QueryRowContext(ctx, `SELECT r.id, m.reserve_id, r.version, r.state,
 		r.program_instance_id, r.program_revision_id, r.backend_instance_id, r.provider_service_locator,
 		r.tuning_target, r.network_id, r.transport_stream_id, r.service_id, r.event_id, r.title,
 		r.station_name, r.start_at_utc_ms, r.duration_seconds, r.requested_priority, r.requested_follow,
-		r.effective_follow, r.created_at_utc_ms, r.updated_at_utc_ms
+		r.effective_follow, r.created_at_utc_ms, r.updated_at_utc_ms, r.enabled, r.use_default_margins,
+		r.effective_start_margin_seconds, r.effective_end_margin_seconds
 		FROM ctrlcmd_reservation_ids m JOIN reservations r ON r.id=m.reservation_id
-		WHERE r.state='ACTIVE' AND NOT EXISTS (
+		WHERE r.state='ACTIVE' AND r.enabled=1 AND NOT EXISTS (
 			SELECT 1 FROM recording_attempts a WHERE a.reservation_id=r.id
 		)
-		ORDER BY r.start_at_utc_ms, r.id LIMIT 1`)
+		ORDER BY CASE WHEN r.start_at_utc_ms-r.effective_start_margin_seconds*1000<=? THEN 0 ELSE 1 END,
+		CASE WHEN r.start_at_utc_ms-r.effective_start_margin_seconds*1000<=? THEN r.requested_priority END DESC,
+		r.start_at_utc_ms-r.effective_start_margin_seconds*1000, r.id LIMIT 1`, now.UnixMilli(), now.UnixMilli())
 	item, err := scanReservation(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -464,16 +515,17 @@ func (store *Store) ClaimRecording(ctx context.Context, request recording.ClaimR
 	defer tx.Rollback()
 
 	var state recording.ReservationState
-	var startMS, durationSeconds int64
-	err = tx.QueryRowContext(ctx, `SELECT state, start_at_utc_ms, duration_seconds FROM reservations WHERE id=?`,
-		request.ReservationID.Bytes()).Scan(&state, &startMS, &durationSeconds)
+	var startMS, durationSeconds, enabled, startMarginSeconds, endMarginSeconds int64
+	err = tx.QueryRowContext(ctx, `SELECT state, start_at_utc_ms, duration_seconds, enabled,
+		effective_start_margin_seconds, effective_end_margin_seconds FROM reservations WHERE id=?`,
+		request.ReservationID.Bytes()).Scan(&state, &startMS, &durationSeconds, &enabled, &startMarginSeconds, &endMarginSeconds)
 	if errors.Is(err, sql.ErrNoRows) {
 		return recording.Attempt{}, ErrReservationUnavailable
 	}
 	if err != nil {
 		return recording.Attempt{}, sanitize("read-recording-reservation", err)
 	}
-	if state != recording.ReservationActive {
+	if state != recording.ReservationActive || enabled != 1 {
 		return recording.Attempt{}, ErrReservationUnavailable
 	}
 	var existing int
@@ -484,8 +536,9 @@ func (store *Store) ClaimRecording(ctx context.Context, request recording.ClaimR
 	if existing != 0 {
 		return recording.Attempt{}, ErrAttemptExists
 	}
-	endMS := startMS + durationSeconds*1_000
-	if startMS < 0 || durationSeconds < 1 || endMS <= startMS {
+	plannedStartMS := startMS - startMarginSeconds*1_000
+	endMS := startMS + (durationSeconds+endMarginSeconds)*1_000
+	if startMS < 0 || durationSeconds < 1 || plannedStartMS < 0 || endMS <= plannedStartMS || endMS-plannedStartMS > int64((24*time.Hour)/time.Millisecond) {
 		return recording.Attempt{}, errors.New("sqlite: corrupt recording time")
 	}
 	nowMS := request.Now.UnixMilli()
@@ -493,7 +546,7 @@ func (store *Store) ClaimRecording(ctx context.Context, request recording.ClaimR
 		id, reservation_id, state, state_version, planned_start_utc_ms, planned_end_utc_ms,
 		owner_instance_id, owner_generation, heartbeat_utc_ms, created_at_utc_ms, updated_at_utc_ms)
 		VALUES (?, ?, 'CLAIMED', 1, ?, ?, ?, ?, ?, ?, ?)`, request.AttemptID.Bytes(),
-		request.ReservationID.Bytes(), startMS, endMS, request.OwnerID.Bytes(), request.OwnerGeneration,
+		request.ReservationID.Bytes(), plannedStartMS, endMS, request.OwnerID.Bytes(), request.OwnerGeneration,
 		nowMS, nowMS, nowMS)
 	if err != nil {
 		return recording.Attempt{}, sanitize("create-recording-attempt", err)
@@ -511,7 +564,7 @@ func (store *Store) ClaimRecording(ctx context.Context, request recording.ClaimR
 	}
 	return recording.Attempt{
 		ID: request.AttemptID, ReservationID: request.ReservationID, State: recording.AttemptClaimed,
-		PlannedStart: time.UnixMilli(startMS).UTC(), PlannedEnd: time.UnixMilli(endMS).UTC(), Plan: request.Plan,
+		PlannedStart: time.UnixMilli(plannedStartMS).UTC(), PlannedEnd: time.UnixMilli(endMS).UTC(), Plan: request.Plan,
 	}, nil
 }
 
@@ -762,12 +815,13 @@ func scanReservation(scanner rowScanner) (recording.Reservation, error) {
 	var item recording.Reservation
 	var id, instanceID, revisionID, backendID []byte
 	var number, networkID, transportID, serviceID, eventID, startMS, duration, priority int64
-	var requestedFollow, effectiveFollow int64
+	var requestedFollow, effectiveFollow, enabled, useDefaultMargins, startMarginSeconds, endMarginSeconds int64
 	var createdMS, updatedMS int64
 	if err := scanner.Scan(&id, &number, &item.Version, &item.State, &instanceID, &revisionID, &backendID,
 		&item.Program.ProviderServiceLocator, &item.Program.TuningTarget, &networkID, &transportID,
 		&serviceID, &eventID, &item.Program.Title, &item.Program.StationName, &startMS,
-		&duration, &priority, &requestedFollow, &effectiveFollow, &createdMS, &updatedMS); err != nil {
+		&duration, &priority, &requestedFollow, &effectiveFollow, &createdMS, &updatedMS,
+		&enabled, &useDefaultMargins, &startMarginSeconds, &endMarginSeconds); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return recording.Reservation{}, err
 		}
@@ -776,7 +830,12 @@ func scanReservation(scanner rowScanner) (recording.Reservation, error) {
 	if number < 1 || number > 1<<31-1 || networkID < 0 || networkID > 65_535 ||
 		transportID < 0 || transportID > 65_535 || serviceID < 0 || serviceID > 65_535 ||
 		eventID < 0 || eventID > 65_535 || startMS < 0 || duration < 1 || duration > 86_400 ||
-		priority < 1 || priority > 5 || requestedFollow < 0 || requestedFollow > 1 || effectiveFollow != 0 {
+		priority < 1 || priority > 5 || requestedFollow < 0 || requestedFollow > 1 || effectiveFollow != 0 ||
+		enabled < 0 || enabled > 1 || useDefaultMargins < 0 || useDefaultMargins > 1 ||
+		startMarginSeconds < -3600 || startMarginSeconds > 3600 || endMarginSeconds < -3600 || endMarginSeconds > 3600 ||
+		startMS-startMarginSeconds*1_000 < 0 ||
+		(useDefaultMargins == 1 && (startMarginSeconds != 5 || endMarginSeconds != 2)) ||
+		duration+startMarginSeconds+endMarginSeconds < 1 || duration+startMarginSeconds+endMarginSeconds > 86_400 {
 		return recording.Reservation{}, errors.New("sqlite: corrupt reservation value")
 	}
 	if err := copyExact(item.ID[:], id); err != nil {
@@ -801,6 +860,11 @@ func scanReservation(scanner rowScanner) (recording.Reservation, error) {
 	item.Priority = uint8(priority)
 	item.RequestedFollow = requestedFollow == 1
 	item.EffectiveFollow = item.RequestedFollow
+	item.Disabled = enabled == 0
+	if useDefaultMargins == 0 {
+		item.Margins = &recording.RecordingMargins{Start: time.Duration(startMarginSeconds) * time.Second,
+			End: time.Duration(endMarginSeconds) * time.Second}
+	}
 	item.CreatedAt = time.UnixMilli(createdMS).UTC()
 	item.UpdatedAt = time.UnixMilli(updatedMS).UTC()
 	return item, nil

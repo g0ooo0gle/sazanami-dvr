@@ -57,6 +57,8 @@ func (operations *fakeOperations) Recording(_ context.Context, _ int32) (bool, e
 
 func TestListWritesOneReservationInTwoPasses(t *testing.T) {
 	reservation := listedReservation(1)
+	reservation.Disabled = true
+	reservation.Margins = &recording.RecordingMargins{Start: -time.Hour, End: time.Hour}
 	operations := &fakeOperations{reservations: []recording.Reservation{reservation}}
 	handler := Handler{Operations: operations, Limits: codec.DefaultLimits()}
 	var response bytes.Buffer
@@ -104,7 +106,7 @@ func TestListAcceptsUpdatedReservationVersion(t *testing.T) {
 	}
 }
 
-func TestAddAcceptsFollowButRejectsUnsupportedSettings(t *testing.T) {
+func TestAddAcceptsBasicSettingsAndRejectsUnsupportedMode(t *testing.T) {
 	operations := &fakeOperations{}
 	handler := Handler{Operations: operations, Limits: codec.DefaultLimits()}
 	var response bytes.Buffer
@@ -132,8 +134,83 @@ func TestAddAcceptsFollowButRejectsUnsupportedSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	frame, _ = codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
-	if frame.Code != ResultFailure || len(operations.added) != 1 {
+	if frame.Code != ResultSuccess || len(operations.added) != 2 || operations.added[1].Margins == nil ||
+		*operations.added[1].Margins != (recording.RecordingMargins{}) {
 		t.Fatalf("margin frame=%+v calls=%d", frame, len(operations.added))
+	}
+}
+
+func TestAddAcceptsDisabledAndMarginBoundariesAtomically(t *testing.T) {
+	operations := &fakeOperations{}
+	handler := Handler{Operations: operations, Limits: codec.DefaultLimits()}
+	for _, test := range []struct {
+		name       string
+		mode       uint8
+		useMargins uint8
+		start, end int32
+		wantOK     bool
+	}{
+		{name: "disabled default", mode: 5, wantOK: true},
+		{name: "negative positive boundary", mode: 1, useMargins: 1, start: -3600, end: 3600, wantOK: true},
+		{name: "positive negative boundary", mode: 1, useMargins: 1, start: 3600, end: -3600, wantOK: true},
+		{name: "one over", mode: 1, useMargins: 1, start: 3601, wantOK: false},
+		{name: "invalid flag", mode: 1, useMargins: 2, wantOK: false},
+		{name: "default with value", mode: 1, start: 1, wantOK: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			before := len(operations.added)
+			request := reservationRequestSettings(t, CommandAdd, Version, 0, test.mode, 3, true,
+				test.useMargins, test.start, test.end, 1)
+			var response bytes.Buffer
+			if err := handler.Handle(context.Background(), request, &response); err != nil {
+				t.Fatal(err)
+			}
+			frame, err := codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.wantOK {
+				if frame.Code != ResultSuccess || len(operations.added) != before+1 {
+					t.Fatalf("frame=%+v calls=%d", frame, len(operations.added))
+				}
+				added := operations.added[len(operations.added)-1]
+				if added.Disabled != (test.mode == 5) || added.RequestedFollow != true ||
+					(test.useMargins == 0) != (added.Margins == nil) {
+					t.Fatalf("added=%+v", added)
+				}
+			} else if frame.Code != ResultFailure || len(operations.added) != before {
+				t.Fatalf("partial acceptance frame=%+v calls=%d", frame, len(operations.added))
+			}
+		})
+	}
+}
+
+func TestChangeReplacesAllBasicSettingsTogether(t *testing.T) {
+	operations := &fakeOperations{}
+	handler := Handler{Operations: operations, Limits: codec.DefaultLimits()}
+	request := reservationRequestSettings(t, CommandChange, Version, 7, 5, 5, true, 1, -10, 20, 1)
+	var response bytes.Buffer
+	if err := handler.Handle(context.Background(), request, &response); err != nil {
+		t.Fatal(err)
+	}
+	frame, err := codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
+	if err != nil || frame.Code != ResultSuccess || len(operations.changed) != 1 {
+		t.Fatalf("frame=%+v changed=%+v err=%v", frame, operations.changed, err)
+	}
+	change := operations.changed[0]
+	if change.Number != 7 || !change.Request.Disabled || change.Request.Priority != 5 ||
+		!change.Request.RequestedFollow || change.Request.Margins == nil ||
+		*change.Request.Margins != (recording.RecordingMargins{Start: -10 * time.Second, End: 20 * time.Second}) {
+		t.Fatalf("change=%+v", change)
+	}
+	response.Reset()
+	invalid := reservationRequestSettings(t, CommandChange, Version, 7, 1, 1, false, 1, -3601, 0, 1)
+	if err := handler.Handle(context.Background(), invalid, &response); err != nil {
+		t.Fatal(err)
+	}
+	frame, err = codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
+	if err != nil || frame.Code != ResultFailure || len(operations.changed) != 1 {
+		t.Fatalf("partial change frame=%+v changed=%d err=%v", frame, len(operations.changed), err)
 	}
 }
 
@@ -339,6 +416,13 @@ func changeRequest(t *testing.T, reserveID int32, priority uint8) []byte {
 }
 
 func reservationRequest(t *testing.T, command int32, version uint16, reserveID int32, recordingMode, priority uint8, follow, margins bool, count int) []byte {
+	return reservationRequestSettings(t, command, version, reserveID, recordingMode, priority, follow,
+		boolByte(margins), 0, 0, count)
+}
+
+func reservationRequestSettings(t *testing.T, command int32, version uint16, reserveID int32,
+	recordingMode, priority uint8, follow bool, useMargins uint8, startMargin, endMargin int32, count int,
+) []byte {
 	t.Helper()
 	var itemBody bytes.Buffer
 	item, err := codec.NewWriter(&itemBody, codec.DefaultLimits())
@@ -381,7 +465,7 @@ func reservationRequest(t *testing.T, command int32, version uint16, reserveID i
 	if err := item.SystemTime(start); err != nil {
 		t.Fatal(err)
 	}
-	writeInputSettings(t, item, recordingMode, priority, follow, margins)
+	writeInputSettings(t, item, recordingMode, priority, follow, useMargins, startMargin, endMargin)
 	if err := item.I32(0); err != nil {
 		t.Fatal(err)
 	}
@@ -405,7 +489,9 @@ func reservationRequest(t *testing.T, command int32, version uint16, reserveID i
 	return request
 }
 
-func writeInputSettings(t *testing.T, writer *codec.Writer, mode, priority uint8, follow, margins bool) {
+func writeInputSettings(t *testing.T, writer *codec.Writer, mode, priority uint8, follow bool,
+	useMargins uint8, startMargin, endMargin int32,
+) {
 	t.Helper()
 	if err := writer.I32(51); err != nil {
 		t.Fatal(err)
@@ -421,9 +507,9 @@ func writeInputSettings(t *testing.T, writer *codec.Writer, mode, priority uint8
 	writeTestVector(t, writer, nil, 0)
 	_ = writer.U8(0)
 	_ = writer.U8(0)
-	_ = writer.U8(boolByte(margins))
-	_ = writer.I32(0)
-	_ = writer.I32(0)
+	_ = writer.U8(useMargins)
+	_ = writer.I32(startMargin)
+	_ = writer.I32(endMargin)
 	_ = writer.U8(0)
 	_ = writer.U8(0)
 	_ = writer.U32(0)
@@ -508,9 +594,10 @@ func readListedReservation(reader *codec.Reader, want recording.Reservation) err
 		if _, err := item.SystemTime(); err != nil {
 			return err
 		}
-		priority, follow, err := decodeSettings(item)
-		if err != nil || priority != want.Priority || follow != want.EffectiveFollow {
-			return fmt.Errorf("priority=%d follow=%v err=%v", priority, follow, err)
+		settings, err := decodeSettings(item)
+		if err != nil || settings.priority != want.Priority || settings.follow != want.EffectiveFollow ||
+			settings.disabled != want.Disabled || !sameMargins(settings.margins, want.Margins) {
+			return fmt.Errorf("settings=%+v err=%v", settings, err)
 		}
 		if _, err := item.I32(); err != nil {
 			return err
@@ -526,6 +613,10 @@ func readListedReservation(reader *codec.Reader, want recording.Reservation) err
 		_, err = item.I32()
 		return err
 	})
+}
+
+func sameMargins(left, right *recording.RecordingMargins) bool {
+	return left == nil && right == nil || left != nil && right != nil && *left == *right
 }
 
 func listedReservation(number int32) recording.Reservation {

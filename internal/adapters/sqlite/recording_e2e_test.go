@@ -131,7 +131,7 @@ func TestActiveExtensionReachesRunningExecutor(t *testing.T) {
 	clock := &e2eClock{now: reservation.Program.Start}
 	var applied bool
 	var followErr error
-	stream := &e2eStream{clock: clock, end: reservation.Program.Start.Add(40 * time.Minute)}
+	stream := &e2eStream{clock: clock, end: reservation.Program.Start.Add(40*time.Minute + core.DefaultEndMargin)}
 	stream.onRead = func() {
 		applied, followErr = store.ApplyReservationFollow(context.Background(), core.ReservationFollowRequest{
 			ReservationID: created.ID, ExpectedVersion: created.Version,
@@ -247,7 +247,7 @@ func TestReservationToFinalFileSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	clock := &e2eClock{now: reservation.Program.Start}
-	stream := &e2eStream{clock: clock, end: reservation.Program.Start.Add(reservation.Program.Duration), disconnectFirst: true}
+	stream := &e2eStream{clock: clock, end: created.PlannedEnd(), disconnectFirst: true}
 	ids := []catalogmodel.ID{testID(t, 130), testID(t, 131), testID(t, 132)}
 	nextID := 0
 	files := apprecording.FileOperations{
@@ -318,7 +318,7 @@ func TestReservationToFinalFileSurvivesRestart(t *testing.T) {
 	if err != nil || observation.Partial.Exists || !observation.Final.Regular || observation.Final.Size != 376 {
 		t.Fatalf("observation=%+v err=%v", observation, err)
 	}
-	if next, err := store.NextActiveReservation(context.Background()); err != nil || next != nil {
+	if next, err := store.NextActiveReservation(context.Background(), time.Now().UTC()); err != nil || next != nil {
 		t.Fatalf("next=%+v err=%v", next, err)
 	}
 }
@@ -367,7 +367,7 @@ func TestTwoRecordingsUseSeparateDatabaseRowsAndFiles(t *testing.T) {
 		go func() {
 			nextID := 0
 			stream := &parallelE2EStream{
-				clock: item.clock, end: item.reservation.Program.Start.Add(item.reservation.Program.Duration),
+				clock: item.clock, end: item.reservation.PlannedEnd(),
 				started: started, release: release,
 			}
 			executor := apprecording.Executor{

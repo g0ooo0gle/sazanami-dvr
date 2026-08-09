@@ -34,6 +34,45 @@ func TestReservationValidateNew(t *testing.T) {
 	}
 }
 
+func TestReservationMarginsAndEffectiveDurationBoundaries(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	request := ReservationRequest{Start: start, Duration: 30 * time.Minute, Priority: 3}
+	if err := request.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	reservation := Reservation{Program: ProgramSnapshot{Start: start, Duration: request.Duration}}
+	if !reservation.PlannedStart().Equal(start.Add(-5*time.Second)) ||
+		!reservation.PlannedEnd().Equal(start.Add(30*time.Minute+2*time.Second)) {
+		t.Fatalf("default start=%s end=%s", reservation.PlannedStart(), reservation.PlannedEnd())
+	}
+	zero := &RecordingMargins{}
+	request.Margins = zero
+	if err := request.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	reservation.Margins = zero
+	if !reservation.PlannedStart().Equal(start) || !reservation.PlannedEnd().Equal(start.Add(30*time.Minute)) {
+		t.Fatalf("zero start=%s end=%s", reservation.PlannedStart(), reservation.PlannedEnd())
+	}
+	for _, duration := range []time.Duration{time.Second, 24 * time.Hour} {
+		request.Duration = duration
+		if err := request.Validate(); err != nil {
+			t.Fatalf("duration=%s: %v", duration, err)
+		}
+	}
+	invalid := []ReservationRequest{
+		{Start: start, Duration: time.Second, Priority: 3, Margins: &RecordingMargins{End: -time.Second}},
+		{Start: start, Duration: 24 * time.Hour, Priority: 3},
+		{Start: start, Duration: time.Hour, Priority: 3, Margins: &RecordingMargins{Start: MaxRecordingMargin + time.Second}},
+		{Start: time.Unix(1, 0).UTC(), Duration: time.Hour, Priority: 3, Margins: &RecordingMargins{Start: 2 * time.Second}},
+	}
+	for index, candidate := range invalid {
+		if err := candidate.Validate(); err == nil {
+			t.Fatalf("invalid %d was accepted", index)
+		}
+	}
+}
+
 func TestFilePlanAndRecordingRequests(t *testing.T) {
 	plan := FilePlan{PartialPath: "2026/08/attempt.ts.partial", FinalPath: "2026/08/attempt.ts"}
 	if err := plan.Validate(); err != nil {

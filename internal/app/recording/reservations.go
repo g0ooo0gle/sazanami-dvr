@@ -50,8 +50,9 @@ func (service ReservationService) Add(ctx context.Context, request recording.Res
 	}
 	now = now.UTC()
 	program, err := service.Catalog.FindProgram(ctx, request)
+	planned := recording.Reservation{Program: program, Margins: request.Margins}
 	if err != nil || !program.Start.Equal(request.Start) || program.Duration != request.Duration ||
-		!program.Start.Add(program.Duration).After(now) {
+		!planned.PlannedEnd().After(now) {
 		return recording.Reservation{}, errors.New("recording: program not reservable")
 	}
 	id, err := service.NewID()
@@ -61,6 +62,7 @@ func (service ReservationService) Add(ctx context.Context, request recording.Res
 	reservation, err := service.Store.CreateReservation(ctx, recording.Reservation{
 		ID: id, Version: 1, State: recording.ReservationActive, Program: program,
 		Priority: request.Priority, RequestedFollow: request.RequestedFollow,
+		Disabled: request.Disabled, Margins: request.Margins,
 		CreatedAt: now, UpdatedAt: now,
 	})
 	if err != nil {

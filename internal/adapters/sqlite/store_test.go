@@ -33,7 +33,7 @@ func openMigratedStore(t *testing.T) (string, *Store) {
 		t.Fatalf("before=%+v err=%v", before, err)
 	}
 	after, err := migrate(ctx, writer, 1785628800000)
-	if err != nil || after.State != StateCurrent || after.CurrentVersion != 7 {
+	if err != nil || after.State != StateCurrent || after.CurrentVersion != 8 {
 		t.Fatalf("after=%+v err=%v", after, err)
 	}
 	if err := writer.Close(); err != nil {
@@ -81,19 +81,19 @@ func TestMigrateVersionOneWithVerifiedBackup(t *testing.T) {
 	}
 	createVersionOneDatabase(t, root, true)
 	before, err := InspectDatabase(context.Background(), root)
-	if err != nil || before.State != StateBehind || before.CurrentVersion != 1 || before.TargetVersion != 7 {
+	if err != nil || before.State != StateBehind || before.CurrentVersion != 1 || before.TargetVersion != 8 {
 		t.Fatalf("before=%+v err=%v", before, err)
 	}
 	result, err := MigrateDatabaseWithBackup(context.Background(), root, MigrationRequest{
 		AppliedAt: time.UnixMilli(1785628800000).UTC(), BackupID: testID(t, 90), ProductVersion: "test",
 		ProductCommit: strings.Repeat("a", 40), Now: func() time.Time { return time.UnixMilli(1785628800001).UTC() },
 	})
-	if err != nil || result.Inspection.State != StateCurrent || result.Inspection.CurrentVersion != 7 || result.Backup == nil {
+	if err != nil || result.Inspection.State != StateCurrent || result.Inspection.CurrentVersion != 8 || result.Backup == nil {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
 	if result.Backup.Purpose != "pre_migration" || result.Backup.SchemaVersion != 1 ||
 		result.Backup.MigrationFromSchema == nil || *result.Backup.MigrationFromSchema != 1 ||
-		result.Backup.MigrationToSchema == nil || *result.Backup.MigrationToSchema != 7 {
+		result.Backup.MigrationToSchema == nil || *result.Backup.MigrationToSchema != 8 {
 		t.Fatalf("backup=%+v", result.Backup)
 	}
 	store, err := OpenStore(context.Background(), root)
@@ -138,19 +138,19 @@ func TestMigrateVersionTwoWithVerifiedBackup(t *testing.T) {
 	}
 	createVersionTwoDatabase(t, root)
 	before, err := InspectDatabase(context.Background(), root)
-	if err != nil || before.State != StateBehind || before.CurrentVersion != 2 || before.TargetVersion != 7 {
+	if err != nil || before.State != StateBehind || before.CurrentVersion != 2 || before.TargetVersion != 8 {
 		t.Fatalf("before=%+v err=%v", before, err)
 	}
 	result, err := MigrateDatabaseWithBackup(context.Background(), root, MigrationRequest{
 		AppliedAt: time.UnixMilli(1785628800000).UTC(), BackupID: testID(t, 86), ProductVersion: "test",
 		ProductCommit: strings.Repeat("c", 40), Now: func() time.Time { return time.UnixMilli(1785628800001).UTC() },
 	})
-	if err != nil || result.Inspection.State != StateCurrent || result.Inspection.CurrentVersion != 7 || result.Backup == nil {
+	if err != nil || result.Inspection.State != StateCurrent || result.Inspection.CurrentVersion != 8 || result.Backup == nil {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
 	if result.Backup.SchemaVersion != 2 || result.Backup.MigrationFromSchema == nil ||
 		*result.Backup.MigrationFromSchema != 2 || result.Backup.MigrationToSchema == nil ||
-		*result.Backup.MigrationToSchema != 7 {
+		*result.Backup.MigrationToSchema != 8 {
 		t.Fatalf("backup=%+v", result.Backup)
 	}
 	store, err := OpenStore(context.Background(), root)
@@ -186,9 +186,9 @@ func TestMigrateVersionThreeAddsReservationTerminalReason(t *testing.T) {
 		AppliedAt: time.UnixMilli(1785628800000).UTC(), BackupID: testID(t, 82), ProductVersion: "test",
 		ProductCommit: strings.Repeat("d", 40), Now: func() time.Time { return time.UnixMilli(1785628800001).UTC() },
 	})
-	if err != nil || result.Inspection.CurrentVersion != 7 || result.Backup == nil ||
+	if err != nil || result.Inspection.CurrentVersion != 8 || result.Backup == nil ||
 		result.Backup.MigrationFromSchema == nil || *result.Backup.MigrationFromSchema != 3 ||
-		result.Backup.MigrationToSchema == nil || *result.Backup.MigrationToSchema != 7 {
+		result.Backup.MigrationToSchema == nil || *result.Backup.MigrationToSchema != 8 {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
 	store, err := OpenStore(context.Background(), root)
@@ -226,7 +226,7 @@ func TestMigrateVersionFiveKeepsExistingProgramMetadataNull(t *testing.T) {
 		AppliedAt: time.UnixMilli(1785628800000).UTC(), BackupID: testID(t, 78), ProductVersion: "test",
 		ProductCommit: strings.Repeat("e", 40), Now: func() time.Time { return time.UnixMilli(1785628800001).UTC() },
 	})
-	if err != nil || result.Inspection.CurrentVersion != 7 || result.Backup == nil ||
+	if err != nil || result.Inspection.CurrentVersion != 8 || result.Backup == nil ||
 		result.Backup.MigrationFromSchema == nil || *result.Backup.MigrationFromSchema != 5 {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
@@ -241,6 +241,115 @@ func TestMigrateVersionFiveKeepsExistingProgramMetadataNull(t *testing.T) {
 	}
 	if _, err := store.writer.Exec(`UPDATE program_revisions SET metadata=x'00'`); err == nil {
 		t.Fatal("migration後に既存revisionが更新されました")
+	}
+}
+
+func TestMigrateVersionSevenAddsBasicRecordingDefaultsAndCanRestore(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database, err := openWriter(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	migrations, err := embeddedMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := database.BeginTx(context.Background(), &sql.TxOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range migrations[:7] {
+		if _, err := tx.Exec(item.content); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(`INSERT INTO schema_migrations(version, name, checksum, applied_at_utc_ms) VALUES (?, ?, ?, 1)`,
+			item.version, item.name, item.checksum[:]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	backendID, serviceID := testID(t, 180), testID(t, 181)
+	instanceID, revisionID, reservationID := testID(t, 182), testID(t, 183), testID(t, 184)
+	identity, content := sha256.Sum256([]byte("schema-seven")), sha256.Sum256([]byte("program"))
+	if _, err := tx.Exec(`INSERT INTO backend_instances
+		(id, provider_kind, identity_hash, created_at_utc_ms, last_seen_at_utc_ms)
+		VALUES (?, 'FAKE', ?, 1, 1)`, backendID.Bytes(), identity[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`INSERT INTO services
+		(id, backend_instance_id, provider_locator, identity_state, created_at_utc_ms, last_seen_at_utc_ms)
+		VALUES (?, ?, 'service', 'VERIFIED', 1, 1)`, serviceID.Bytes(), backendID.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`INSERT INTO program_instances
+		(id, service_id, provider_event_locator, raw_event_id, identity_state, created_at_utc_ms, last_seen_at_utc_ms)
+		VALUES (?, ?, 'event', 4, 'VERIFIED', 1, 1)`, instanceID.Bytes(), serviceID.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`INSERT INTO program_revisions
+		(id, program_instance_id, revision_number, content_hash, start_at_utc_ms, duration_ms, title, validation_state, created_at_utc_ms)
+		VALUES (?, ?, 1, ?, 10000, 1800000, 'program', 'VALID', 1)`, revisionID.Bytes(), instanceID.Bytes(), content[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`INSERT INTO reservations(
+		id, version, state, program_instance_id, program_revision_id, backend_instance_id,
+		provider_service_locator, tuning_target, network_id, transport_stream_id, service_id, event_id,
+		title, station_name, start_at_utc_ms, duration_seconds, requested_priority, requested_follow,
+		effective_follow, created_at_utc_ms, updated_at_utc_ms)
+		VALUES (?, 1, 'ACTIVE', ?, ?, ?, 'service', 'service', 1, 2, 3, 4,
+		'program', 'station', 10000, 1800, 3, 1, 0, 1, 1)`, reservationID.Bytes(), instanceID.Bytes(),
+		revisionID.Bytes(), backendID.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := InspectDatabase(context.Background(), root)
+	if err != nil || before.State != StateBehind || before.CurrentVersion != 7 || before.TargetVersion != 8 {
+		t.Fatalf("before=%+v err=%v", before, err)
+	}
+	result, err := MigrateDatabaseWithBackup(context.Background(), root, MigrationRequest{
+		AppliedAt: time.UnixMilli(2).UTC(), BackupID: testID(t, 185), ProductVersion: "test",
+		ProductCommit: strings.Repeat("f", 40), Now: func() time.Time { return time.UnixMilli(3).UTC() },
+	})
+	if err != nil || result.Inspection.CurrentVersion != 8 || result.Backup == nil {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	store, err := OpenStore(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var enabled, defaults, startMargin, endMargin int
+	if err := store.reader.QueryRow(`SELECT enabled, use_default_margins, effective_start_margin_seconds,
+		effective_end_margin_seconds FROM reservations WHERE id=?`, reservationID.Bytes()).
+		Scan(&enabled, &defaults, &startMargin, &endMargin); err != nil {
+		t.Fatal(err)
+	}
+	if enabled != 1 || defaults != 1 || startMargin != 5 || endMargin != 2 {
+		t.Fatalf("enabled=%d default=%d margins=%d/%d", enabled, defaults, startMargin, endMargin)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := FindBackupManifest(root, testID(t, 185))
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := RestoreOffline(context.Background(), root, RestoreRequest{
+		OperationID: testID(t, 186), BackupManifest: manifest,
+		CreatedAt: time.UnixMilli(4).UTC(), Now: func() time.Time { return time.UnixMilli(5).UTC() },
+	})
+	if err != nil || restored.Phase != RestoreCommitted {
+		t.Fatalf("restore=%+v err=%v", restored, err)
+	}
+	after, err := InspectDatabase(context.Background(), root)
+	if err != nil || after.CurrentVersion != 7 || after.State != StateBehind {
+		t.Fatalf("after=%+v err=%v", after, err)
 	}
 }
 
@@ -507,7 +616,7 @@ func TestMigrationStateClassification(t *testing.T) {
 		if _, err := migrate(context.Background(), database, 1); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := database.Exec(`INSERT INTO schema_migrations VALUES (8, 'future', zeroblob(32), 2)`); err != nil {
+		if _, err := database.Exec(`INSERT INTO schema_migrations VALUES (9, 'future', zeroblob(32), 2)`); err != nil {
 			t.Fatal(err)
 		}
 		got, err := inspect(context.Background(), database)
@@ -819,13 +928,14 @@ func TestEmbeddedMigrationChecksumAndLimits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(migrations) != 7 || migrations[0].version != 1 || migrations[0].name != "catalog_v1" ||
+	if len(migrations) != 8 || migrations[0].version != 1 || migrations[0].name != "catalog_v1" ||
 		migrations[1].version != 2 || migrations[1].name != "mirakurun_catalog_limits" ||
 		migrations[2].version != 3 || migrations[2].name != "first_recording" ||
 		migrations[3].version != 4 || migrations[3].name != "reservation_terminal_reason" ||
 		migrations[4].version != 5 || migrations[4].name != "automatic_reservations" ||
 		migrations[5].version != 6 || migrations[5].name != "program_metadata" ||
-		migrations[6].version != 7 || migrations[6].name != "user_stopped_recording" {
+		migrations[6].version != 7 || migrations[6].name != "user_stopped_recording" ||
+		migrations[7].version != 8 || migrations[7].name != "basic_recording_settings" {
 		t.Fatalf("migrations=%+v", migrations)
 	}
 	if got := sha256.Sum256([]byte(migrations[0].content)); got != migrations[0].checksum {

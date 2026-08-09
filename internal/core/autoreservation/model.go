@@ -132,6 +132,10 @@ func validateValues(search SearchCondition, settings RecordingSettings) error {
 		len(settings.PartialFolders) > maxFolders || (settings.StartMargin == nil) != (settings.EndMargin == nil) {
 		return errors.New("autoreservation: invalid recording settings")
 	}
+	if settings.StartMargin != nil && (*settings.StartMargin < -3600 || *settings.StartMargin > 3600 ||
+		*settings.EndMargin < -3600 || *settings.EndMargin > 3600) {
+		return errors.New("autoreservation: invalid recording margins")
+	}
 	for _, folder := range append(append([]Folder(nil), settings.Folders...), settings.PartialFolders...) {
 		if !validText(folder.Path) || !validText(folder.Writer) || !validText(folder.Name) {
 			return errors.New("autoreservation: invalid recording folder")

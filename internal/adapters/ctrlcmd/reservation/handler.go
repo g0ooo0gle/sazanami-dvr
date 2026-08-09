@@ -260,7 +260,7 @@ func decodeReservation(reader *codec.Reader, change *recording.ReservationChange
 	if err != nil {
 		return err
 	}
-	priority, follow, err := decodeSettings(reader)
+	settings, err := decodeSettings(reader)
 	if err != nil {
 		return err
 	}
@@ -287,7 +287,8 @@ func decodeReservation(reader *codec.Reader, change *recording.ReservationChange
 	change.Number = reserveID
 	change.Request = recording.ReservationRequest{
 		NetworkID: networkID, TransportStreamID: transportID, ServiceID: serviceID, EventID: eventID,
-		Start: start, Duration: time.Duration(duration) * time.Second, Priority: priority, RequestedFollow: follow,
+		Start: start, Duration: time.Duration(duration) * time.Second, Priority: settings.priority,
+		RequestedFollow: settings.follow, Disabled: settings.disabled, Margins: settings.margins,
 	}
 	return nil
 }
@@ -321,15 +322,21 @@ func decodeOneNumber(body []byte, limits codec.Limits, vector bool) (int32, erro
 	return number, nil
 }
 
-func decodeSettings(reader *codec.Reader) (uint8, bool, error) {
-	var priority uint8
-	var follow bool
+type decodedSettings struct {
+	priority uint8
+	follow   bool
+	disabled bool
+	margins  *recording.RecordingMargins
+}
+
+func decodeSettings(reader *codec.Reader) (decodedSettings, error) {
+	var settings decodedSettings
 	err := reader.Structure(func(item *codec.Reader) error {
 		recordingMode, err := item.U8()
 		if err != nil {
 			return err
 		}
-		priority, err = item.U8()
+		settings.priority, err = item.U8()
 		if err != nil {
 			return err
 		}
@@ -389,15 +396,29 @@ func decodeSettings(reader *codec.Reader) (uint8, bool, error) {
 		if err != nil {
 			return err
 		}
-		if recordingMode != 1 || priority < 1 || priority > 5 || followValue > 1 || serviceMode != 0 ||
-			exact != 0 || batch != "" || folders != 0 || suspend != 0 || reboot != 0 || useMargins != 0 ||
-			startMargin != 0 || endMargin != 0 || continued != 0 || partial != 0 || tuner != 0 || partialFolders != 0 {
+		if (recordingMode != 1 && recordingMode != 5) || settings.priority < 1 || settings.priority > 5 ||
+			followValue > 1 || serviceMode != 0 ||
+			exact != 0 || batch != "" || folders != 0 || suspend != 0 || reboot != 0 || useMargins > 1 ||
+			continued != 0 || partial != 0 || tuner != 0 || partialFolders != 0 {
 			return failure(codec.Unsupported, "recording-setting-out-of-profile", 0)
 		}
-		follow = followValue == 1
+		if useMargins == 0 {
+			if startMargin != 0 || endMargin != 0 {
+				return failure(codec.Unsupported, "recording-setting-out-of-profile", 0)
+			}
+		} else if useMargins == 1 && startMargin >= -3600 && startMargin <= 3600 && endMargin >= -3600 && endMargin <= 3600 {
+			settings.margins = &recording.RecordingMargins{
+				Start: time.Duration(startMargin) * time.Second,
+				End:   time.Duration(endMargin) * time.Second,
+			}
+		} else {
+			return failure(codec.Unsupported, "recording-setting-out-of-profile", 0)
+		}
+		settings.follow = followValue == 1
+		settings.disabled = recordingMode == 5
 		return nil
 	})
-	return priority, follow, err
+	return settings, err
 }
 
 func decodeFolderVector(reader *codec.Reader) (int, error) {
@@ -510,7 +531,7 @@ func writeReservation(writer *codec.Writer, reservation recording.Reservation, l
 	if err := writer.SystemTime(reservation.Program.Start); err != nil {
 		return err
 	}
-	if err := writeSettings(writer, reservation.Priority, reservation.EffectiveFollow); err != nil {
+	if err := writeSettings(writer, reservation); err != nil {
 		return err
 	}
 	if err := writer.I32(0); err != nil {
@@ -522,15 +543,18 @@ func writeReservation(writer *codec.Writer, reservation recording.Reservation, l
 	return writer.I32(0)
 }
 
-func writeSettings(writer *codec.Writer, priority uint8, follow bool) error {
+func writeSettings(writer *codec.Writer, reservation recording.Reservation) error {
 	if err := writer.I32(51); err != nil {
 		return err
 	}
-	followValue := uint8(0)
-	if follow {
+	followValue, recordingMode := uint8(0), uint8(1)
+	if reservation.EffectiveFollow {
 		followValue = 1
 	}
-	for _, value := range [...]uint8{1, priority, followValue} {
+	if reservation.Disabled {
+		recordingMode = 5
+	}
+	for _, value := range [...]uint8{recordingMode, reservation.Priority, followValue} {
 		if err := writer.U8(value); err != nil {
 			return err
 		}
@@ -547,15 +571,26 @@ func writeSettings(writer *codec.Writer, priority uint8, follow bool) error {
 	if err := writeEmptyVector(writer); err != nil {
 		return err
 	}
-	for range 3 {
-		if err := writer.U8(0); err != nil {
-			return err
-		}
+	if err := writer.U8(0); err != nil {
+		return err
 	}
-	for range 2 {
-		if err := writer.I32(0); err != nil {
-			return err
-		}
+	if err := writer.U8(0); err != nil {
+		return err
+	}
+	useMargins := uint8(0)
+	margins := recording.RecordingMargins{}
+	if reservation.Margins != nil {
+		useMargins = 1
+		margins = *reservation.Margins
+	}
+	if err := writer.U8(useMargins); err != nil {
+		return err
+	}
+	if err := writer.I32(int32(margins.Start / time.Second)); err != nil {
+		return err
+	}
+	if err := writer.I32(int32(margins.End / time.Second)); err != nil {
+		return err
 	}
 	for range 2 {
 		if err := writer.U8(0); err != nil {
@@ -580,7 +615,8 @@ func validateStoredReservation(reservation recording.Reservation) error {
 		reservation.EffectiveFollow != reservation.RequestedFollow || reservation.Priority < 1 || reservation.Priority > 5 ||
 		reservation.Program.Start.IsZero() || reservation.Program.Start.Location() != time.UTC ||
 		reservation.Program.Duration < time.Second || reservation.Program.Duration > 24*time.Hour ||
-		reservation.Program.Duration%time.Second != 0 {
+		reservation.Program.Duration%time.Second != 0 || !reservation.PlannedEnd().After(reservation.PlannedStart()) ||
+		reservation.PlannedEnd().Sub(reservation.PlannedStart()) > recording.MaxEffectiveDuration {
 		return failure(codec.Internal, "invalid-stored-reservation", int64(reservation.Number))
 	}
 	return nil

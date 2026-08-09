@@ -102,7 +102,15 @@ func (evaluator Evaluator) Run(ctx context.Context) (Result, error) {
 			}
 			request, err := evaluator.Catalog.ReservationRequestForProgram(program, candidate.rule.Recording.Priority,
 				candidate.rule.Recording.Follow)
-			if err != nil || !matchService(candidate.rule.Search.Services, request) || !matchDate(candidate.rule.Search.Dates,
+			settings := candidate.rule.Recording
+			request.Disabled = settings.Mode == 5
+			if settings.StartMargin != nil {
+				request.Margins = &recording.RecordingMargins{
+					Start: time.Duration(*settings.StartMargin) * time.Second,
+					End:   time.Duration(*settings.EndMargin) * time.Second,
+				}
+			}
+			if err != nil || request.Validate() != nil || !matchService(candidate.rule.Search.Services, request) || !matchDate(candidate.rule.Search.Dates,
 				candidate.rule.Search.ExcludeDates, request.Start) || !matchDuration(candidate.rule.Search, request.Duration) {
 				continue
 			}
@@ -122,6 +130,7 @@ func (evaluator Evaluator) Run(ctx context.Context) (Result, error) {
 			_, err = evaluator.Store.CreateAutomaticReservation(ctx, candidate.rule.Number, recording.Reservation{
 				ID: id, Version: 1, State: recording.ReservationActive, Program: snapshot,
 				Priority: request.Priority, RequestedFollow: request.RequestedFollow,
+				Disabled: request.Disabled, Margins: request.Margins,
 				CreatedAt: now, UpdatedAt: now,
 			})
 			if err != nil {
@@ -227,9 +236,14 @@ func prepareRule(rule autoreservation.Rule) preparedRule {
 		return prepared
 	}
 	if search.Fuzzy || len(search.Contents) != 0 || search.ExcludeContents || len(search.Video) != 0 || len(search.Audio) != 0 ||
-		search.CheckRecordedTitle || settings.Mode != 1 || settings.ServiceMode != 0 || settings.Exact || settings.Batch != "" ||
-		len(settings.Folders) != 0 || settings.Suspend != 0 || settings.Reboot || settings.StartMargin != nil ||
+		search.CheckRecordedTitle || (settings.Mode != 1 && settings.Mode != 5) || settings.ServiceMode != 0 || settings.Exact || settings.Batch != "" ||
+		len(settings.Folders) != 0 || settings.Suspend != 0 || settings.Reboot ||
 		settings.Continue || settings.PartialMode != 0 || settings.TunerID != 0 || len(settings.PartialFolders) != 0 {
+		prepared.unavailable = true
+		return prepared
+	}
+	if settings.StartMargin != nil && (*settings.StartMargin < -3600 || *settings.StartMargin > 3600 ||
+		*settings.EndMargin < -3600 || *settings.EndMargin > 3600) {
 		prepared.unavailable = true
 		return prepared
 	}

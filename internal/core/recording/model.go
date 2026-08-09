@@ -23,6 +23,14 @@ const (
 	MaxHistoryPage = 256
 	// MaxHistoryItemsはCtrlCmdへ列挙できる録画履歴の最大件数である。
 	MaxHistoryItems = 16_384
+	// DefaultStartMarginは個別指定がない予約を番組開始より早く録画し始める時間である。
+	DefaultStartMargin = 5 * time.Second
+	// DefaultEndMarginは個別指定がない予約を番組終了より長く録画する時間である。
+	DefaultEndMargin = 2 * time.Second
+	// MaxRecordingMarginは個別に指定できる前後余白の絶対値である。
+	MaxRecordingMargin = time.Hour
+	// MaxEffectiveDurationは前後余白を含む一回の録画時間の上限である。
+	MaxEffectiveDuration = 24 * time.Hour
 )
 
 var (
@@ -38,6 +46,8 @@ const (
 	ReservationActive ReservationState = "ACTIVE"
 	// ReservationFinishedは録画試行がterminalになった予約である。
 	ReservationFinished ReservationState = "FINISHED"
+	// ReservationReasonDisabledExpiredは無効のまま予定終了を過ぎた予約の固定終了理由である。
+	ReservationReasonDisabledExpired = "DISABLED_EXPIRED"
 )
 
 // ProgramSnapshotは予約時点で固定した番組と放送サービスの情報である。
@@ -57,6 +67,13 @@ type ProgramSnapshot struct {
 	Duration               time.Duration
 }
 
+// RecordingMarginsは番組の開始と終了に対して個別指定する録画時刻の差である。
+// nilの設定は既定値を選んだことを表し、個別指定の0秒とは区別する。
+type RecordingMargins struct {
+	Start time.Duration
+	End   time.Duration
+}
+
 // ReservationRequestは番組表から一回限りの予約を作るための照合条件である。
 type ReservationRequest struct {
 	NetworkID         uint16
@@ -67,6 +84,8 @@ type ReservationRequest struct {
 	Duration          time.Duration
 	Priority          uint8
 	RequestedFollow   bool
+	Disabled          bool
+	Margins           *RecordingMargins
 }
 
 // ReservationChangeはKonomiTVが返す完全な予約情報から、変更対象と照合条件を分離した値である。
@@ -87,7 +106,7 @@ func (change ReservationChange) Validate() error {
 func (request ReservationRequest) Validate() error {
 	if request.Start.IsZero() || request.Start.Location() != time.UTC || request.Start.UnixMilli() < 0 ||
 		request.Duration < time.Second || request.Duration > 24*time.Hour || request.Duration%time.Second != 0 ||
-		request.Priority < 1 || request.Priority > 5 {
+		request.Priority < 1 || request.Priority > 5 || validateRecordingTime(request.Start, request.Duration, request.Margins) != nil {
 		return errors.New("recording: invalid reservation request")
 	}
 	return nil
@@ -103,9 +122,26 @@ type Reservation struct {
 	Priority        uint8
 	RequestedFollow bool
 	EffectiveFollow bool
+	Disabled        bool
+	Margins         *RecordingMargins
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
 	FinishedAt      *time.Time
+}
+
+// EffectiveMarginsは予約が実際に使う開始余白と終了余白を返す。
+func (reservation Reservation) EffectiveMargins() RecordingMargins {
+	return effectiveMargins(reservation.Margins)
+}
+
+// PlannedStartは開始余白を一度だけ適用した録画開始予定を返す。
+func (reservation Reservation) PlannedStart() time.Time {
+	return reservation.Program.Start.Add(-reservation.EffectiveMargins().Start)
+}
+
+// PlannedEndは終了余白を一度だけ適用した録画終了予定を返す。
+func (reservation Reservation) PlannedEnd() time.Time {
+	return reservation.Program.Start.Add(reservation.Program.Duration).Add(reservation.EffectiveMargins().End)
 }
 
 // FollowTargetは最新の完成済み番組表から選んだ、同じ番組の追従先revisionである。
@@ -153,12 +189,35 @@ func (reservation Reservation) ValidateNew() error {
 		return errors.New("recording: invalid reservation text")
 	}
 	if program.Start.IsZero() || program.Start.Location() != time.UTC || program.Start.UnixMilli() < 0 ||
-		program.Duration < time.Second || program.Duration > 24*time.Hour || program.Duration%time.Second != 0 {
+		program.Duration < time.Second || program.Duration > 24*time.Hour || program.Duration%time.Second != 0 ||
+		validateRecordingTime(program.Start, program.Duration, reservation.Margins) != nil {
 		return errors.New("recording: invalid reservation time")
 	}
 	if reservation.CreatedAt.IsZero() || reservation.CreatedAt.Location() != time.UTC ||
 		reservation.UpdatedAt != reservation.CreatedAt || reservation.CreatedAt.UnixMilli() < 0 {
 		return errors.New("recording: invalid reservation timestamp")
+	}
+	return nil
+}
+
+func effectiveMargins(margins *RecordingMargins) RecordingMargins {
+	if margins == nil {
+		return RecordingMargins{Start: DefaultStartMargin, End: DefaultEndMargin}
+	}
+	return *margins
+}
+
+func validateRecordingTime(start time.Time, duration time.Duration, margins *RecordingMargins) error {
+	effective := effectiveMargins(margins)
+	if effective.Start < -MaxRecordingMargin || effective.Start > MaxRecordingMargin ||
+		effective.End < -MaxRecordingMargin || effective.End > MaxRecordingMargin ||
+		effective.Start%time.Second != 0 || effective.End%time.Second != 0 {
+		return errors.New("recording: invalid recording margins")
+	}
+	plannedStart := start.Add(-effective.Start)
+	plannedEnd := start.Add(duration).Add(effective.End)
+	if plannedStart.UnixMilli() < 0 || !plannedEnd.After(plannedStart) || plannedEnd.Sub(plannedStart) > MaxEffectiveDuration {
+		return errors.New("recording: invalid effective recording time")
 	}
 	return nil
 }
