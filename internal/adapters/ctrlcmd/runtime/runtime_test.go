@@ -17,10 +17,12 @@ import (
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/channel"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/codec"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/filecopy2"
+	liveadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/live"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/programguide"
 	recordedadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/recorded"
 	reservationadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/reservation"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/status"
+	"github.com/g0ooo0gle/sazanami-dvr/internal/app/liverelay"
 	coreautoreservation "github.com/g0ooo0gle/sazanami-dvr/internal/core/autoreservation"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/catalogmodel"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/recording"
@@ -43,6 +45,18 @@ type emptyReservationOperations struct{}
 type emptyAutomaticReservationOperations struct{}
 
 type emptyRecordedOperations struct{}
+
+type emptyLiveOperations struct{}
+
+func (emptyLiveOperations) Select(context.Context, liverelay.Service, int32) (int32, error) {
+	return 1, nil
+}
+
+func (emptyLiveOperations) Open(context.Context, int32) (liverelay.Stream, error) {
+	return nil, errors.New("not opened in router test")
+}
+
+func (emptyLiveOperations) Close(int32) {}
 
 func (emptyRecordedOperations) CompletedRecordings(context.Context, int, int32) ([]recording.HistoryItem, error) {
 	return nil, nil
@@ -417,6 +431,46 @@ func TestRecordingRouterDispatchesCompletedRecordingList(t *testing.T) {
 	frame, err := codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
 	if err != nil || frame.Code != 1 {
 		t.Fatalf("frame=%+v err=%v", frame, err)
+	}
+}
+
+func TestRecordingRouterMarksOnlyLiveRelayAsLongLived(t *testing.T) {
+	root, path, base, _ := validFixture(t)
+	snapshot, err := BuildSnapshot(context.Background(), root, path, &recordingCatalog{fakeCatalog: base})
+	if err != nil {
+		t.Fatal(err)
+	}
+	router, err := NewRecordingRouterWithLive(snapshot, emptyReservationOperations{},
+		emptyAutomaticReservationOperations{}, emptyRecordedOperations{}, emptyLiveOperations{},
+		SystemClock{}, codec.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := make([]byte, 12)
+	binary.LittleEndian.PutUint32(request[:4], uint32(liveadapter.CommandRelay))
+	binary.LittleEndian.PutUint32(request[4:8], 4)
+	binary.LittleEndian.PutUint32(request[8:12], 1)
+	if !router.LongLived(request) {
+		t.Fatal("301を長時間接続として識別しません")
+	}
+	binary.LittleEndian.PutUint32(request[:4], uint32(liveadapter.CommandSelect))
+	if router.LongLived(request) || router.LongLived(request[:4]) {
+		t.Fatal("301以外を長時間接続として識別しました")
+	}
+}
+
+func TestSnapshotResolvesOneLiveService(t *testing.T) {
+	root, path, base, _ := validFixture(t)
+	snapshot, err := BuildSnapshot(context.Background(), root, path, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := snapshot.ResolveLiveService(context.Background(), 1, 2, 3)
+	if err != nil || target.Opaque != "service:1" {
+		t.Fatalf("target=%+v err=%v", target, err)
+	}
+	if _, err := snapshot.ResolveLiveService(context.Background(), 1, 2, 9); err == nil {
+		t.Fatal("未知serviceを解決しました")
 	}
 }
 

@@ -6,22 +6,19 @@
 初回は「接続の分担」から「一件確認する」までを順に進めます。「うまくいかない場合」は、問題が起きた
 ときだけ参照してください。
 
-現在のSazanami DVRはローカル接続だけを受け付けます。KonomiTVをDockerコンテナへ入れると
-`127.0.0.1`の指す環境が分かれるため、初回確認ではDockerを使いません。
+Sazanami DVRは同じPCからの接続を既定とします。LANで使う場合は待受アドレスを明示できます。KonomiTVをDockerコンテナへ入れると`127.0.0.1`の指す環境が分かれるため、初回確認ではDockerを使いません。
 
 確認対象はKonomiTV v0.14.1です。画面の番組表から予約し、5分間録画したファイルを録画済み一覧から
 再生するところまで一件確認しました。自動予約はHTTP APIから条件の追加・一覧取得・変更・削除を行い、
 実Mirakurunの番組表から予約を作って、再起動後に重複しないところまで確認しました。長時間運転や幅広い環境での動作は未確認です。
 操作別の状況は[互換実装表](compatibility.md)で確認できます。
 
-## KonomiTVは予約、Mirakurunはライブ視聴を担当する
+## Sazanami DVRが予約とライブ視聴をMirakurunへ接続する
 
-KonomiTVではバックエンドに`EDCB`を選び、その接続先をSazanami DVRにします。ライブ視聴は従来どおり
-Mirakurunまたはmirakcから受信します。
+KonomiTVではバックエンドに`EDCB`を選び、その接続先をSazanami DVRにします。予約録画とライブ視聴のどちらも、Sazanami DVRが必要なときだけMirakurunまたはmirakcの放送ストリームを開きます。
 
 ```text
-KonomiTV ──予約・番組表──> Sazanami DVR ──録画時だけ──> Mirakurun / mirakc
-    └────────────────ライブ視聴──────────────────────> Mirakurun / mirakc
+KonomiTV ──番組表・予約・ライブ視聴──> Sazanami DVR ──必要なstream──> Mirakurun / mirakc
 ```
 
 Sazanami DVRの待受は`127.0.0.1`のままです。LANへ公開する必要はありません。
@@ -79,7 +76,7 @@ KonomiTVの`config.yaml`で、次の項目を設定します。ほかの項目�
 ```yaml
 general:
     backend: 'EDCB'
-    always_receive_tv_from_mirakurun: true
+    always_receive_tv_from_mirakurun: false
     edcb_url: 'tcp://127.0.0.1:4510/'
     mirakurun_url: '<mirakurun-url>'
 
@@ -91,6 +88,8 @@ video:
 `backend`が`Mirakurun`のままだと、KonomiTVの録画予約機能は利用できません。Sazanami DVRの完成ファイルは
 録画保存先の下へ`.ts`として作られます。KonomiTV v0.14.1は登録したフォルダを再帰的に監視し、60秒以上の
 TSファイルを録画済み番組の解析対象にします。
+
+`always_receive_tv_from_mirakurun: false`では、KonomiTVのライブ視聴もSazanami DVRを経由します。Sazanami DVRをライブ経路から外す場合だけ`true`にします。その場合も番組表と録画予約はSazanami DVRへ接続します。
 
 ## 番組表から録画済み一覧まで一件を確認する
 
@@ -117,6 +116,7 @@ Mirakurunへの接続とファイル準備にかかる時間を吸収するた�
 | KonomiTVがEDCBへ接続できない | Sazanami DVRが先に起動し、`127.0.0.1:4510`で待ち受けているか |
 | 予約画面がHTTP 422になる | KonomiTVの`backend`が`EDCB`になっているか |
 | 番組表が空 | `catalog sync`と`ctrlcmd validate`が成功しているか |
+| ライブ視聴を開始できない | `always_receive_tv_from_mirakurun`、チャンネル設定のONID・TSID・SID、Mirakurunのstream応答を確認する |
 | 予約後も録画が始まらない | 開始時刻、残り時間、明示した同時録画上限に該当していないか |
 | 予約を変更・取消しできない | すでに録画処理が始まっていないか、初版で対応しない録画設定を選んでいないか |
 | 録画中と表示されない | Sazanami DVRが最新DB形式で動き、予約が実際に録画中か |

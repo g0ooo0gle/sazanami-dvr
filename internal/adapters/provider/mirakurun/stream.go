@@ -76,7 +76,7 @@ func newStreamAdapterWithLimit(baseURL string, limits streamLimits, maximumConcu
 	return &StreamAdapter{base: base, client: client, limits: limits, maximumConcurrent: maximumConcurrent}, nil
 }
 
-// OpenStreamは指定serviceの復号済みMPEG-TSをpriority 0で一度だけ開く。
+// OpenStreamは録画またはライブ視聴の指定serviceをpriority 0で一度だけ開く。
 func (adapter *StreamAdapter) OpenStream(ctx context.Context, request providerstream.Request) (providerstream.Lease, error) {
 	if adapter == nil || adapter.client == nil {
 		return nil, provider.NewFailure(provider.ReasonInternal, "nil-stream-adapter")
@@ -84,7 +84,8 @@ func (adapter *StreamAdapter) OpenStream(ctx context.Context, request providerst
 	if err := provider.ContextFailure(ctx); err != nil {
 		return nil, err
 	}
-	if request.Usage != providerstream.UsageRecording || request.PriorityPolicy != "0" || !request.RequireDescrambled ||
+	if request.Usage != providerstream.UsageRecording && request.Usage != providerstream.UsageLive ||
+		request.PriorityPolicy != "0" || !request.RequireDescrambled ||
 		request.CorrelationID == "" || len(request.CorrelationID) > provider.MaxDiagnosticBytes ||
 		!canonicalStreamServiceID(request.Target.Opaque) {
 		return nil, provider.NewFailure(provider.ReasonRejected, "stream-request-out-of-profile")

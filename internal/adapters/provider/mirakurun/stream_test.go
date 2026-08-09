@@ -63,6 +63,33 @@ func TestStreamRequestAndChunkedRead(t *testing.T) {
 	}
 }
 
+func TestStreamAcceptsIndependentLiveUsage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "video/MP2T")
+		writer.WriteHeader(http.StatusOK)
+		writer.(http.Flusher).Flush()
+		<-request.Context().Done()
+	}))
+	defer server.Close()
+	adapter, err := NewStreamWithLimit(server.URL, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := validStreamRequest("1003")
+	request.Usage = providerstream.UsageLive
+	request.CorrelationID = "live-test"
+	lease, err := adapter.OpenStream(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.Cancel(); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestStreamRejectsStatusContentTypeAndRedirect(t *testing.T) {
 	redirectTarget := atomic.Int32{}
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {

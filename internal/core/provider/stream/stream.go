@@ -10,7 +10,11 @@ import (
 // UsageClassはstreamを開く業務目的を表す。
 type UsageClass string
 
-const UsageRecording UsageClass = "RECORDING"
+const (
+	UsageRecording UsageClass = "RECORDING"
+	// UsageLiveは利用者が明示的に開始した一時的なライブ視聴を表す。
+	UsageLive UsageClass = "LIVE"
+)
 
 // Requestはstreamを開くtarget、利用目的、期限、相関IDを指定する。
 type Request struct {

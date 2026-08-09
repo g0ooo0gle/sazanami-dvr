@@ -13,6 +13,7 @@ import (
 
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/channel"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/catalogmodel"
+	"github.com/g0ooo0gle/sazanami-dvr/internal/core/provider"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/recording"
 )
 
@@ -182,6 +183,28 @@ func (snapshot *Snapshot) Count() int {
 		return 0
 	}
 	return len(snapshot.value.Services)
+}
+
+// ResolveLiveServiceは放送IDの組を一つの完成済みスナップショットで照合し、
+// Mirakurun固有のservice locatorをopaqueな接続先として返す。
+func (snapshot *Snapshot) ResolveLiveService(ctx context.Context, networkID, transportStreamID, serviceID uint16) (provider.TuningTarget, error) {
+	if snapshot == nil || ctx == nil || ctx.Err() != nil {
+		return provider.TuningTarget{}, stable("live-service-unavailable")
+	}
+	locator := ""
+	for _, service := range snapshot.value.Services {
+		if service.NetworkID == networkID && service.TransportStreamID == transportStreamID && service.ServiceID == serviceID {
+			if locator != "" {
+				return provider.TuningTarget{}, stable("live-service-unavailable")
+			}
+			locator = service.ProviderLocator
+		}
+	}
+	target, err := provider.NewTuningTarget(locator)
+	if err != nil {
+		return provider.TuningTarget{}, stable("live-service-unavailable")
+	}
+	return target, nil
 }
 
 // Loadは固定スナップショット自身を返し、動的保持器と同じrouter境界で利用できるようにする。

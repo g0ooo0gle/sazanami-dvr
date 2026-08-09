@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync/atomic"
 
+	"github.com/g0ooo0gle/sazanami-dvr/internal/core/provider"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/recording"
 )
 
@@ -52,4 +53,13 @@ func (holder *SnapshotHolder) FindProgram(ctx context.Context, request recording
 		return recording.ProgramSnapshot{}, stable("program-not-reservable")
 	}
 	return snapshot.FindProgram(ctx, request)
+}
+
+// ResolveLiveServiceは要求開始時のスナップショット一つだけでライブ放送局を照合する。
+func (holder *SnapshotHolder) ResolveLiveService(ctx context.Context, networkID, transportStreamID, serviceID uint16) (provider.TuningTarget, error) {
+	snapshot := holder.Load()
+	if snapshot == nil {
+		return provider.TuningTarget{}, stable("live-service-unavailable")
+	}
+	return snapshot.ResolveLiveService(ctx, networkID, transportStreamID, serviceID)
 }
