@@ -165,14 +165,15 @@ func TestReservationFollowExtendsActiveRecording(t *testing.T) {
 				items[0].Program.Duration != 40*time.Minute || !items[0].Program.Start.Equal(reservation.Program.Start) {
 				t.Fatalf("items=%+v err=%v", items, err)
 			}
-			var endMS int64
+			var endMS, stateVersion int64
 			var persistedState recording.AttemptState
-			if err := store.reader.QueryRow(`SELECT state, planned_end_utc_ms FROM recording_attempts WHERE id=?`,
-				attemptID.Bytes()).Scan(&persistedState, &endMS); err != nil {
+			if err := store.reader.QueryRow(`SELECT state, state_version, planned_end_utc_ms
+				FROM recording_attempts WHERE id=?`, attemptID.Bytes()).Scan(&persistedState, &stateVersion, &endMS); err != nil {
 				t.Fatal(err)
 			}
-			if persistedState != state || endMS != reservation.Program.Start.Add(40*time.Minute).UnixMilli() {
-				t.Fatalf("state=%s end=%d", persistedState, endMS)
+			if persistedState != state || stateVersion != int64(2+index) ||
+				endMS != reservation.Program.Start.Add(40*time.Minute).UnixMilli() {
+				t.Fatalf("state=%s version=%d end=%d", persistedState, stateVersion, endMS)
 			}
 			if state == recording.AttemptRecording {
 				end, err := store.UpdateRecordingProgress(context.Background(), attemptID, 188, claim.Now.Add(4*time.Second))
