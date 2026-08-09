@@ -316,6 +316,9 @@ func convertProgram(observation providercatalog.ProgramObservation) (catalogmode
 	if normalizeErr != nil {
 		return catalogmodel.ProgramObservation{}, errors.New("catalogsync: invalid program metadata")
 	}
+	if _, encodeErr := catalogmodel.EncodeMetadataV1(normalized); encodeErr != nil {
+		return catalogmodel.ProgramObservation{}, errors.New("catalogsync: program metadata exceeds limit")
+	}
 	material.Metadata = normalized
 	if observation.FreeAccess != nil {
 		if *observation.FreeAccess {

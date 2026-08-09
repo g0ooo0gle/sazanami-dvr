@@ -216,6 +216,34 @@ func TestMigrateVersionThreeAddsReservationTerminalReason(t *testing.T) {
 	}
 }
 
+func TestMigrateVersionFiveKeepsExistingProgramMetadataNull(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	createVersionFiveDatabaseWithProgram(t, root)
+	result, err := MigrateDatabaseWithBackup(context.Background(), root, MigrationRequest{
+		AppliedAt: time.UnixMilli(1785628800000).UTC(), BackupID: testID(t, 78), ProductVersion: "test",
+		ProductCommit: strings.Repeat("e", 40), Now: func() time.Time { return time.UnixMilli(1785628800001).UTC() },
+	})
+	if err != nil || result.Inspection.CurrentVersion != 6 || result.Backup == nil ||
+		result.Backup.MigrationFromSchema == nil || *result.Backup.MigrationFromSchema != 5 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	store, err := OpenStore(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var nullCount int
+	if err := store.reader.QueryRow(`SELECT count(*) FROM program_revisions WHERE metadata IS NULL`).Scan(&nullCount); err != nil || nullCount != 1 {
+		t.Fatalf("NULL count=%d err=%v", nullCount, err)
+	}
+	if _, err := store.writer.Exec(`UPDATE program_revisions SET metadata=x'00'`); err == nil {
+		t.Fatal("migration後に既存revisionが更新されました")
+	}
+}
+
 func TestVersionTwoProviderKindsAndProgramCountLimit(t *testing.T) {
 	_, store := openMigratedStore(t)
 	for marker, kind := range map[byte]string{92: "FAKE", 93: "MIRAKURUN"} {
@@ -400,6 +428,59 @@ func createVersionThreeDatabase(t *testing.T, root string) {
 			item.version, item.name, item.checksum[:]); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func createVersionFiveDatabaseWithProgram(t *testing.T, root string) {
+	t.Helper()
+	database, err := openWriter(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	migrations, err := embeddedMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := database.BeginTx(context.Background(), &sql.TxOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	for _, item := range migrations[:5] {
+		if _, err := tx.Exec(item.content); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(`INSERT INTO schema_migrations(version, name, checksum, applied_at_utc_ms) VALUES (?, ?, ?, 1)`,
+			item.version, item.name, item.checksum[:]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	backendID, serviceID, instanceID, revisionID := testID(t, 79), testID(t, 80), testID(t, 81), testID(t, 82)
+	identityHash := sha256.Sum256([]byte("version-five"))
+	if _, err := tx.Exec(`INSERT INTO backend_instances
+		(id, provider_kind, identity_hash, created_at_utc_ms, last_seen_at_utc_ms)
+		VALUES (?, 'FAKE', ?, 1, 1)`, backendID.Bytes(), identityHash[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`INSERT INTO services
+		(id, backend_instance_id, provider_locator, identity_state, created_at_utc_ms, last_seen_at_utc_ms)
+		VALUES (?, ?, 'service', 'VERIFIED', 1, 1)`, serviceID.Bytes(), backendID.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`INSERT INTO program_instances
+		(id, service_id, provider_event_locator, raw_event_id, identity_state, created_at_utc_ms, last_seen_at_utc_ms)
+		VALUES (?, ?, 'event', 1, 'VERIFIED', 1, 1)`, instanceID.Bytes(), serviceID.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256([]byte("revision"))
+	if _, err := tx.Exec(`INSERT INTO program_revisions
+		(id, program_instance_id, revision_number, content_hash, title, validation_state, created_at_utc_ms)
+		VALUES (?, ?, 1, ?, '番組', 'VALID', 1)`, revisionID.Bytes(), instanceID.Bytes(), hash[:]); err != nil {
+		t.Fatal(err)
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
