@@ -244,6 +244,80 @@ func TestStreamCanOpenAgainAfterTemporaryFailures(t *testing.T) {
 	}
 }
 
+func TestStreamUsesExplicitConcurrentLimitAndReusesSlot(t *testing.T) {
+	var requests atomic.Int32
+	var active atomic.Int32
+	var maximum atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		current := active.Add(1)
+		defer active.Add(-1)
+		for {
+			observed := maximum.Load()
+			if current <= observed || maximum.CompareAndSwap(observed, current) {
+				break
+			}
+		}
+		writer.Header().Set("Content-Type", "video/MP2T")
+		writer.WriteHeader(http.StatusOK)
+		writer.(http.Flusher).Flush()
+		<-request.Context().Done()
+	}))
+	defer server.Close()
+	adapter, err := NewStreamWithLimit(server.URL, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport := adapter.client.Transport.(*http.Transport)
+	if transport.MaxConnsPerHost != 2 || transport.MaxIdleConnsPerHost != 2 || transport.MaxIdleConns != 2 {
+		t.Fatalf("transport limits=%d/%d/%d", transport.MaxConnsPerHost, transport.MaxIdleConnsPerHost, transport.MaxIdleConns)
+	}
+	firstRequest := validStreamRequest("1003")
+	firstRequest.CorrelationID = "recording-first"
+	first, err := adapter.OpenStream(context.Background(), firstRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRequest := validStreamRequest("1004")
+	secondRequest.CorrelationID = "recording-second"
+	second, err := adapter.OpenStream(context.Background(), secondRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	thirdRequest := validStreamRequest("1005")
+	thirdRequest.CorrelationID = "recording-third"
+	if _, err := adapter.OpenStream(context.Background(), thirdRequest); !provider.IsReason(err, provider.ReasonRejected) {
+		t.Fatalf("上限超過err=%v", err)
+	}
+	if requests.Load() != 2 || maximum.Load() != 2 {
+		t.Fatalf("requests=%d maximum=%d", requests.Load(), maximum.Load())
+	}
+	_ = first.Cancel()
+	_ = first.Close()
+	third, err := adapter.OpenStream(context.Background(), thirdRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = second.Cancel()
+	_ = second.Close()
+	_ = third.Cancel()
+	_ = third.Close()
+	adapter.mu.Lock()
+	remaining := adapter.active
+	adapter.mu.Unlock()
+	if requests.Load() != 3 || remaining != 0 {
+		t.Fatalf("requests=%d remaining=%d", requests.Load(), remaining)
+	}
+}
+
+func TestStreamRejectsConcurrentLimitOutsideProfile(t *testing.T) {
+	for _, maximum := range []int{0, maximumConcurrentStreams + 1} {
+		if _, err := NewStreamWithLimit("http://127.0.0.1:9", maximum); !provider.IsReason(err, provider.ReasonInternal) {
+			t.Fatalf("maximum=%d err=%v", maximum, err)
+		}
+	}
+}
+
 func TestStreamRepeatedDisconnectDoesNotLeakResources(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		writer.Header().Set("Content-Type", "video/MP2T")

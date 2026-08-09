@@ -5,6 +5,7 @@ package sqlite
 import (
 	"bytes"
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -40,6 +41,37 @@ type e2eLease struct {
 	stream     *e2eStream
 	connection int
 }
+
+type parallelE2EStream struct {
+	clock   *e2eClock
+	end     time.Time
+	started chan<- struct{}
+	release <-chan struct{}
+}
+
+func (stream *parallelE2EStream) OpenStream(context.Context, providerstream.Request) (providerstream.Lease, error) {
+	return &parallelE2ELease{stream: stream}, nil
+}
+
+type parallelE2ELease struct{ stream *parallelE2EStream }
+
+func (lease *parallelE2ELease) Read(ctx context.Context, destination []byte) (int, providerstream.Terminal, error) {
+	select {
+	case lease.stream.started <- struct{}{}:
+	default:
+	}
+	select {
+	case <-ctx.Done():
+		return 0, providerstream.Terminal{Done: true, Reason: providerstream.TerminalCancelled}, ctx.Err()
+	case <-lease.stream.release:
+	}
+	copy(destination, bytes.Repeat([]byte{0x47}, 188))
+	lease.stream.clock.now = lease.stream.end
+	return 188, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
+}
+
+func (*parallelE2ELease) Cancel() error { return nil }
+func (*parallelE2ELease) Close() error  { return nil }
 
 func (lease *e2eLease) Read(_ context.Context, destination []byte) (int, providerstream.Terminal, error) {
 	copy(destination, bytes.Repeat([]byte{0x47}, 188))
@@ -207,4 +239,156 @@ func TestReservationToFinalFileSurvivesRestart(t *testing.T) {
 	if next, err := store.NextActiveReservation(context.Background()); err != nil || next != nil {
 		t.Fatalf("next=%+v err=%v", next, err)
 	}
+}
+
+func TestTwoRecordingsUseSeparateDatabaseRowsAndFiles(t *testing.T) {
+	dataRoot, store := openMigratedStore(t)
+	firstRequest := reservationForTest(t, store)
+	first, err := store.CreateReservation(context.Background(), firstRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRequest := secondReservationForE2E(t, store, firstRequest)
+	second, err := store.CreateReservation(context.Background(), secondRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordingRootPath := filepath.Join(t.TempDir(), "recordings")
+	recordingRoot, err := recordingfs.OpenRoot(recordingRootPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := apprecording.FileOperations{
+		CreatePartial: func(plan core.FilePlan) (apprecording.PartialFile, error) {
+			return recordingRoot.CreatePartial(plan)
+		},
+		LinkFinal: recordingRoot.LinkFinal, SyncDirectory: recordingRoot.SyncDirectory,
+		RemovePartial: recordingRoot.RemovePartial,
+	}
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	type execution struct {
+		reservation core.Reservation
+		clock       *e2eClock
+		ids         []catalogmodel.ID
+		owner       catalogmodel.ID
+	}
+	executions := []execution{
+		{reservation: first, clock: &e2eClock{now: first.Program.Start},
+			ids: []catalogmodel.ID{testID(t, 240), testID(t, 241), testID(t, 242)}, owner: testID(t, 243)},
+		{reservation: second, clock: &e2eClock{now: second.Program.Start},
+			ids: []catalogmodel.ID{testID(t, 244), testID(t, 245), testID(t, 246)}, owner: testID(t, 243)},
+	}
+	results := make(chan error, len(executions))
+	for index := range executions {
+		item := &executions[index]
+		go func() {
+			nextID := 0
+			stream := &parallelE2EStream{
+				clock: item.clock, end: item.reservation.Program.Start.Add(item.reservation.Program.Duration),
+				started: started, release: release,
+			}
+			executor := apprecording.Executor{
+				Store: store, Stream: stream, Files: files, Clock: item.clock, OwnerID: item.owner, Generation: 1,
+				NewID: func() (catalogmodel.ID, error) {
+					id := item.ids[nextID]
+					nextID++
+					return id, nil
+				},
+				WithDeadline: func(ctx context.Context, _ time.Time) (context.Context, context.CancelFunc) {
+					return context.WithCancel(ctx)
+				},
+			}
+			result, executeErr := executor.Execute(context.Background(), item.reservation)
+			if executeErr == nil && (result.State != core.AttemptSucceeded || result.Reason != core.ReasonCompleted) {
+				executeErr = errors.New("unexpected recording result")
+			}
+			results <- executeErr
+		}()
+	}
+	for range executions {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("二件の録画が同時にstream読込みへ到達しませんでした")
+		}
+	}
+	close(release)
+	for range executions {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	items, err := store.RecoveryAttempts(context.Background(), core.MaxRecoveryPage, catalogmodel.ID{})
+	if err != nil || len(items) != 2 {
+		t.Fatalf("items=%+v err=%v", items, err)
+	}
+	if items[0].Plan.PartialPath == items[1].Plan.PartialPath || items[0].Plan.FinalPath == items[1].Plan.FinalPath {
+		t.Fatalf("録画ファイル名が共有されました: %+v %+v", items[0].Plan, items[1].Plan)
+	}
+	for _, item := range items {
+		observation, inspectErr := recordingRoot.Inspect(item.Plan)
+		if inspectErr != nil || item.State != core.AttemptSucceeded || item.ByteCount != 188 ||
+			item.Availability != core.AvailabilityFinal || observation.Partial.Exists ||
+			!observation.Final.Regular || observation.Final.Size != 188 {
+			t.Fatalf("item=%+v observation=%+v err=%v", item, observation, inspectErr)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordingRoot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = OpenStore(context.Background(), dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	items, err = store.RecoveryAttempts(context.Background(), core.MaxRecoveryPage, catalogmodel.ID{})
+	if err != nil || len(items) != 2 || items[0].State != core.AttemptSucceeded || items[1].State != core.AttemptSucceeded {
+		t.Fatalf("restart items=%+v err=%v", items, err)
+	}
+}
+
+func secondReservationForE2E(t *testing.T, store *Store, first core.Reservation) core.Reservation {
+	t.Helper()
+	syncID := testID(t, 237)
+	if err := store.BeginSync(context.Background(), catalogmodel.Sync{
+		ID: syncID, BackendID: first.Program.BackendID, StartedAtMS: 3, CorrelationID: "parallel-recording-test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	networkID, transportID, serviceID := int64(1), int64(2), int64(3)
+	tuningTarget := first.Program.TuningTarget
+	if err := store.StoreServices(context.Background(), syncID, []catalogmodel.ServiceObservation{{
+		ProviderLocator: tuningTarget, NetworkID: &networkID, TransportID: &transportID, ServiceID: &serviceID,
+		DisplayName: "テスト局", TuningTarget: &tuningTarget, Validation: catalogmodel.ValidationValid,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	startMS, durationMS, eventID := first.Program.Start.UnixMilli(), first.Program.Duration.Milliseconds(), int64(5)
+	title := "並行録画テスト"
+	if err := store.StorePrograms(context.Background(), syncID, false, []catalogmodel.ProgramObservation{{
+		ServiceLocator: tuningTarget, EventLocator: "5", RawEventID: &eventID,
+		Material: catalogmodel.RevisionMaterial{
+			StartUTCMS: &startMS, DurationMS: &durationMS, Title: &title, Validation: catalogmodel.ValidationValid,
+		},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompleteSync(context.Background(), syncID, startMS+1, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	programs, err := store.CurrentPrograms(context.Background(), first.Program.BackendID, 1, catalogmodel.ID{})
+	if err != nil || len(programs) != 1 {
+		t.Fatalf("programs=%+v err=%v", programs, err)
+	}
+	second := first
+	second.ID = testID(t, 238)
+	second.Program.ProgramInstanceID = programs[0].InstanceID
+	second.Program.ProgramRevisionID = programs[0].RevisionID
+	second.Program.EventID = uint16(eventID)
+	second.Program.Title = title
+	return second
 }

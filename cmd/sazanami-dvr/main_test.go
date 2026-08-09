@@ -31,7 +31,7 @@ func TestVersion(t *testing.T) {
 	if code := run([]string{"--version"}, &output, &diagnostic); code != 0 {
 		t.Fatalf("code=%d err=%q", code, diagnostic.String())
 	}
-	if got, want := output.String(), "sazanami-dvr 0.0.6\n"; got != want {
+	if got, want := output.String(), "sazanami-dvr 0.0.7\n"; got != want {
 		t.Fatalf("version=%q want=%q", got, want)
 	}
 }
@@ -341,6 +341,10 @@ func TestRecordingServeRefreshesCatalogWithoutOpeningStreamBeforeReservationTime
 		cancel()
 		t.Fatalf("catalog=%d stream=%d", catalogCalls.Load(), streamCalls.Load())
 	}
+	if !strings.Contains(output.String(), "max_concurrent_recordings=1") {
+		cancel()
+		t.Fatalf("既定同時録画数が出力されませんでした: %q", output.String())
+	}
 	connection, err := net.DialTimeout("tcp", address, time.Second)
 	if err != nil {
 		cancel()
@@ -426,6 +430,40 @@ func TestRecordingServeValidatesCatalogRefreshIntervalBeforeOpeningRoots(t *test
 			strings.Contains(diagnostic.String(), "/private") {
 			t.Fatalf("interval=%q code=%d diagnostic=%q", interval, code, diagnostic.String())
 		}
+	}
+}
+
+func TestRecordingServeValidatesConcurrentRecordingLimitBeforeOpeningRoots(t *testing.T) {
+	base := []string{
+		"recording", "serve", "--data-root", "/private/not-for-output",
+		"--recording-root", "/private/not-for-output/recordings",
+		"--channel-map", "/private/not-for-output/channels.json", "--provider", "mirakurun",
+		"--base-url", "http://127.0.0.1:40773", "--listen", "127.0.0.1:4510",
+	}
+	for _, maximum := range []string{"-1", "0", "9"} {
+		var output, diagnostic bytes.Buffer
+		arguments := append(append([]string(nil), base...), "--max-concurrent-recordings", maximum)
+		code := runContext(context.Background(), arguments, &output, &diagnostic)
+		if code != 1 || !strings.Contains(diagnostic.String(), "recording-arguments-required") ||
+			strings.Contains(diagnostic.String(), "/private") {
+			t.Fatalf("maximum=%q code=%d diagnostic=%q", maximum, code, diagnostic.String())
+		}
+	}
+	for _, maximum := range []string{"1", "2", "8"} {
+		var output, diagnostic bytes.Buffer
+		arguments := append(append([]string(nil), base...), "--max-concurrent-recordings", maximum)
+		code := runContext(context.Background(), arguments, &output, &diagnostic)
+		if code != 1 || !strings.Contains(diagnostic.String(), "current-database-required") ||
+			strings.Contains(diagnostic.String(), "/private") {
+			t.Fatalf("maximum=%q code=%d diagnostic=%q", maximum, code, diagnostic.String())
+		}
+	}
+	var output, diagnostic bytes.Buffer
+	arguments := append(append([]string(nil), base...), "--max-concurrent-recordings", "not-a-number")
+	code := runContext(context.Background(), arguments, &output, &diagnostic)
+	if code != 1 || !strings.Contains(diagnostic.String(), "invalid-command-arguments") ||
+		strings.Contains(diagnostic.String(), "/private") {
+		t.Fatalf("non-number code=%d diagnostic=%q", code, diagnostic.String())
 	}
 }
 

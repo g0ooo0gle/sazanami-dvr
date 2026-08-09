@@ -94,7 +94,7 @@ func (executor Executor) Miss(ctx context.Context, reservation recording.Reserva
 	if reason != recording.ReasonLateStartExpired && reason != recording.ReasonRecordingSlotUnavailable {
 		return Result{}, errors.New("recording: invalid missed reason")
 	}
-	attempt, err := executor.claim(ctx, reservation)
+	attempt, err := executor.Claim(ctx, reservation)
 	if err != nil {
 		return Result{}, err
 	}
@@ -110,11 +110,17 @@ func (executor Executor) Miss(ctx context.Context, reservation recording.Reserva
 
 // Executeは一つの予約を予定終了まで録画し、正常終了時だけ完成ファイルを公開する。
 func (executor Executor) Execute(ctx context.Context, reservation recording.Reservation) (Result, error) {
-	if err := executor.validate(ctx, reservation); err != nil {
+	attempt, err := executor.Claim(ctx, reservation)
+	if err != nil {
 		return Result{}, err
 	}
-	attempt, err := executor.claim(ctx, reservation)
-	if err != nil {
+	return executor.ExecuteClaimed(ctx, reservation, attempt)
+}
+
+// ExecuteClaimedはDBへ確保済みの一件を実行する。
+// SchedulerはClaimの完了後だけこの処理をGo routineで起動し、同じ予約の二重起動を防ぐ。
+func (executor Executor) ExecuteClaimed(ctx context.Context, reservation recording.Reservation, attempt recording.Attempt) (Result, error) {
+	if err := executor.validateClaimed(ctx, reservation, attempt); err != nil {
 		return Result{}, err
 	}
 	if err := executor.Store.StartAttempt(ctx, attempt.ID, executor.now()); err != nil {
@@ -406,7 +412,9 @@ func (executor Executor) finishWithoutFile(ctx context.Context, attemptID catalo
 	return executor.finishByCount(context.WithoutCancel(ctx), attemptID, 0, reason, false)
 }
 
-func (executor Executor) claim(ctx context.Context, reservation recording.Reservation) (recording.Attempt, error) {
+// Claimは一件の予約へ録画処理とファイル計画を同期的に割り当てる。
+// 呼び出しが成功するまで録画用Go routineやstreamを開始してはいけない。
+func (executor Executor) Claim(ctx context.Context, reservation recording.Reservation) (recording.Attempt, error) {
 	if err := executor.validate(ctx, reservation); err != nil {
 		return recording.Attempt{}, err
 	}
@@ -430,6 +438,19 @@ func (executor Executor) claim(ctx context.Context, reservation recording.Reserv
 		return recording.Attempt{}, err
 	}
 	return attempt, nil
+}
+
+func (executor Executor) validateClaimed(ctx context.Context, reservation recording.Reservation, attempt recording.Attempt) error {
+	if err := executor.validate(ctx, reservation); err != nil {
+		return err
+	}
+	if attempt.ID == (catalogmodel.ID{}) || attempt.ReservationID != reservation.ID ||
+		attempt.State != recording.AttemptClaimed || attempt.PlannedStart.IsZero() || attempt.PlannedEnd.IsZero() ||
+		attempt.PlannedStart.Location() != time.UTC || attempt.PlannedEnd.Location() != time.UTC ||
+		!attempt.PlannedEnd.After(attempt.PlannedStart) || attempt.Plan.Validate() != nil {
+		return errors.New("recording: invalid claimed attempt")
+	}
+	return nil
 }
 
 func (executor Executor) validate(ctx context.Context, reservation recording.Reservation) error {

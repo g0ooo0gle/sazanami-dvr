@@ -36,25 +36,34 @@ func (store *queueStore) NextActiveReservation(context.Context) (*core.Reservati
 }
 
 type schedulerExecutor struct {
-	clock     *manualScheduleClock
-	execute   []core.Reservation
-	miss      []core.TerminalReason
-	onExecute func()
-	executed  chan struct{}
+	clock    *manualScheduleClock
+	claimed  []core.Reservation
+	execute  []core.Reservation
+	miss     []core.TerminalReason
+	executed chan struct{}
+	release  <-chan struct{}
 }
 
-func (executor *schedulerExecutor) Execute(_ context.Context, reservation core.Reservation) (Result, error) {
+func (executor *schedulerExecutor) Claim(_ context.Context, reservation core.Reservation) (core.Attempt, error) {
+	executor.claimed = append(executor.claimed, reservation)
+	return core.Attempt{ReservationID: reservation.ID}, nil
+}
+
+func (executor *schedulerExecutor) ExecuteClaimed(ctx context.Context, reservation core.Reservation, _ core.Attempt) (Result, error) {
 	executor.execute = append(executor.execute, reservation)
-	if executor.onExecute != nil {
-		executor.onExecute()
-	}
 	if executor.executed != nil {
 		select {
 		case executor.executed <- struct{}{}:
 		default:
 		}
 	}
-	executor.clock.now = executor.clock.now.Add(2 * time.Minute)
+	if executor.release != nil {
+		select {
+		case <-ctx.Done():
+			return Result{}, nil
+		case <-executor.release:
+		}
+	}
 	return Result{State: core.AttemptSucceeded, Reason: core.ReasonCompleted}, nil
 }
 
@@ -92,13 +101,14 @@ func TestSchedulerUsesOneSlotAndLateStartRules(t *testing.T) {
 	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
 	clock := &manualScheduleClock{now: start}
 	first := reservationForExecutor(t, start, 10*time.Minute)
-	second := reservationForExecutor(t, start.Add(time.Minute), 10*time.Minute)
+	second := reservationForExecutor(t, start, 10*time.Minute)
 	second.ID = appID(t, 40)
 	late := reservationForExecutor(t, start.Add(-10*time.Minute), 20*time.Minute)
 	late.ID = appID(t, 41)
 	store := &queueStore{items: []core.Reservation{first, second, late}, queried: make(chan struct{}, 8)}
-	executor := &schedulerExecutor{clock: clock}
-	scheduler, err := NewScheduler(store, executor, clock)
+	release := make(chan struct{})
+	executor := &schedulerExecutor{clock: clock, release: release}
+	scheduler, err := NewScheduler(store, executor, clock, DefaultMaximumConcurrentRecordings)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,6 +122,7 @@ func TestSchedulerUsesOneSlotAndLateStartRules(t *testing.T) {
 			t.Fatal("schedulerが次の予約を確認しませんでした")
 		}
 	}
+	close(release)
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatal(err)
@@ -125,7 +136,7 @@ func TestSchedulerUsesOneSlotAndLateStartRules(t *testing.T) {
 func TestSchedulerWaitsForNotificationWithoutPolling(t *testing.T) {
 	clock := &manualScheduleClock{now: time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)}
 	store := &queueStore{queried: make(chan struct{}, 4)}
-	scheduler, err := NewScheduler(store, &schedulerExecutor{clock: clock}, clock)
+	scheduler, err := NewScheduler(store, &schedulerExecutor{clock: clock}, clock, DefaultMaximumConcurrentRecordings)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +184,7 @@ func TestSchedulerTreatsDatabaseCancellationAsCleanShutdown(t *testing.T) {
 	executor := &schedulerExecutor{clock: clock}
 	ctx, cancel := context.WithCancel(context.Background())
 	store := schedulerErrorStore{err: context.Canceled, before: cancel}
-	scheduler, err := NewScheduler(store, executor, clock)
+	scheduler, err := NewScheduler(store, executor, clock, DefaultMaximumConcurrentRecordings)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +196,7 @@ func TestSchedulerTreatsDatabaseCancellationAsCleanShutdown(t *testing.T) {
 func TestSchedulerKeepsDatabaseFailureWhileRunning(t *testing.T) {
 	clock := &manualScheduleClock{now: time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)}
 	executor := &schedulerExecutor{clock: clock}
-	scheduler, err := NewScheduler(schedulerErrorStore{err: errors.New("database failed")}, executor, clock)
+	scheduler, err := NewScheduler(schedulerErrorStore{err: errors.New("database failed")}, executor, clock, DefaultMaximumConcurrentRecordings)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,12 +206,13 @@ func TestSchedulerKeepsDatabaseFailureWhileRunning(t *testing.T) {
 }
 
 type futureStore struct {
-	item core.Reservation
-	done bool
+	item    core.Reservation
+	queries int
 }
 
 func (store *futureStore) NextActiveReservation(context.Context) (*core.Reservation, error) {
-	if store.done {
+	store.queries++
+	if store.queries > 2 {
 		return nil, nil
 	}
 	item := store.item
@@ -212,8 +224,7 @@ func TestSchedulerUsesTimerAndRechecksDatabase(t *testing.T) {
 	clock := &manualScheduleClock{now: start.Add(-time.Hour), created: make(chan struct{}, 1)}
 	store := &futureStore{item: reservationForExecutor(t, start, 10*time.Minute)}
 	executor := &schedulerExecutor{clock: clock, executed: make(chan struct{}, 1)}
-	executor.onExecute = func() { store.done = true }
-	scheduler, err := NewScheduler(store, executor, clock)
+	scheduler, err := NewScheduler(store, executor, clock, DefaultMaximumConcurrentRecordings)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,5 +252,338 @@ func TestSchedulerUsesTimerAndRechecksDatabase(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+type concurrentSchedulerExecutor struct {
+	mu        sync.Mutex
+	claimed   int
+	running   int
+	maximum   int
+	missed    []core.TerminalReason
+	started   chan core.Reservation
+	release   chan struct{}
+	onClaim   func(core.Reservation)
+	failAfter <-chan struct{}
+	failID    core.Reservation
+	cancelled int
+}
+
+func (executor *concurrentSchedulerExecutor) Claim(_ context.Context, reservation core.Reservation) (core.Attempt, error) {
+	executor.mu.Lock()
+	executor.claimed++
+	executor.mu.Unlock()
+	if executor.onClaim != nil {
+		executor.onClaim(reservation)
+	}
+	return core.Attempt{ReservationID: reservation.ID}, nil
+}
+
+func (executor *concurrentSchedulerExecutor) ExecuteClaimed(ctx context.Context, reservation core.Reservation, attempt core.Attempt) (Result, error) {
+	if attempt.ReservationID != reservation.ID {
+		return Result{}, errors.New("attempt mismatch")
+	}
+	executor.mu.Lock()
+	executor.running++
+	if executor.running > executor.maximum {
+		executor.maximum = executor.running
+	}
+	executor.mu.Unlock()
+	executor.started <- reservation
+	if executor.failAfter != nil && reservation.ID == executor.failID.ID {
+		select {
+		case <-ctx.Done():
+			executor.finishConcurrent(true)
+			return Result{}, nil
+		case <-executor.failAfter:
+			executor.finishConcurrent(false)
+			return Result{}, errors.New("recording failed")
+		}
+	}
+	select {
+	case <-ctx.Done():
+		executor.finishConcurrent(true)
+		return Result{}, nil
+	case <-executor.release:
+		executor.finishConcurrent(false)
+		return Result{State: core.AttemptSucceeded, Reason: core.ReasonCompleted}, nil
+	}
+}
+
+func (executor *concurrentSchedulerExecutor) finishConcurrent(cancelled bool) {
+	executor.mu.Lock()
+	executor.running--
+	if cancelled {
+		executor.cancelled++
+	}
+	executor.mu.Unlock()
+}
+
+func (executor *concurrentSchedulerExecutor) Miss(_ context.Context, _ core.Reservation, reason core.TerminalReason) (Result, error) {
+	executor.mu.Lock()
+	executor.missed = append(executor.missed, reason)
+	executor.mu.Unlock()
+	return Result{State: core.AttemptMissed, Reason: reason}, nil
+}
+
+func TestSchedulerRunsTwoRecordingsAndMissesOneOverLimit(t *testing.T) {
+	start := time.Date(2026, 8, 9, 8, 0, 0, 0, time.UTC)
+	items := []core.Reservation{
+		reservationForExecutor(t, start, 10*time.Minute),
+		reservationForExecutor(t, start, 10*time.Minute),
+		reservationForExecutor(t, start, 10*time.Minute),
+	}
+	items[1].ID = appID(t, 51)
+	items[2].ID = appID(t, 52)
+	store := &queueStore{items: items, queried: make(chan struct{}, 8)}
+	executor := &concurrentSchedulerExecutor{started: make(chan core.Reservation, 3), release: make(chan struct{}, 2)}
+	scheduler, err := NewScheduler(store, executor, &manualScheduleClock{now: start}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+	for range 2 {
+		select {
+		case <-executor.started:
+		case <-time.After(time.Second):
+			cancel()
+			t.Fatal("二件の録画が同時に開始されませんでした")
+		}
+	}
+	for range 4 {
+		select {
+		case <-store.queried:
+		case <-time.After(time.Second):
+			cancel()
+			t.Fatal("三件目の枠不足が判定されませんでした")
+		}
+	}
+	executor.release <- struct{}{}
+	executor.release <- struct{}{}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	if executor.claimed != 2 || executor.maximum != 2 || executor.running != 0 ||
+		len(executor.missed) != 1 || executor.missed[0] != core.ReasonRecordingSlotUnavailable {
+		t.Fatalf("claimed=%d maximum=%d running=%d missed=%v", executor.claimed, executor.maximum, executor.running, executor.missed)
+	}
+}
+
+func TestSchedulerReusesCompletedSlotAfterNotification(t *testing.T) {
+	start := time.Date(2026, 8, 9, 9, 0, 0, 0, time.UTC)
+	first := reservationForExecutor(t, start, 10*time.Minute)
+	second := reservationForExecutor(t, start, 10*time.Minute)
+	second.ID = appID(t, 53)
+	store := &queueStore{items: []core.Reservation{first}, queried: make(chan struct{}, 8)}
+	executor := &concurrentSchedulerExecutor{started: make(chan core.Reservation, 2), release: make(chan struct{}, 2)}
+	scheduler, err := NewScheduler(store, executor, &manualScheduleClock{now: start}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+	waitSchedulerStart(t, executor.started)
+	executor.release <- struct{}{}
+	deadline := time.Now().Add(time.Second)
+	for {
+		executor.mu.Lock()
+		running := executor.running
+		executor.mu.Unlock()
+		if running == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("完了した録画枠が解放されませんでした")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	store.mu.Lock()
+	store.items = append(store.items, second)
+	store.mu.Unlock()
+	scheduler.Notify()
+	started := waitSchedulerStart(t, executor.started)
+	if started.ID != second.ID {
+		cancel()
+		t.Fatalf("別の予約が開始されました: %v", started.ID)
+	}
+	executor.release <- struct{}{}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+type pendingScheduleStore struct {
+	mu    sync.Mutex
+	items []core.Reservation
+}
+
+func (store *pendingScheduleStore) NextActiveReservation(context.Context) (*core.Reservation, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.items) == 0 {
+		return nil, nil
+	}
+	item := store.items[0]
+	return &item, nil
+}
+
+func (store *pendingScheduleStore) claimed(reservation core.Reservation) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.items) > 0 && store.items[0].ID == reservation.ID {
+		store.items = store.items[1:]
+	}
+}
+
+func TestSchedulerWaitsUntilStartForBackToBackRecordingSlot(t *testing.T) {
+	firstStart := time.Date(2026, 8, 9, 9, 30, 0, 0, time.UTC)
+	secondStart := firstStart.Add(10 * time.Minute)
+	first := reservationForExecutor(t, firstStart, 10*time.Minute)
+	second := reservationForExecutor(t, secondStart, 10*time.Minute)
+	second.ID = appID(t, 56)
+	store := &pendingScheduleStore{items: []core.Reservation{first, second}}
+	clock := &manualScheduleClock{now: firstStart, created: make(chan struct{}, 2)}
+	executor := &concurrentSchedulerExecutor{
+		started: make(chan core.Reservation, 2), release: make(chan struct{}, 2), onClaim: store.claimed,
+	}
+	scheduler, err := NewScheduler(store, executor, clock, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+	started := waitSchedulerStart(t, executor.started)
+	if started.ID != first.ID {
+		cancel()
+		t.Fatalf("最初の予約ではありません: %v", started.ID)
+	}
+	select {
+	case <-clock.created:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("次の予約の準備時刻timerが作られませんでした")
+	}
+	clock.now = secondStart.Add(-startupLeadTime)
+	clock.timer.channel <- clock.now
+	select {
+	case <-clock.created:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("満杯時に実際の開始時刻まで待ちませんでした")
+	}
+	if clock.duration != startupLeadTime {
+		cancel()
+		t.Fatalf("開始時刻までの待機=%s", clock.duration)
+	}
+	executor.release <- struct{}{}
+	started = waitSchedulerStart(t, executor.started)
+	if started.ID != second.ID {
+		cancel()
+		t.Fatalf("連続する予約ではありません: %v", started.ID)
+	}
+	executor.release <- struct{}{}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	if executor.claimed != 2 || len(executor.missed) != 0 {
+		t.Fatalf("claimed=%d missed=%v", executor.claimed, executor.missed)
+	}
+}
+
+func TestSchedulerCancelsAndWaitsForAllRecordings(t *testing.T) {
+	start := time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)
+	first := reservationForExecutor(t, start, 10*time.Minute)
+	second := reservationForExecutor(t, start, 10*time.Minute)
+	second.ID = appID(t, 54)
+	store := &queueStore{items: []core.Reservation{first, second}}
+	executor := &concurrentSchedulerExecutor{started: make(chan core.Reservation, 2), release: make(chan struct{})}
+	scheduler, err := NewScheduler(store, executor, &manualScheduleClock{now: start}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+	waitSchedulerStart(t, executor.started)
+	waitSchedulerStart(t, executor.started)
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("停止時に録画処理の終了を待てませんでした")
+	}
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	if executor.running != 0 || executor.cancelled != 2 {
+		t.Fatalf("running=%d cancelled=%d", executor.running, executor.cancelled)
+	}
+}
+
+func TestSchedulerCancelsSiblingAfterExecutionError(t *testing.T) {
+	start := time.Date(2026, 8, 9, 11, 0, 0, 0, time.UTC)
+	first := reservationForExecutor(t, start, 10*time.Minute)
+	second := reservationForExecutor(t, start, 10*time.Minute)
+	second.ID = appID(t, 55)
+	fail := make(chan struct{})
+	executor := &concurrentSchedulerExecutor{
+		started: make(chan core.Reservation, 2), release: make(chan struct{}), failAfter: fail, failID: first,
+	}
+	scheduler, err := NewScheduler(&queueStore{items: []core.Reservation{first, second}}, executor,
+		&manualScheduleClock{now: start}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(context.Background()) }()
+	waitSchedulerStart(t, executor.started)
+	waitSchedulerStart(t, executor.started)
+	close(fail)
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("録画処理の基盤エラーが失敗終了になりませんでした")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("基盤エラー後に兄弟録画を停止できませんでした")
+	}
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	if executor.running != 0 || executor.cancelled != 1 {
+		t.Fatalf("running=%d cancelled=%d", executor.running, executor.cancelled)
+	}
+}
+
+func TestSchedulerRejectsConcurrentBounds(t *testing.T) {
+	clock := &manualScheduleClock{now: time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)}
+	for _, maximum := range []int{0, MaximumConcurrentRecordings + 1} {
+		if _, err := NewScheduler(&queueStore{}, &schedulerExecutor{clock: clock}, clock, maximum); err == nil {
+			t.Fatalf("maximum=%dが受理されました", maximum)
+		}
+	}
+}
+
+func waitSchedulerStart(t *testing.T, started <-chan core.Reservation) core.Reservation {
+	t.Helper()
+	select {
+	case reservation := <-started:
+		return reservation
+	case <-time.After(time.Second):
+		t.Fatal("録画処理が開始されませんでした")
+		return core.Reservation{}
 	}
 }
