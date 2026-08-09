@@ -38,6 +38,17 @@ func (store *Store) CreateReservation(ctx context.Context, reservation recording
 	}
 	defer tx.Rollback()
 
+	reservation, err = createReservationTx(ctx, tx, reservation)
+	if err != nil {
+		return recording.Reservation{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return recording.Reservation{}, sanitize("commit-reservation", err)
+	}
+	return reservation, nil
+}
+
+func createReservationTx(ctx context.Context, tx *sql.Tx, reservation recording.Reservation) (recording.Reservation, error) {
 	var active int
 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM reservations WHERE state='ACTIVE'`).Scan(&active); err != nil {
 		return recording.Reservation{}, sanitize("count-reservations", err)
@@ -57,7 +68,7 @@ func (store *Store) CreateReservation(ctx context.Context, reservation recording
 		return recording.Reservation{}, ErrDuplicateReservation
 	}
 	createdMS := reservation.CreatedAt.UnixMilli()
-	_, err = tx.ExecContext(ctx, `INSERT INTO reservations(
+	_, err := tx.ExecContext(ctx, `INSERT INTO reservations(
 		id, version, state, program_instance_id, program_revision_id, backend_instance_id,
 		provider_service_locator, tuning_target, network_id, transport_stream_id, service_id, event_id,
 		title, station_name, start_at_utc_ms, duration_seconds, requested_priority, requested_follow,
@@ -77,9 +88,6 @@ func (store *Store) CreateReservation(ctx context.Context, reservation recording
 	}
 	if number < 1 || number > 1<<31-1 {
 		return recording.Reservation{}, ErrReservationLimit
-	}
-	if err := tx.Commit(); err != nil {
-		return recording.Reservation{}, sanitize("commit-reservation", err)
 	}
 	reservation.Number = int32(number)
 	reservation.EffectiveFollow = reservation.RequestedFollow
