@@ -257,7 +257,18 @@ func EventStructureSize(program catalogmodel.CurrentProgram, limits codec.Limits
 	if err != nil {
 		return 0, false, err
 	}
-	return 63 + titleSize + descriptionSize, true, nil
+	metadata, err := prepareEventMetadata(material.Metadata, limits)
+	if err != nil {
+		return 0, false, err
+	}
+	total := int64(47) + titleSize + descriptionSize
+	for _, size := range [...]int64{metadata.extendedSize, metadata.contentSize, metadata.videoSize, metadata.audioSize} {
+		total, err = addSize(total, size, codec.MaxStructureExtent, "event-structure-over-limit")
+		if err != nil {
+			return 0, false, err
+		}
+	}
+	return total, true, nil
 }
 
 func writePrograms(ctx context.Context, writer *codec.Writer, source Source, services []channel.Service, stats []serviceStats, query programQuery, limits codec.Limits) error {
@@ -367,6 +378,10 @@ func WriteEvent(writer *codec.Writer, service channel.Service, program catalogmo
 	}
 	titleSize, _ := codec.StringSize(title, limits)
 	descriptionSize, _ := codec.StringSize(description, limits)
+	metadata, metadataErr := prepareEventMetadata(material.Metadata, limits)
+	if metadataErr != nil {
+		return metadataErr
+	}
 	if err := writer.I32(int32(4 + titleSize + descriptionSize)); err != nil {
 		return err
 	}
@@ -376,7 +391,19 @@ func WriteEvent(writer *codec.Writer, service channel.Service, program catalogmo
 	if err := writer.String(description); err != nil {
 		return err
 	}
-	for range 6 {
+	if err := metadata.writeExtended(writer); err != nil {
+		return err
+	}
+	if err := metadata.writeContent(writer); err != nil {
+		return err
+	}
+	if err := metadata.writeVideo(writer); err != nil {
+		return err
+	}
+	if err := metadata.writeAudio(writer); err != nil {
+		return err
+	}
+	for range 2 {
 		if err := writer.I32(4); err != nil {
 			return err
 		}
