@@ -7,6 +7,7 @@ import (
 
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/channel"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/codec"
+	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/filecopy2"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/programguide"
 	reservationadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/reservation"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/status"
@@ -67,6 +68,8 @@ func (router *Router) Handle(ctx context.Context, request []byte, destination io
 		return router.status.Handle(ctx, request, destination)
 	case channel.CommandFileCopy, channel.CommandEnumService:
 		return router.channel.Handle(ctx, request, destination)
+	case filecopy2.Command:
+		return (filecopy2.Handler{Limits: router.limits}).Handle(ctx, request, destination)
 	case programguide.Command:
 		if router.programGuide != nil {
 			return router.programGuide.Handle(ctx, request, destination)

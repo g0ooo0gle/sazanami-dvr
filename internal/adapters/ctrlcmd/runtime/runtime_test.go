@@ -14,6 +14,7 @@ import (
 
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/channel"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/codec"
+	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/filecopy2"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/programguide"
 	reservationadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/reservation"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/status"
@@ -537,6 +538,16 @@ func TestRecordingRouterKeepsKonomiTVCoreProfile(t *testing.T) {
 
 	listBody := make([]byte, 2)
 	binary.LittleEndian.PutUint16(listBody, reservationadapter.Version)
+	fileCopy2Body := make([]byte, 38)
+	binary.LittleEndian.PutUint16(fileCopy2Body[0:2], filecopy2.Version)
+	binary.LittleEndian.PutUint32(fileCopy2Body[2:6], 36)
+	binary.LittleEndian.PutUint32(fileCopy2Body[6:10], 1)
+	binary.LittleEndian.PutUint32(fileCopy2Body[10:14], 28)
+	position = 14
+	for _, character := range []byte("Bitrate.ini") {
+		binary.LittleEndian.PutUint16(fileCopy2Body[position:position+2], uint16(character))
+		position += 2
+	}
 	requests := []struct {
 		name    string
 		command int32
@@ -547,6 +558,7 @@ func TestRecordingRouterKeepsKonomiTVCoreProfile(t *testing.T) {
 		{name: "サービス一覧", command: channel.CommandEnumService},
 		{name: "番組表", command: programguide.Command, body: programBody},
 		{name: "予約一覧", command: reservationadapter.CommandList, body: listBody},
+		{name: "録画設定", command: filecopy2.Command, body: fileCopy2Body},
 	}
 	for _, test := range requests {
 		t.Run(test.name, func(t *testing.T) {
@@ -571,7 +583,7 @@ func TestRecordingRouterKeepsKonomiTVCoreProfile(t *testing.T) {
 	}
 
 	var codecError *codec.Error
-	if err := router.Handle(context.Background(), commandFrame(2060, nil), &bytes.Buffer{}); !errors.As(err, &codecError) || codecError.Category != codec.Unsupported {
+	if err := router.Handle(context.Background(), commandFrame(2061, nil), &bytes.Buffer{}); !errors.As(err, &codecError) || codecError.Category != codec.Unsupported {
 		t.Fatalf("対象外命令error=%v", err)
 	}
 }
