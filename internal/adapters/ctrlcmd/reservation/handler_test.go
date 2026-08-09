@@ -223,6 +223,84 @@ func TestReservationOutputSettingsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestReservationComponentSettingsNormalizeAndRoundTrip(t *testing.T) {
+	tests := []struct {
+		wire uint32
+		mode recording.ComponentMode
+	}{
+		{0x00, recording.ComponentDefault},
+		{0x10, recording.ComponentDefault},
+		{0x20, recording.ComponentDefault},
+		{0x30, recording.ComponentDefault},
+		{0x01, recording.ComponentNeither},
+		{0x11, recording.ComponentCaptionsOnly},
+		{0x21, recording.ComponentDataOnly},
+		{0x31, recording.ComponentBoth},
+	}
+	for _, test := range tests {
+		operations := &fakeOperations{}
+		handler := Handler{Operations: operations, Limits: codec.DefaultLimits()}
+		request := reservationRequestSettingsWithServiceMode(t, CommandAdd, Version, 0, 1, 3, true,
+			0, 0, 0, 1, test.wire, recording.OutputSettings{})
+		var response bytes.Buffer
+		if err := handler.Handle(context.Background(), request, &response); err != nil {
+			t.Fatal(err)
+		}
+		frame, err := codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
+		if err != nil || frame.Code != ResultSuccess || len(operations.added) != 1 ||
+			operations.added[0].Components != test.mode {
+			t.Fatalf("wire=%#x frame=%+v added=%+v err=%v", test.wire, frame, operations.added, err)
+		}
+	}
+
+	operations := &fakeOperations{}
+	handler := Handler{Operations: operations, Limits: codec.DefaultLimits()}
+	request := reservationRequestSettingsWithServiceMode(t, CommandAdd, Version, 0, 1, 3, true,
+		0, 0, 0, 1, 0x02, recording.OutputSettings{})
+	var response bytes.Buffer
+	if err := handler.Handle(context.Background(), request, &response); err != nil {
+		t.Fatal(err)
+	}
+	frame, err := codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
+	if err != nil || frame.Code != ResultFailure || len(operations.added) != 0 {
+		t.Fatalf("unknown frame=%+v calls=%d err=%v", frame, len(operations.added), err)
+	}
+
+	change := reservationRequestSettingsWithServiceMode(t, CommandChange, Version, 7, 1, 3, true,
+		0, 0, 0, 1, 0x31, recording.OutputSettings{})
+	response.Reset()
+	if err := handler.Handle(context.Background(), change, &response); err != nil {
+		t.Fatal(err)
+	}
+	frame, err = codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
+	if err != nil || frame.Code != ResultSuccess || len(operations.changed) != 1 ||
+		operations.changed[0].Request.Components != recording.ComponentBoth {
+		t.Fatalf("change frame=%+v changed=%+v err=%v", frame, operations.changed, err)
+	}
+
+	for _, mode := range []recording.ComponentMode{recording.ComponentDefault, recording.ComponentNeither,
+		recording.ComponentCaptionsOnly, recording.ComponentDataOnly, recording.ComponentBoth} {
+		listed := listedReservation(42)
+		listed.Components = mode
+		operations.reservations = []recording.Reservation{listed}
+		response.Reset()
+		if err := handler.Handle(context.Background(), listRequest(Version), &response); err != nil {
+			t.Fatal(err)
+		}
+		frame, err = codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
+		if err != nil || frame.Code != ResultSuccess {
+			t.Fatalf("mode=%d frame=%+v err=%v", mode, frame, err)
+		}
+		reader, _ := codec.NewReader(frame.Body, codec.DefaultLimits())
+		_, _ = reader.U16()
+		if err := reader.Vector(4, 1, func(items *codec.Reader, _ int) error {
+			return readListedReservation(items, listed)
+		}); err != nil {
+			t.Fatalf("mode=%d err=%v", mode, err)
+		}
+	}
+}
+
 func TestReservationOutputRejectsUnsafePathMacroAndPluginsAtomically(t *testing.T) {
 	valid := recording.OutputSettings{Folder: "safe", Template: "$Title$"}
 	base := reservationRequestSettingsWithOutput(t, CommandAdd, Version, 0, 1, 3, true, 0, 0, 0, 1, valid)
@@ -498,6 +576,14 @@ func reservationRequestSettingsWithOutput(t *testing.T, command int32, version u
 	recordingMode, priority uint8, follow bool, useMargins uint8, startMargin, endMargin int32, count int,
 	output recording.OutputSettings,
 ) []byte {
+	return reservationRequestSettingsWithServiceMode(t, command, version, reserveID, recordingMode, priority, follow,
+		useMargins, startMargin, endMargin, count, 0, output)
+}
+
+func reservationRequestSettingsWithServiceMode(t *testing.T, command int32, version uint16, reserveID int32,
+	recordingMode, priority uint8, follow bool, useMargins uint8, startMargin, endMargin int32, count int,
+	serviceMode uint32, output recording.OutputSettings,
+) []byte {
 	t.Helper()
 	var itemBody bytes.Buffer
 	item, err := codec.NewWriter(&itemBody, codec.DefaultLimits())
@@ -540,7 +626,8 @@ func reservationRequestSettingsWithOutput(t *testing.T, command int32, version u
 	if err := item.SystemTime(start); err != nil {
 		t.Fatal(err)
 	}
-	writeInputSettingsWithOutput(t, item, recordingMode, priority, follow, useMargins, startMargin, endMargin, output)
+	writeInputSettingsWithServiceMode(t, item, recordingMode, priority, follow, useMargins, startMargin, endMargin,
+		serviceMode, output)
 	if err := item.I32(0); err != nil {
 		t.Fatal(err)
 	}
@@ -574,6 +661,12 @@ func writeInputSettings(t *testing.T, writer *codec.Writer, mode, priority uint8
 func writeInputSettingsWithOutput(t *testing.T, writer *codec.Writer, mode, priority uint8, follow bool,
 	useMargins uint8, startMargin, endMargin int32, output recording.OutputSettings,
 ) {
+	writeInputSettingsWithServiceMode(t, writer, mode, priority, follow, useMargins, startMargin, endMargin, 0, output)
+}
+
+func writeInputSettingsWithServiceMode(t *testing.T, writer *codec.Writer, mode, priority uint8, follow bool,
+	useMargins uint8, startMargin, endMargin int32, serviceMode uint32, output recording.OutputSettings,
+) {
 	t.Helper()
 	var folder bytes.Buffer
 	if output != (recording.OutputSettings{}) {
@@ -603,7 +696,7 @@ func writeInputSettingsWithOutput(t *testing.T, writer *codec.Writer, mode, prio
 			t.Fatal(err)
 		}
 	}
-	_ = writer.U32(0)
+	_ = writer.U32(serviceMode)
 	_ = writer.U8(0)
 	_ = writer.String("")
 	if output == (recording.OutputSettings{}) {
@@ -704,6 +797,9 @@ func readListedReservation(reader *codec.Reader, want recording.Reservation) err
 		if err != nil || settings.priority != want.Priority || settings.follow != want.EffectiveFollow ||
 			settings.disabled != want.Disabled || !sameMargins(settings.margins, want.Margins) || settings.output != want.Output {
 			return fmt.Errorf("settings=%+v err=%v", settings, err)
+		}
+		if settings.components != want.Components {
+			return fmt.Errorf("components=%d want=%d", settings.components, want.Components)
 		}
 		if _, err := item.I32(); err != nil {
 			return err

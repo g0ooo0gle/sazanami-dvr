@@ -207,6 +207,26 @@ func TestExecutorPublishesOnlyAfterPlannedEnd(t *testing.T) {
 	}
 }
 
+func TestExecutorFailsMalformedSelectedStreamWithoutReconnect(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	clock := &mutableClock{now: start}
+	store := &attemptMemory{start: start, end: start.Add(time.Minute)}
+	lease := &fakeLease{read: func(destination []byte) (int, providerstream.Terminal, error) {
+		copy(destination, bytesOf(0x47, tsPacketBytes))
+		clock.now = store.end
+		return tsPacketBytes, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
+	}}
+	stream := &fakeProvider{lease: lease}
+	executor := executorForTest(t, store, stream, clock, false)
+	reservation := reservationForExecutor(t, start, time.Minute)
+	reservation.Components = core.ComponentDefault
+	result, err := executor.Execute(context.Background(), reservation)
+	if err != nil || result.State != core.AttemptFailed || result.Reason != core.ReasonStreamFormatInvalid ||
+		stream.opens != 1 || store.finish.ByteCount != 0 {
+		t.Fatalf("result=%+v opens=%d finish=%+v err=%v", result, stream.opens, store.finish, err)
+	}
+}
+
 func TestExecutorUsesExtendedPlannedEnd(t *testing.T) {
 	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
 	initialEnd := start.Add(time.Minute)
@@ -949,7 +969,7 @@ func executorForTest(t *testing.T, store *attemptMemory, stream *fakeProvider, c
 func reservationForExecutor(t *testing.T, start time.Time, duration time.Duration) core.Reservation {
 	t.Helper()
 	return core.Reservation{
-		ID: appID(t, 30), Version: 1, State: core.ReservationActive, Priority: 3,
+		ID: appID(t, 30), Version: 1, State: core.ReservationActive, Priority: 3, Components: core.ComponentBoth,
 		Program: core.ProgramSnapshot{
 			ProgramInstanceID: appID(t, 31), ProgramRevisionID: appID(t, 32), BackendID: appID(t, 33),
 			ProviderServiceLocator: "1003", TuningTarget: "1003", Start: start, Duration: duration,

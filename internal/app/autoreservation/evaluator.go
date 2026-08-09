@@ -109,6 +109,10 @@ func (evaluator Evaluator) Run(ctx context.Context) (Result, error) {
 			}
 			request.Disabled = settings.Mode == 5
 			request.Output = output
+			request.Components, supported = automaticComponentMode(settings.ServiceMode)
+			if !supported {
+				continue
+			}
 			if settings.StartMargin != nil {
 				request.Margins = &recording.RecordingMargins{
 					Start: time.Duration(*settings.StartMargin) * time.Second,
@@ -135,7 +139,7 @@ func (evaluator Evaluator) Run(ctx context.Context) (Result, error) {
 			_, err = evaluator.Store.CreateAutomaticReservation(ctx, candidate.rule.Number, recording.Reservation{
 				ID: id, Version: 1, State: recording.ReservationActive, Program: snapshot,
 				Priority: request.Priority, RequestedFollow: request.RequestedFollow,
-				Disabled: request.Disabled, Margins: request.Margins, Output: request.Output,
+				Disabled: request.Disabled, Margins: request.Margins, Output: request.Output, Components: request.Components,
 				CreatedAt: now, UpdatedAt: now,
 			})
 			if err != nil {
@@ -241,13 +245,17 @@ func prepareRule(rule autoreservation.Rule) preparedRule {
 		return prepared
 	}
 	if search.Fuzzy || len(search.Contents) != 0 || search.ExcludeContents || len(search.Video) != 0 || len(search.Audio) != 0 ||
-		search.CheckRecordedTitle || (settings.Mode != 1 && settings.Mode != 5) || settings.ServiceMode != 0 || settings.Exact || settings.Batch != "" ||
+		search.CheckRecordedTitle || (settings.Mode != 1 && settings.Mode != 5) || settings.Exact || settings.Batch != "" ||
 		settings.Suspend != 0 || settings.Reboot ||
 		settings.Continue || settings.PartialMode != 0 || settings.TunerID != 0 || len(settings.PartialFolders) != 0 {
 		prepared.unavailable = true
 		return prepared
 	}
 	if _, ok := automaticOutputSettings(settings); !ok {
+		prepared.unavailable = true
+		return prepared
+	}
+	if _, ok := automaticComponentMode(settings.ServiceMode); !ok {
 		prepared.unavailable = true
 		return prepared
 	}
@@ -270,6 +278,17 @@ func prepareRule(rule autoreservation.Rule) preparedRule {
 		prepared.keyword, prepared.exclude = keyword, exclude
 	}
 	return prepared
+}
+
+// automaticComponentModeは自動予約に保存したCtrlCmd値を通常予約と同じ選択へ変換する。
+func automaticComponentMode(value uint32) (recording.ComponentMode, bool) {
+	if value&^uint32(0x31) != 0 {
+		return recording.ComponentDefault, false
+	}
+	if value&0x01 == 0 {
+		return recording.ComponentDefault, true
+	}
+	return recording.ExplicitComponentMode(value&0x10 != 0, value&0x20 != 0), true
 }
 
 func automaticOutputSettings(settings autoreservation.RecordingSettings) (recording.OutputSettings, bool) {

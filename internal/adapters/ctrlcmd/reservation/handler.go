@@ -290,6 +290,7 @@ func decodeReservation(reader *codec.Reader, change *recording.ReservationChange
 		NetworkID: networkID, TransportStreamID: transportID, ServiceID: serviceID, EventID: eventID,
 		Start: start, Duration: time.Duration(duration) * time.Second, Priority: settings.priority,
 		RequestedFollow: settings.follow, Disabled: settings.disabled, Margins: settings.margins, Output: settings.output,
+		Components: settings.components,
 	}
 	return nil
 }
@@ -324,11 +325,12 @@ func decodeOneNumber(body []byte, limits codec.Limits, vector bool) (int32, erro
 }
 
 type decodedSettings struct {
-	priority uint8
-	follow   bool
-	disabled bool
-	margins  *recording.RecordingMargins
-	output   recording.OutputSettings
+	priority   uint8
+	follow     bool
+	disabled   bool
+	margins    *recording.RecordingMargins
+	output     recording.OutputSettings
+	components recording.ComponentMode
 }
 
 func decodeSettings(reader *codec.Reader) (decodedSettings, error) {
@@ -347,6 +349,10 @@ func decodeSettings(reader *codec.Reader) (decodedSettings, error) {
 			return err
 		}
 		serviceMode, err := item.U32()
+		if err != nil {
+			return err
+		}
+		settings.components, err = componentModeFromWire(serviceMode)
 		if err != nil {
 			return err
 		}
@@ -399,7 +405,7 @@ func decodeSettings(reader *codec.Reader) (decodedSettings, error) {
 			return err
 		}
 		if (recordingMode != 1 && recordingMode != 5) || settings.priority < 1 || settings.priority > 5 ||
-			followValue > 1 || serviceMode != 0 ||
+			followValue > 1 ||
 			exact != 0 || batch != "" || suspend != 0 || reboot != 0 || useMargins > 1 ||
 			continued != 0 || partial != 0 || tuner != 0 || partialFolders != 0 {
 			return failure(codec.Unsupported, "recording-setting-out-of-profile", 0)
@@ -620,7 +626,11 @@ func writeSettings(writer *codec.Writer, reservation recording.Reservation, limi
 			return err
 		}
 	}
-	if err := writer.U32(0); err != nil {
+	serviceMode, err := componentModeToWire(reservation.Components)
+	if err != nil {
+		return failure(codec.Internal, "invalid-stored-reservation-components", int64(reservation.Number))
+	}
+	if err := writer.U32(serviceMode); err != nil {
 		return err
 	}
 	if err := writer.U8(0); err != nil {
@@ -662,6 +672,35 @@ func writeSettings(writer *codec.Writer, reservation recording.Reservation, limi
 		return err
 	}
 	return writeEmptyVector(writer)
+}
+
+// componentModeFromWireはKonomiTVの個別指定bitを予約domainの固定値へ正規化する。
+func componentModeFromWire(value uint32) (recording.ComponentMode, error) {
+	if value&^uint32(0x31) != 0 {
+		return recording.ComponentDefault, failure(codec.Unsupported, "recording-setting-out-of-profile", 0)
+	}
+	if value&0x01 == 0 {
+		return recording.ComponentDefault, nil
+	}
+	return recording.ExplicitComponentMode(value&0x10 != 0, value&0x20 != 0), nil
+}
+
+// componentModeToWireは保存した既定値または明示指定をKonomiTVのbitへ戻す。
+func componentModeToWire(mode recording.ComponentMode) (uint32, error) {
+	switch mode {
+	case recording.ComponentDefault:
+		return 0, nil
+	case recording.ComponentNeither:
+		return 0x01, nil
+	case recording.ComponentCaptionsOnly:
+		return 0x11, nil
+	case recording.ComponentDataOnly:
+		return 0x21, nil
+	case recording.ComponentBoth:
+		return 0x31, nil
+	default:
+		return 0, failure(codec.Internal, "invalid-stored-reservation-components", 0)
+	}
 }
 
 func reservationFoldersSize(reservation recording.Reservation, limits codec.Limits) (int64, error) {
