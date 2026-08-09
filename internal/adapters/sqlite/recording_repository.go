@@ -442,14 +442,14 @@ func (store *Store) StartAttempt(ctx context.Context, attemptID catalogmodel.ID,
 	return store.transitionAttempt(ctx, attemptID, recording.AttemptClaimed, recording.AttemptStarting, now)
 }
 
-// RecordingStartedはストリーム接続後に、録画処理とファイル区間を一緒に書込み中へ進める。
-func (store *Store) RecordingStarted(ctx context.Context, attemptID catalogmodel.ID, now time.Time) error {
+// RecordingStartedは録画処理とファイル区間を書込み中へ進め、現在の予定終了時刻を返す。
+func (store *Store) RecordingStarted(ctx context.Context, attemptID catalogmodel.ID, now time.Time) (time.Time, error) {
 	if err := validateRecordingUpdate(store, ctx, attemptID, now); err != nil {
-		return err
+		return time.Time{}, err
 	}
 	tx, err := store.writer.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
-		return sanitize("begin-recording-start", err)
+		return time.Time{}, sanitize("begin-recording-start", err)
 	}
 	defer tx.Rollback()
 	nowMS := now.UnixMilli()
@@ -457,23 +457,31 @@ func (store *Store) RecordingStarted(ctx context.Context, attemptID catalogmodel
 		actual_start_utc_ms=?, heartbeat_utc_ms=?, updated_at_utc_ms=? WHERE id=? AND state='STARTING'`,
 		nowMS, nowMS, nowMS, attemptID.Bytes())
 	if err != nil {
-		return sanitize("mark-recording-started", err)
+		return time.Time{}, sanitize("mark-recording-started", err)
 	}
 	if affected(result) != 1 {
-		return ErrAttemptState
+		return time.Time{}, ErrAttemptState
 	}
 	result, err = tx.ExecContext(ctx, `UPDATE recording_segments SET state='WRITING', updated_at_utc_ms=?
 		WHERE attempt_id=? AND ordinal=0 AND state='PLANNED'`, nowMS, attemptID.Bytes())
 	if err != nil {
-		return sanitize("mark-recording-segment-started", err)
+		return time.Time{}, sanitize("mark-recording-segment-started", err)
 	}
 	if affected(result) != 1 {
-		return ErrAttemptState
+		return time.Time{}, ErrAttemptState
+	}
+	var plannedEndMS int64
+	if err := tx.QueryRowContext(ctx, `SELECT planned_end_utc_ms FROM recording_attempts
+		WHERE id=? AND state='RECORDING'`, attemptID.Bytes()).Scan(&plannedEndMS); err != nil {
+		return time.Time{}, sanitize("read-recording-start-end", err)
+	}
+	if plannedEndMS < 0 {
+		return time.Time{}, errors.New("sqlite: corrupt recording planned end")
 	}
 	if err := tx.Commit(); err != nil {
-		return sanitize("commit-recording-start", err)
+		return time.Time{}, sanitize("commit-recording-start", err)
 	}
-	return nil
+	return time.UnixMilli(plannedEndMS).UTC(), nil
 }
 
 // UpdateRecordingProgressは5秒ごとのバイト数と生存時刻を保存し、現在の予定終了時刻を返す。

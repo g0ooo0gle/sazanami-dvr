@@ -20,6 +20,7 @@ func (clock *mutableClock) Now() time.Time { return clock.now }
 type attemptMemory struct {
 	start       time.Time
 	end         time.Time
+	startEnd    time.Time
 	claim       core.ClaimRequest
 	finish      core.FinishRequest
 	progress    []int64
@@ -43,9 +44,12 @@ func (store *attemptMemory) StartAttempt(context.Context, catalogmodel.ID, time.
 	return nil
 }
 
-func (store *attemptMemory) RecordingStarted(context.Context, catalogmodel.ID, time.Time) error {
+func (store *attemptMemory) RecordingStarted(context.Context, catalogmodel.ID, time.Time) (time.Time, error) {
 	store.operations = append(store.operations, "recording")
-	return nil
+	if store.startEnd.IsZero() {
+		store.startEnd = store.end
+	}
+	return store.startEnd, nil
 }
 
 func (store *attemptMemory) UpdateRecordingProgress(_ context.Context, _ catalogmodel.ID, count int64, _ time.Time) (time.Time, error) {
@@ -222,6 +226,32 @@ func TestExecutorUsesExtendedPlannedEnd(t *testing.T) {
 	result, err := executor.Execute(context.Background(), reservationForExecutor(t, start, time.Minute))
 	if err != nil || result.State != core.AttemptSucceeded || result.Reason != core.ReasonCompleted ||
 		reads != 3 || store.finish.ByteCount != 3*188 {
+		t.Fatalf("result=%+v reads=%d finish=%+v err=%v", result, reads, store.finish, err)
+	}
+}
+
+func TestExecutorUsesExtensionObservedBeforeRecordingStart(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	initialEnd := start.Add(time.Minute)
+	extendedEnd := start.Add(2 * time.Minute)
+	clock := &mutableClock{now: start}
+	store := &attemptMemory{start: start, end: initialEnd, startEnd: extendedEnd, progressEnd: extendedEnd}
+	reads := 0
+	lease := &fakeLease{read: func(destination []byte) (int, providerstream.Terminal, error) {
+		reads++
+		for index := 0; index < 188; index++ {
+			destination[index] = 0x47
+		}
+		if reads == 1 {
+			clock.now = initialEnd
+		} else {
+			clock.now = extendedEnd
+		}
+		return 188, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
+	}}
+	executor := executorForTest(t, store, &fakeProvider{lease: lease}, clock, false)
+	result, err := executor.Execute(context.Background(), reservationForExecutor(t, start, time.Minute))
+	if err != nil || result.State != core.AttemptSucceeded || reads != 2 || store.finish.ByteCount != 2*188 {
 		t.Fatalf("result=%+v reads=%d finish=%+v err=%v", result, reads, store.finish, err)
 	}
 }

@@ -145,7 +145,7 @@ func TestReservationFollowExtendsActiveRecording(t *testing.T) {
 				}
 			}
 			if state == recording.AttemptRecording {
-				if err := store.RecordingStarted(context.Background(), attemptID, claim.Now.Add(2*time.Second)); err != nil {
+				if _, err := store.RecordingStarted(context.Background(), attemptID, claim.Now.Add(2*time.Second)); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -220,7 +220,7 @@ func TestReservationFollowDoesNotShortenShiftOrFinalizeActiveRecording(t *testin
 			if err := store.StartAttempt(context.Background(), attemptID, now.Add(time.Second)); err != nil {
 				t.Fatal(err)
 			}
-			if err := store.RecordingStarted(context.Background(), attemptID, now.Add(2*time.Second)); err != nil {
+			if _, err := store.RecordingStarted(context.Background(), attemptID, now.Add(2*time.Second)); err != nil {
 				t.Fatal(err)
 			}
 			if test.finalizing {
@@ -539,7 +539,7 @@ func TestRecordingAttemptLifecycle(t *testing.T) {
 	if err := store.CancelReservation(context.Background(), created.Number, now.Add(time.Second)); !errors.Is(err, ErrReservationUnavailable) {
 		t.Fatalf("録画開始後の取消しが成功しました: %v", err)
 	}
-	if err := store.RecordingStarted(context.Background(), claim.AttemptID, now.Add(2*time.Second)); err != nil {
+	if _, err := store.RecordingStarted(context.Background(), claim.AttemptID, now.Add(2*time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.UpdateRecordingProgress(context.Background(), claim.AttemptID, 376, now.Add(3*time.Second)); err != nil {

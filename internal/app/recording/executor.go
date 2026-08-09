@@ -25,7 +25,7 @@ var reconnectDelays = [...]time.Duration{time.Second, 2 * time.Second, 4 * time.
 type AttemptStore interface {
 	ClaimRecording(context.Context, recording.ClaimRequest) (recording.Attempt, error)
 	StartAttempt(context.Context, catalogmodel.ID, time.Time) error
-	RecordingStarted(context.Context, catalogmodel.ID, time.Time) error
+	RecordingStarted(context.Context, catalogmodel.ID, time.Time) (time.Time, error)
 	UpdateRecordingProgress(context.Context, catalogmodel.ID, int64, time.Time) (time.Time, error)
 	BeginFinalization(context.Context, recording.FinalizeRequest) error
 	MarkFinalPublished(context.Context, catalogmodel.ID, time.Time) error
@@ -159,12 +159,15 @@ func (executor Executor) Execute(ctx context.Context, reservation recording.Rese
 			reconnected = true
 		}
 		if !started {
-			if err := executor.Store.RecordingStarted(ctx, attempt.ID, executor.now()); err != nil {
+			plannedEnd, err := executor.Store.RecordingStarted(ctx, attempt.ID, executor.now())
+			if err != nil || plannedEnd.IsZero() || plannedEnd.Location() != time.UTC ||
+				plannedEnd.Before(copyResult.PlannedEnd) || plannedEnd.After(copyResult.MaximumEnd) {
 				_ = lease.Cancel()
 				_ = lease.Close()
 				_ = partial.Close()
 				return Result{}, errors.New("recording: persist recording start")
 			}
+			copyResult.PlannedEnd = plannedEnd
 			started = true
 		}
 		copyResult = executor.copy(streamContext, lease, partial, attempt, copyResult)
