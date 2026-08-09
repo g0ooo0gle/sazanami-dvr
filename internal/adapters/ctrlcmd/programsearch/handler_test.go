@@ -182,34 +182,17 @@ func TestHandlerReturnsEmptyForDisabledOrEmptyServiceCondition(t *testing.T) {
 	}
 }
 
-func TestHandlerRejectsUnavailableAndInvalidConditionsBeforeReadingSource(t *testing.T) {
+func TestHandlerRejectsInvalidRegexpBeforeReadingSource(t *testing.T) {
 	base := core.SearchCondition{Enabled: true, Services: []core.ServiceRange{{NetworkID: 1, TransportStreamID: 2, ServiceID: 3}}}
-	cases := map[string]core.SearchCondition{}
-	for name, change := range map[string]func(*core.SearchCondition){
-		"fuzzy":            func(value *core.SearchCondition) { value.Fuzzy = true },
-		"contents":         func(value *core.SearchCondition) { value.Contents = []core.ContentRange{{Content: 1}} },
-		"exclude contents": func(value *core.SearchCondition) { value.ExcludeContents = true },
-		"video":            func(value *core.SearchCondition) { value.Video = []uint16{1} },
-		"audio":            func(value *core.SearchCondition) { value.Audio = []uint16{1} },
-	} {
-		value := base
-		change(&value)
-		cases[name] = value
-	}
 	invalidRegex := base
 	invalidRegex.Regex, invalidRegex.Keyword = true, "["
-	cases["invalid regexp"] = invalidRegex
-	for name, search := range cases {
-		t.Run(name, func(t *testing.T) {
-			source := &memorySource{snapshot: channel.Snapshot{Key: "search"}}
-			handler, _ := NewHandler(source, codec.DefaultLimits(), make(chan struct{}, 1))
-			if err := handler.Handle(context.Background(), searchRequest(t, search, ""), io.Discard); err == nil {
-				t.Fatal("未対応または不正な条件が受理されました")
-			}
-			if source.currentReads != 0 || source.reads != 0 {
-				t.Fatalf("current=%d reads=%d", source.currentReads, source.reads)
-			}
-		})
+	source := &memorySource{snapshot: channel.Snapshot{Key: "search"}}
+	handler, _ := NewHandler(source, codec.DefaultLimits(), make(chan struct{}, 1))
+	if err := handler.Handle(context.Background(), searchRequest(t, invalidRegex, ""), io.Discard); err == nil {
+		t.Fatal("不正な正規表現が受理されました")
+	}
+	if source.currentReads != 0 || source.reads != 0 {
+		t.Fatalf("current=%d reads=%d", source.currentReads, source.reads)
 	}
 }
 
@@ -749,7 +732,65 @@ func responseEventIDs(t *testing.T, response []byte) []uint16 {
 			}); err != nil {
 				return err
 			}
-			for range 6 {
+			if err := item.Structure(func(value *codec.Reader) error {
+				if value.Remaining() == 0 {
+					return nil
+				}
+				_, err := value.String()
+				return err
+			}); err != nil {
+				return err
+			}
+			if err := item.Structure(func(value *codec.Reader) error {
+				if value.Remaining() == 0 {
+					return nil
+				}
+				return value.Vector(8, 64, func(element *codec.Reader, _ int) error {
+					return element.Structure(func(fields *codec.Reader) error {
+						for range 4 {
+							if _, err := fields.U8(); err != nil {
+								return err
+							}
+						}
+						return nil
+					})
+				})
+			}); err != nil {
+				return err
+			}
+			if err := item.Structure(func(value *codec.Reader) error {
+				if value.Remaining() == 0 {
+					return nil
+				}
+				for range 3 {
+					if _, err := value.U8(); err != nil {
+						return err
+					}
+				}
+				_, err := value.String()
+				return err
+			}); err != nil {
+				return err
+			}
+			if err := item.Structure(func(value *codec.Reader) error {
+				if value.Remaining() == 0 {
+					return nil
+				}
+				return value.Vector(19, 16, func(element *codec.Reader, _ int) error {
+					return element.Structure(func(fields *codec.Reader) error {
+						for range 9 {
+							if _, err := fields.U8(); err != nil {
+								return err
+							}
+						}
+						_, err := fields.String()
+						return err
+					})
+				})
+			}); err != nil {
+				return err
+			}
+			for range 2 {
 				if err := item.Structure(func(*codec.Reader) error { return nil }); err != nil {
 					return err
 				}

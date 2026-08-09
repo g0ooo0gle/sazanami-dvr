@@ -18,9 +18,6 @@ type preparedCondition struct {
 }
 
 func prepare(search core.SearchCondition) (preparedCondition, error) {
-	if search.Fuzzy || search.ExcludeContents || len(search.Contents) != 0 || len(search.Video) != 0 || len(search.Audio) != 0 {
-		return preparedCondition{}, failure(codec.Unsupported, "program-search-condition-unavailable", 0)
-	}
 	prepared := preparedCondition{search: search}
 	if !search.Regex {
 		return prepared, nil
@@ -48,20 +45,49 @@ func compile(value string, caseSensitive bool) (*regexp.Regexp, error) {
 
 func (prepared preparedCondition) matches(program catalogmodel.CurrentProgram) bool {
 	return prepared.search.Enabled && prepared.matchesText(program.Material) && prepared.matchesDate(program.Material) &&
-		prepared.matchesDuration(program.Material) && prepared.matchesFreeAccess(program.Material)
+		prepared.matchesDuration(program.Material) && prepared.matchesFreeAccess(program.Material) &&
+		prepared.matchesContents(program.Material.Metadata) && prepared.matchesComponents(program.Material.Metadata)
 }
 
 func (prepared preparedCondition) matchesText(material catalogmodel.RevisionMaterial) bool {
-	target := ""
+	var targetBuilder strings.Builder
 	if material.Title != nil {
-		target = *material.Title
+		targetBuilder.WriteString(*material.Title)
 	}
 	if !prepared.search.TitleOnly && material.Description != nil {
-		target += "\n" + *material.Description
+		targetBuilder.WriteByte('\n')
+		targetBuilder.WriteString(*material.Description)
 	}
+	if !prepared.search.TitleOnly {
+		for _, item := range material.Metadata.Extended {
+			targetBuilder.WriteByte('\n')
+			targetBuilder.WriteString(item.Heading)
+			targetBuilder.WriteByte('\n')
+			targetBuilder.WriteString(item.Body)
+		}
+	}
+	target := targetBuilder.String()
 	if prepared.search.Regex {
 		return (prepared.keyword == nil || prepared.keyword.MatchString(target)) &&
 			(prepared.exclude == nil || !prepared.exclude.MatchString(target))
+	}
+	if prepared.search.Fuzzy {
+		normalizedTarget := normalizeFuzzyText(target, prepared.search.CaseSensitive)
+		for _, word := range strings.Fields(normalizeFuzzyText(prepared.search.Keyword, prepared.search.CaseSensitive)) {
+			if !fuzzyContains(normalizedTarget, word) {
+				return false
+			}
+		}
+		exclude := prepared.search.Exclude
+		if !prepared.search.CaseSensitive {
+			target, exclude = strings.ToLower(target), strings.ToLower(exclude)
+		}
+		for _, word := range strings.Fields(exclude) {
+			if strings.Contains(target, word) {
+				return false
+			}
+		}
+		return true
 	}
 	keyword, exclude := prepared.search.Keyword, prepared.search.Exclude
 	if !prepared.search.CaseSensitive {
@@ -78,6 +104,66 @@ func (prepared preparedCondition) matchesText(material catalogmodel.RevisionMate
 		}
 	}
 	return true
+}
+
+func (prepared preparedCondition) matchesContents(metadata catalogmodel.ProgramMetadata) bool {
+	if len(prepared.search.Contents) == 0 {
+		return true
+	}
+	matched := false
+	for _, condition := range prepared.search.Contents {
+		level1, level2 := uint8(condition.Content), uint8(condition.Content>>8)
+		user1, user2 := uint8(condition.User), uint8(condition.User>>8)
+		if level1 == 0xff && level2 == 0xff {
+			matched = len(metadata.Genres) == 0
+		} else {
+			for _, genre := range metadata.Genres {
+				if genre.Level1 != level1 || level2 != 0xff && genre.Level2 != level2 {
+					continue
+				}
+				if level1 == 0x0e && (genre.User1 != user1 || genre.User2 != user2) {
+					continue
+				}
+				matched = true
+				break
+			}
+		}
+		if matched {
+			break
+		}
+	}
+	return matched != prepared.search.ExcludeContents
+}
+
+func (prepared preparedCondition) matchesComponents(metadata catalogmodel.ProgramMetadata) bool {
+	if len(prepared.search.Video) > 0 {
+		if metadata.Video == nil || !containsComponent(prepared.search.Video, metadata.Video.StreamContent, metadata.Video.ComponentType) {
+			return false
+		}
+	}
+	if len(prepared.search.Audio) > 0 {
+		matched := false
+		for _, audio := range metadata.Audios {
+			if containsComponent(prepared.search.Audio, 2, audio.ComponentType) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	return true
+}
+
+func containsComponent(conditions []uint16, streamContent, componentType uint8) bool {
+	packed := uint16(streamContent)<<8 | uint16(componentType)
+	for _, condition := range conditions {
+		if condition == packed {
+			return true
+		}
+	}
+	return false
 }
 
 func (prepared preparedCondition) matchesDate(material catalogmodel.RevisionMaterial) bool {
