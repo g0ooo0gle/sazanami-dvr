@@ -86,6 +86,17 @@ func TestTSComponentFilterFourSelectionsAndPMTUpdate(t *testing.T) {
 	if containsPID(pids, 0x102) || containsPID(pids, 0x103) || containsPID(pids, 0x105) || containsPID(pids, 0x106) {
 		t.Fatalf("更新後の除外PIDが残りました: %#v", pids)
 	}
+	wantContinuity := byte(3)
+	for offset := 0; offset < len(file.Bytes()); offset += tsPacketBytes {
+		packet := file.Bytes()[offset : offset+tsPacketBytes]
+		if packetPID(packet) != 0x100 {
+			continue
+		}
+		if packet[3]&0x0f != wantContinuity {
+			t.Fatalf("更新PMT continuity=%d want=%d", packet[3]&0x0f, wantContinuity)
+		}
+		wantContinuity = (wantContinuity + 1) & 0x0f
+	}
 }
 
 func TestTSComponentFilterHandlesMultiPacketPMT(t *testing.T) {
