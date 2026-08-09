@@ -6,6 +6,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -189,6 +191,97 @@ func TestStreamReadTimeoutDisconnectAndCancel(t *testing.T) {
 	})
 }
 
+func TestStreamCanOpenAgainAfterTemporaryFailures(t *testing.T) {
+	requests := atomic.Int32{}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch requests.Add(1) {
+		case 1:
+			http.Error(writer, "private body", http.StatusServiceUnavailable)
+		case 2:
+			writer.Header().Set("Content-Type", "video/MP2T")
+			writer.Header().Set("Content-Length", "376")
+			writer.WriteHeader(http.StatusOK)
+			_, _ = writer.Write(bytes.Repeat([]byte{0x47}, 188))
+		default:
+			writer.Header().Set("Content-Type", "video/MP2T")
+			writer.WriteHeader(http.StatusOK)
+			_, _ = writer.Write(bytes.Repeat([]byte{0x47}, 188))
+			writer.(http.Flusher).Flush()
+			<-request.Context().Done()
+		}
+	}))
+	defer server.Close()
+	adapter, err := NewStream(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adapter.OpenStream(context.Background(), validStreamRequest("1003")); !provider.IsReason(err, provider.ReasonUnavailable) {
+		t.Fatalf("5xx err=%v", err)
+	}
+	lease, err := adapter.OpenStream(context.Background(), validStreamRequest("1003"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	read, terminal, err := streamTestReadTerminal(lease)
+	if read != 188 || !terminal.Done || err == nil {
+		t.Fatalf("read=%d terminal=%+v err=%v", read, terminal, err)
+	}
+	if err := lease.Close(); err != nil {
+		t.Fatal(err)
+	}
+	lease, err = adapter.OpenStream(context.Background(), validStreamRequest("1003"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	read, terminal, err = lease.Read(context.Background(), make([]byte, 188))
+	if err != nil || read != 188 || terminal.Done {
+		t.Fatalf("read=%d terminal=%+v err=%v", read, terminal, err)
+	}
+	_ = lease.Cancel()
+	_ = lease.Close()
+	if requests.Load() != 3 {
+		t.Fatalf("requests=%d", requests.Load())
+	}
+}
+
+func TestStreamRepeatedDisconnectDoesNotLeakResources(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "video/MP2T")
+		writer.Header().Set("Content-Length", "376")
+		writer.WriteHeader(http.StatusOK)
+		_, _ = writer.Write(bytes.Repeat([]byte{0x47}, 188))
+	}))
+	defer server.Close()
+	adapter, err := NewStream(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeGoroutines := runtime.NumGoroutine()
+	beforeFDs, measureFDs := streamTestFDCount()
+	for cycle := 0; cycle < 100; cycle++ {
+		lease, err := adapter.OpenStream(context.Background(), validStreamRequest("1003"))
+		if err != nil {
+			t.Fatalf("cycle=%d open=%v", cycle, err)
+		}
+		read, terminal, err := streamTestReadTerminal(lease)
+		if read != 188 || !terminal.Done || err == nil {
+			t.Fatalf("cycle=%d read=%d terminal=%+v err=%v", cycle, read, terminal, err)
+		}
+		if err := lease.Close(); err != nil {
+			t.Fatalf("cycle=%d close=%v", cycle, err)
+		}
+	}
+	adapter.CloseIdleConnections()
+	runtime.GC()
+	time.Sleep(50 * time.Millisecond)
+	if after := runtime.NumGoroutine(); after > beforeGoroutines+8 {
+		t.Fatalf("goroutines before=%d after=%d", beforeGoroutines, after)
+	}
+	if after, supported := streamTestFDCount(); measureFDs && supported && after > beforeFDs+4 {
+		t.Fatalf("file descriptors before=%d after=%d", beforeFDs, after)
+	}
+}
+
 func TestStreamRequestValidationAndBufferCap(t *testing.T) {
 	adapter, err := NewStream("http://127.0.0.1:9")
 	if err != nil {
@@ -210,4 +303,24 @@ func validStreamRequest(id string) providerstream.Request {
 		Target: provider.TuningTarget{Opaque: id}, Usage: providerstream.UsageRecording,
 		PriorityPolicy: "0", RequireDescrambled: true, CorrelationID: "recording-test",
 	}
+}
+
+func streamTestFDCount() (int, bool) {
+	entries, err := os.ReadDir("/dev/fd")
+	if err != nil {
+		return 0, false
+	}
+	return len(entries), true
+}
+
+func streamTestReadTerminal(lease providerstream.Lease) (int, providerstream.Terminal, error) {
+	total := 0
+	for range 2 {
+		read, terminal, err := lease.Read(context.Background(), make([]byte, 376))
+		total += read
+		if terminal.Done || err != nil {
+			return total, terminal, err
+		}
+	}
+	return total, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
 }

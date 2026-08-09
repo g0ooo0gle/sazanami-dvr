@@ -68,6 +68,10 @@ func TestFilePlanAndRecordingRequests(t *testing.T) {
 	if err := finish.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	finish.Reason = ReasonCompletedAfterReconnect
+	if err := finish.Validate(); err != nil {
+		t.Fatal(err)
+	}
 	finish.ByteCount = 187
 	if err := finish.Validate(); err == nil {
 		t.Fatal("188 bytes未満の成功が受理されました")

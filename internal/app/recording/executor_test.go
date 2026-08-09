@@ -3,6 +3,7 @@ package recording
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -17,13 +18,14 @@ type mutableClock struct{ now time.Time }
 func (clock *mutableClock) Now() time.Time { return clock.now }
 
 type attemptMemory struct {
-	start      time.Time
-	end        time.Time
-	claim      core.ClaimRequest
-	finish     core.FinishRequest
-	progress   []int64
-	operations []string
-	finishErr  error
+	start       time.Time
+	end         time.Time
+	claim       core.ClaimRequest
+	finish      core.FinishRequest
+	progress    []int64
+	operations  []string
+	finishErr   error
+	progressErr error
 }
 
 func (store *attemptMemory) ClaimRecording(_ context.Context, request core.ClaimRequest) (core.Attempt, error) {
@@ -48,7 +50,7 @@ func (store *attemptMemory) RecordingStarted(context.Context, catalogmodel.ID, t
 func (store *attemptMemory) UpdateRecordingProgress(_ context.Context, _ catalogmodel.ID, count int64, _ time.Time) error {
 	store.progress = append(store.progress, count)
 	store.operations = append(store.operations, "progress")
-	return nil
+	return store.progressErr
 }
 
 func (store *attemptMemory) BeginFinalization(context.Context, core.FinalizeRequest) error {
@@ -96,30 +98,59 @@ func (file *fakePartial) Close() error {
 }
 
 type fakeProvider struct {
-	lease   providerstream.Lease
-	err     error
-	opens   int
-	request providerstream.Request
+	lease      providerstream.Lease
+	err        error
+	leases     []providerstream.Lease
+	errors     []error
+	opens      int
+	request    providerstream.Request
+	requests   []providerstream.Request
+	operations *[]string
 }
 
 func (stream *fakeProvider) OpenStream(_ context.Context, request providerstream.Request) (providerstream.Lease, error) {
+	index := stream.opens
 	stream.opens++
 	stream.request = request
+	stream.requests = append(stream.requests, request)
+	if stream.operations != nil {
+		*stream.operations = append(*stream.operations, "open")
+	}
+	if index < len(stream.errors) && stream.errors[index] != nil {
+		return nil, stream.errors[index]
+	}
+	if index < len(stream.leases) && stream.leases[index] != nil {
+		return stream.leases[index], nil
+	}
 	return stream.lease, stream.err
 }
 
 type fakeLease struct {
-	read   func([]byte) (int, providerstream.Terminal, error)
-	cancel int
-	close  int
+	read       func([]byte) (int, providerstream.Terminal, error)
+	cancel     int
+	close      int
+	operations *[]string
 }
 
 func (lease *fakeLease) Read(_ context.Context, destination []byte) (int, providerstream.Terminal, error) {
 	return lease.read(destination)
 }
 
-func (lease *fakeLease) Cancel() error { lease.cancel++; return nil }
-func (lease *fakeLease) Close() error  { lease.close++; return nil }
+func (lease *fakeLease) Cancel() error {
+	lease.cancel++
+	if lease.operations != nil {
+		*lease.operations = append(*lease.operations, "lease-cancel")
+	}
+	return nil
+}
+
+func (lease *fakeLease) Close() error {
+	lease.close++
+	if lease.operations != nil {
+		*lease.operations = append(*lease.operations, "lease-close")
+	}
+	return nil
+}
 
 func TestExecutorPublishesOnlyAfterPlannedEnd(t *testing.T) {
 	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
@@ -155,10 +186,10 @@ func TestExecutorPublishesOnlyAfterPlannedEnd(t *testing.T) {
 	}
 }
 
-func TestExecutorKeepsEarlyStreamAsPartial(t *testing.T) {
+func TestExecutorKeepsEarlyStreamAsPartialWhenLessThanReconnectWindowRemains(t *testing.T) {
 	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
 	clock := &mutableClock{now: start}
-	store := &attemptMemory{start: start, end: start.Add(time.Minute)}
+	store := &attemptMemory{start: start, end: start.Add(time.Minute - time.Nanosecond)}
 	lease := &fakeLease{read: func(destination []byte) (int, providerstream.Terminal, error) {
 		for index := 0; index < 188; index++ {
 			destination[index] = 0x47
@@ -194,15 +225,231 @@ func TestExecutorDoesNotTreatShortWriteAsUsefulRecording(t *testing.T) {
 	}
 }
 
-func TestExecutorRecordsOpenTimeoutWithoutRetry(t *testing.T) {
+func TestExecutorRecordsOpenTimeoutWithoutRetryInsideReconnectWindow(t *testing.T) {
 	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
 	clock := &mutableClock{now: start}
-	store := &attemptMemory{start: start, end: start.Add(time.Minute)}
+	store := &attemptMemory{start: start, end: start.Add(59 * time.Second)}
 	stream := &fakeProvider{err: provider.NewFailure(provider.ReasonTimeout, "test")}
 	executor := executorForTest(t, store, stream, clock, false)
 	result, err := executor.Execute(context.Background(), reservationForExecutor(t, start, time.Minute))
 	if err != nil || result.State != core.AttemptFailed || result.Reason != core.ReasonStreamTimeout || stream.opens != 1 ||
 		store.finish.Availability != core.AvailabilityPartial {
+		t.Fatalf("result=%+v opens=%d err=%v", result, stream.opens, err)
+	}
+}
+
+func TestExecutorReconnectsUpToThreeTimesAndKeepsOneRecording(t *testing.T) {
+	for additionalConnections := 1; additionalConnections <= len(reconnectDelays); additionalConnections++ {
+		t.Run(fmt.Sprintf("additional-%d", additionalConnections), func(t *testing.T) {
+			start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+			clock := &mutableClock{now: start}
+			store := &attemptMemory{start: start, end: start.Add(2 * time.Minute)}
+			leases := make([]providerstream.Lease, additionalConnections+1)
+			for index := 0; index < additionalConnections; index++ {
+				leases[index] = &fakeLease{read: func(destination []byte) (int, providerstream.Terminal, error) {
+					copy(destination, bytesOf(0x47, minimumUsefulTS))
+					return minimumUsefulTS, providerstream.Terminal{Done: true, Reason: providerstream.TerminalEarlyEOF},
+						provider.NewFailure(provider.ReasonEarlyEOF, "test")
+				}}
+			}
+			leases[additionalConnections] = &fakeLease{read: func(destination []byte) (int, providerstream.Terminal, error) {
+				copy(destination, bytesOf(0x47, minimumUsefulTS))
+				clock.now = store.end
+				return minimumUsefulTS, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
+			}}
+			stream := &fakeProvider{leases: leases}
+			executor := executorForTest(t, store, stream, clock, false)
+			var waits []time.Duration
+			executor.Wait = func(_ context.Context, delay time.Duration) error {
+				waits = append(waits, delay)
+				return nil
+			}
+
+			result, err := executor.Execute(context.Background(), reservationForExecutor(t, start, 2*time.Minute))
+			if err != nil || result.State != core.AttemptSucceeded || result.Reason != core.ReasonCompletedAfterReconnect {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+			if stream.opens != additionalConnections+1 || store.finish.ByteCount != int64(additionalConnections+1)*minimumUsefulTS ||
+				countString(store.operations, "create") != 1 || countString(store.operations, "recording") != 1 {
+				t.Fatalf("opens=%d finish=%+v operations=%v", stream.opens, store.finish, store.operations)
+			}
+			if !equalDurations(waits, reconnectDelays[:additionalConnections]) {
+				t.Fatalf("waits=%v", waits)
+			}
+			seen := make(map[string]bool)
+			for index, request := range stream.requests {
+				if request.CorrelationID == "" || seen[request.CorrelationID] {
+					t.Fatalf("correlation[%d]=%q", index, request.CorrelationID)
+				}
+				seen[request.CorrelationID] = true
+			}
+			for index, item := range leases {
+				lease := item.(*fakeLease)
+				if lease.cancel != 1 || lease.close != 1 {
+					t.Fatalf("lease[%d] cancel=%d close=%d", index, lease.cancel, lease.close)
+				}
+			}
+		})
+	}
+}
+
+func TestExecutorExhaustsReconnectLimit(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	clock := &mutableClock{now: start}
+	store := &attemptMemory{start: start, end: start.Add(2 * time.Minute)}
+	failure := provider.NewFailure(provider.ReasonUnavailable, "test")
+	stream := &fakeProvider{errors: []error{failure, failure, failure, failure}}
+	executor := executorForTest(t, store, stream, clock, false)
+	var waits []time.Duration
+	executor.Wait = func(_ context.Context, delay time.Duration) error {
+		waits = append(waits, delay)
+		return nil
+	}
+
+	result, err := executor.Execute(context.Background(), reservationForExecutor(t, start, 2*time.Minute))
+	if err != nil || result.State != core.AttemptFailed || result.Reason != core.ReasonStreamReconnectExhausted ||
+		stream.opens != 4 || countString(store.operations, "recording") != 0 ||
+		!equalDurations(waits, reconnectDelays[:]) {
+		t.Fatalf("result=%+v opens=%d waits=%v operations=%v err=%v", result, stream.opens, waits, store.operations, err)
+	}
+}
+
+func TestExecutorReconnectsAfterZeroProgressAndClosesLeaseBeforeWaiting(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	clock := &mutableClock{now: start}
+	store := &attemptMemory{start: start, end: start.Add(2 * time.Minute)}
+	var order []string
+	first := &fakeLease{operations: &order, read: func([]byte) (int, providerstream.Terminal, error) {
+		return 0, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
+	}}
+	second := &fakeLease{operations: &order, read: func(destination []byte) (int, providerstream.Terminal, error) {
+		copy(destination, bytesOf(0x47, minimumUsefulTS))
+		clock.now = store.end
+		return minimumUsefulTS, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
+	}}
+	stream := &fakeProvider{leases: []providerstream.Lease{first, second}, operations: &order}
+	executor := executorForTest(t, store, stream, clock, false)
+	executor.Wait = func(context.Context, time.Duration) error {
+		order = append(order, "wait")
+		return nil
+	}
+
+	result, err := executor.Execute(context.Background(), reservationForExecutor(t, start, 2*time.Minute))
+	wantPrefix := []string{"open", "lease-cancel", "lease-close", "wait", "open"}
+	if err != nil || result.Reason != core.ReasonCompletedAfterReconnect || len(order) < len(wantPrefix) ||
+		!equalStrings(order[:len(wantPrefix)], wantPrefix) {
+		t.Fatalf("result=%+v order=%v err=%v", result, order, err)
+	}
+}
+
+func TestExecutorAllowsReconnectAtExactlySixtySeconds(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	clock := &mutableClock{now: start}
+	store := &attemptMemory{start: start, end: start.Add(minimumReconnectRemaining)}
+	lease := &fakeLease{read: func(destination []byte) (int, providerstream.Terminal, error) {
+		copy(destination, bytesOf(0x47, minimumUsefulTS))
+		clock.now = store.end
+		return minimumUsefulTS, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
+	}}
+	stream := &fakeProvider{
+		leases: []providerstream.Lease{nil, lease},
+		errors: []error{provider.NewFailure(provider.ReasonTimeout, "test"), nil},
+	}
+	executor := executorForTest(t, store, stream, clock, false)
+	result, err := executor.Execute(context.Background(), reservationForExecutor(t, start, time.Minute))
+	if err != nil || result.Reason != core.ReasonCompletedAfterReconnect || stream.opens != 2 {
+		t.Fatalf("result=%+v opens=%d err=%v", result, stream.opens, err)
+	}
+}
+
+func TestExecutorCancelsReconnectWaitWithParent(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	clock := &mutableClock{now: start}
+	store := &attemptMemory{start: start, end: start.Add(2 * time.Minute)}
+	stream := &fakeProvider{err: provider.NewFailure(provider.ReasonUnavailable, "test")}
+	executor := executorForTest(t, store, stream, clock, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	executor.Wait = func(waitCtx context.Context, _ time.Duration) error {
+		cancel()
+		return waitCtx.Err()
+	}
+
+	result, err := executor.Execute(ctx, reservationForExecutor(t, start, 2*time.Minute))
+	if err != nil || result.State != core.AttemptCancelled || result.Reason != core.ReasonProcessShutdown || stream.opens != 1 {
+		t.Fatalf("result=%+v opens=%d err=%v", result, stream.opens, err)
+	}
+}
+
+func TestExecutorDoesNotReconnectNonTransientFailures(t *testing.T) {
+	tests := []struct {
+		reason provider.Reason
+		want   core.TerminalReason
+	}{
+		{reason: provider.ReasonNotFound, want: core.ReasonStreamNotFound},
+		{reason: provider.ReasonRejected, want: core.ReasonStreamUnavailable},
+		{reason: provider.ReasonMalformed, want: core.ReasonStreamUnavailable},
+		{reason: provider.ReasonCancelled, want: core.ReasonStreamCancelled},
+		{reason: provider.ReasonNoTuner, want: core.ReasonStreamUnavailable},
+	}
+	for _, test := range tests {
+		t.Run(string(test.reason), func(t *testing.T) {
+			start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+			clock := &mutableClock{now: start}
+			store := &attemptMemory{start: start, end: start.Add(2 * time.Minute)}
+			stream := &fakeProvider{err: provider.NewFailure(test.reason, "test")}
+			executor := executorForTest(t, store, stream, clock, false)
+			result, err := executor.Execute(context.Background(), reservationForExecutor(t, start, 2*time.Minute))
+			if err != nil || result.Reason != test.want || stream.opens != 1 {
+				t.Fatalf("result=%+v opens=%d err=%v", result, stream.opens, err)
+			}
+		})
+	}
+}
+
+func TestRetryableStreamFailureUsesStableProviderAndTerminalReasons(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		terminal providerstream.Terminal
+		want     bool
+	}{
+		{name: "unavailable", err: provider.NewFailure(provider.ReasonUnavailable, "test"), want: true},
+		{name: "timeout", err: provider.NewFailure(provider.ReasonTimeout, "test"), want: true},
+		{name: "early eof", err: provider.NewFailure(provider.ReasonEarlyEOF, "test"), want: true},
+		{name: "clean end", terminal: providerstream.Terminal{Done: true, Reason: providerstream.TerminalCleanEnd}, want: true},
+		{name: "peer", terminal: providerstream.Terminal{Done: true, Reason: providerstream.TerminalPeer}, want: true},
+		{name: "rejected", err: provider.NewFailure(provider.ReasonRejected, "test")},
+		{name: "not found", err: provider.NewFailure(provider.ReasonNotFound, "test")},
+		{name: "malformed", err: provider.NewFailure(provider.ReasonMalformed, "test")},
+		{name: "cancelled", terminal: providerstream.Terminal{Done: true, Reason: providerstream.TerminalCancelled}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := retryableStreamFailure(test.err, test.terminal); got != test.want {
+				t.Fatalf("retryable=%v want=%v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestExecutorDoesNotReconnectProgressDatabaseFailure(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	clock := &mutableClock{now: start}
+	store := &attemptMemory{start: start, end: start.Add(2 * time.Minute), progressErr: errors.New("database failed")}
+	first := &fakeLease{read: func(destination []byte) (int, providerstream.Terminal, error) {
+		copy(destination, bytesOf(0x47, minimumUsefulTS))
+		return minimumUsefulTS, providerstream.Terminal{Done: true, Reason: providerstream.TerminalEarlyEOF},
+			provider.NewFailure(provider.ReasonEarlyEOF, "test")
+	}}
+	second := &fakeLease{read: func(destination []byte) (int, providerstream.Terminal, error) {
+		copy(destination, bytesOf(0x47, minimumUsefulTS))
+		clock.now = clock.now.Add(progressInterval)
+		return minimumUsefulTS, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
+	}}
+	stream := &fakeProvider{leases: []providerstream.Lease{first, second}}
+	executor := executorForTest(t, store, stream, clock, false)
+	result, err := executor.Execute(context.Background(), reservationForExecutor(t, start, 2*time.Minute))
+	if err == nil || result != (Result{}) || stream.opens != 2 {
 		t.Fatalf("result=%+v opens=%d err=%v", result, stream.opens, err)
 	}
 }
@@ -320,6 +567,7 @@ func executorForTest(t *testing.T, store *attemptMemory, stream *fakeProvider, c
 		WithDeadline: func(ctx context.Context, _ time.Time) (context.Context, context.CancelFunc) {
 			return context.WithCancel(ctx)
 		},
+		Wait: func(context.Context, time.Duration) error { return nil },
 	}
 }
 
@@ -344,4 +592,26 @@ func equalStrings(left, right []string) bool {
 		}
 	}
 	return true
+}
+
+func equalDurations(left, right []time.Duration) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func countString(values []string, target string) int {
+	count := 0
+	for _, value := range values {
+		if value == target {
+			count++
+		}
+	}
+	return count
 }
