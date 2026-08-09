@@ -17,7 +17,15 @@ type queueStore struct {
 	queried chan struct{}
 }
 
-func (store *queueStore) NextActiveReservation(context.Context) (*core.Reservation, error) {
+func (store *queueStore) ExpireOneDisabledReservation(context.Context, time.Time) (bool, error) {
+	return false, nil
+}
+
+func (store *queueStore) NextDisabledReservationDeadline(context.Context, time.Time) (*time.Time, error) {
+	return nil, nil
+}
+
+func (store *queueStore) NextActiveReservation(context.Context, time.Time) (*core.Reservation, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	store.queries++
@@ -97,6 +105,71 @@ type manualTimer struct{ channel chan time.Time }
 func (timer *manualTimer) C() <-chan time.Time { return timer.channel }
 func (timer *manualTimer) Stop() bool          { return true }
 
+type disabledDeadlineStore struct {
+	deadline time.Time
+	expired  bool
+	calls    chan struct{}
+}
+
+func (store *disabledDeadlineStore) ExpireOneDisabledReservation(_ context.Context, now time.Time) (bool, error) {
+	if !store.expired && !now.Before(store.deadline) {
+		store.expired = true
+		return true, nil
+	}
+	return false, nil
+}
+
+func (store *disabledDeadlineStore) NextDisabledReservationDeadline(context.Context, time.Time) (*time.Time, error) {
+	if store.expired {
+		select {
+		case store.calls <- struct{}{}:
+		default:
+		}
+		return nil, nil
+	}
+	deadline := store.deadline
+	return &deadline, nil
+}
+
+func (*disabledDeadlineStore) NextActiveReservation(context.Context, time.Time) (*core.Reservation, error) {
+	return nil, nil
+}
+
+func TestSchedulerWakesForDisabledReservationDeadline(t *testing.T) {
+	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+	clock := &manualScheduleClock{now: now, created: make(chan struct{}, 1)}
+	store := &disabledDeadlineStore{deadline: now.Add(time.Minute), calls: make(chan struct{}, 1)}
+	scheduler, err := NewScheduler(store, &schedulerExecutor{clock: clock}, clock, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+	select {
+	case <-clock.created:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("無効予約の終了timerが作られませんでした")
+	}
+	if clock.duration != time.Minute {
+		cancel()
+		t.Fatalf("duration=%s", clock.duration)
+	}
+	clock.now = store.deadline
+	clock.timer.channel <- store.deadline
+	select {
+	case <-store.calls:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("期限後に無効予約が終了しませんでした")
+	}
+	cancel()
+	if err := <-done; err != nil || !store.expired {
+		t.Fatalf("expired=%v err=%v", store.expired, err)
+	}
+}
+
 func TestSchedulerUsesOneSlotAndLateStartRules(t *testing.T) {
 	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
 	clock := &manualScheduleClock{now: start}
@@ -130,6 +203,57 @@ func TestSchedulerUsesOneSlotAndLateStartRules(t *testing.T) {
 	if len(executor.execute) != 1 || len(executor.miss) != 2 ||
 		executor.miss[0] != core.ReasonRecordingSlotUnavailable || executor.miss[1] != core.ReasonLateStartExpired {
 		t.Fatalf("execute=%d miss=%v", len(executor.execute), executor.miss)
+	}
+}
+
+func TestSchedulerUsesPlannedEndForMinimumRemainingTime(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	reservation := reservationForExecutor(t, start, 4*time.Minute)
+	for _, test := range []struct {
+		name      string
+		remaining time.Duration
+		wantRun   bool
+	}{
+		{name: "sixty seconds", remaining: 60 * time.Second, wantRun: true},
+		{name: "one second under", remaining: 59 * time.Second, wantRun: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clock := &manualScheduleClock{now: reservation.PlannedEnd().Add(-test.remaining)}
+			store := &queueStore{items: []core.Reservation{reservation}, queried: make(chan struct{}, 4)}
+			executor := &schedulerExecutor{clock: clock, executed: make(chan struct{}, 1)}
+			scheduler, err := NewScheduler(store, executor, clock, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- scheduler.Run(ctx) }()
+			if test.wantRun {
+				select {
+				case <-executor.executed:
+				case <-time.After(time.Second):
+					cancel()
+					t.Fatal("残り60秒の予約が始まりませんでした")
+				}
+			} else {
+				for range 2 {
+					select {
+					case <-store.queried:
+					case <-time.After(time.Second):
+						cancel()
+						t.Fatal("残り時間不足が判定されませんでした")
+					}
+				}
+			}
+			cancel()
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			if test.wantRun && len(executor.execute) != 1 || !test.wantRun &&
+				(len(executor.miss) != 1 || executor.miss[0] != core.ReasonLateStartExpired) {
+				t.Fatalf("execute=%d miss=%v", len(executor.execute), executor.miss)
+			}
+		})
 	}
 }
 
@@ -172,7 +296,15 @@ type schedulerErrorStore struct {
 	before func()
 }
 
-func (store schedulerErrorStore) NextActiveReservation(context.Context) (*core.Reservation, error) {
+func (store schedulerErrorStore) ExpireOneDisabledReservation(context.Context, time.Time) (bool, error) {
+	return false, nil
+}
+
+func (store schedulerErrorStore) NextDisabledReservationDeadline(context.Context, time.Time) (*time.Time, error) {
+	return nil, nil
+}
+
+func (store schedulerErrorStore) NextActiveReservation(context.Context, time.Time) (*core.Reservation, error) {
 	if store.before != nil {
 		store.before()
 	}
@@ -210,7 +342,15 @@ type futureStore struct {
 	queries int
 }
 
-func (store *futureStore) NextActiveReservation(context.Context) (*core.Reservation, error) {
+func (store *futureStore) ExpireOneDisabledReservation(context.Context, time.Time) (bool, error) {
+	return false, nil
+}
+
+func (store *futureStore) NextDisabledReservationDeadline(context.Context, time.Time) (*time.Time, error) {
+	return nil, nil
+}
+
+func (store *futureStore) NextActiveReservation(context.Context, time.Time) (*core.Reservation, error) {
 	store.queries++
 	if store.queries > 2 {
 		return nil, nil
@@ -237,11 +377,11 @@ func TestSchedulerUsesTimerAndRechecksDatabase(t *testing.T) {
 		cancel()
 		t.Fatal("開始時刻のtimerが作られませんでした")
 	}
-	if clock.duration != time.Hour-startupLeadTime {
+	if clock.duration != time.Hour-core.DefaultStartMargin {
 		cancel()
 		t.Fatalf("timer=%s", clock.duration)
 	}
-	clock.now = start.Add(-startupLeadTime)
+	clock.now = start.Add(-core.DefaultStartMargin)
 	clock.timer.channel <- clock.now
 	select {
 	case <-executor.executed:
@@ -425,7 +565,15 @@ type pendingScheduleStore struct {
 	items []core.Reservation
 }
 
-func (store *pendingScheduleStore) NextActiveReservation(context.Context) (*core.Reservation, error) {
+func (store *pendingScheduleStore) ExpireOneDisabledReservation(context.Context, time.Time) (bool, error) {
+	return false, nil
+}
+
+func (store *pendingScheduleStore) NextDisabledReservationDeadline(context.Context, time.Time) (*time.Time, error) {
+	return nil, nil
+}
+
+func (store *pendingScheduleStore) NextActiveReservation(context.Context, time.Time) (*core.Reservation, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if len(store.items) == 0 {
@@ -472,18 +620,7 @@ func TestSchedulerWaitsUntilStartForBackToBackRecordingSlot(t *testing.T) {
 		cancel()
 		t.Fatal("次の予約の準備時刻timerが作られませんでした")
 	}
-	clock.now = secondStart.Add(-startupLeadTime)
-	clock.timer.channel <- clock.now
-	select {
-	case <-clock.created:
-	case <-time.After(time.Second):
-		cancel()
-		t.Fatal("満杯時に実際の開始時刻まで待ちませんでした")
-	}
-	if clock.duration != startupLeadTime {
-		cancel()
-		t.Fatalf("開始時刻までの待機=%s", clock.duration)
-	}
+	clock.now = secondStart.Add(-core.DefaultStartMargin)
 	executor.release <- struct{}{}
 	started = waitSchedulerStart(t, executor.started)
 	if started.ID != second.ID {

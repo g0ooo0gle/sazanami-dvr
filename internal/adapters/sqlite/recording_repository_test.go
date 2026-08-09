@@ -43,6 +43,131 @@ func TestReservationCreateReadbackAndDuplicate(t *testing.T) {
 	}
 }
 
+func TestBasicRecordingSettingsRoundTripAndDisabledExpiration(t *testing.T) {
+	_, store := openMigratedStore(t)
+	base := reservationForTest(t, store)
+	base.ID, base.Program.EventID, base.Disabled = testID(t, 121), 10, true
+	first, err := store.CreateReservation(context.Background(), base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRequest := base
+	secondRequest.ID, secondRequest.Program.EventID = testID(t, 122), 11
+	second, err := store.CreateReservation(context.Background(), secondRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeEnd := base.PlannedEnd().Add(-time.Second)
+	if next, err := store.NextActiveReservation(context.Background(), beforeEnd); err != nil || next != nil {
+		t.Fatalf("disabled next=%+v err=%v", next, err)
+	}
+	deadline, err := store.NextDisabledReservationDeadline(context.Background(), beforeEnd)
+	if err != nil || deadline == nil || !deadline.Equal(base.PlannedEnd()) {
+		t.Fatalf("deadline=%v err=%v", deadline, err)
+	}
+	if expired, err := store.ExpireOneDisabledReservation(context.Background(), beforeEnd); err != nil || expired {
+		t.Fatalf("early expired=%v err=%v", expired, err)
+	}
+	for index := 0; index < 2; index++ {
+		if expired, err := store.ExpireOneDisabledReservation(context.Background(), base.PlannedEnd()); err != nil || !expired {
+			t.Fatalf("expiration %d=%v err=%v", index, expired, err)
+		}
+		items, err := store.ActiveReservations(context.Background(), 256, 0)
+		if err != nil || len(items) != 1-index {
+			t.Fatalf("active after %d=%+v err=%v", index, items, err)
+		}
+	}
+	var reasons int
+	if err := store.reader.QueryRow(`SELECT count(*) FROM reservations WHERE terminal_reason='DISABLED_EXPIRED'`).Scan(&reasons); err != nil || reasons != 2 {
+		t.Fatalf("reasons=%d err=%v", reasons, err)
+	}
+
+	reenable := base
+	reenable.ID, reenable.Program.EventID = testID(t, 123), 12
+	created, err := store.CreateReservation(context.Background(), reenable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := recording.ReservationRequest{
+		NetworkID: reenable.Program.NetworkID, TransportStreamID: reenable.Program.TransportStreamID,
+		ServiceID: reenable.Program.ServiceID, EventID: reenable.Program.EventID, Start: reenable.Program.Start,
+		Duration: reenable.Program.Duration, Priority: 1, Margins: &recording.RecordingMargins{},
+	}
+	changeAt := reenable.Program.Start.Add(reenable.Program.Duration - time.Second)
+	if err := store.UpdateReservation(context.Background(), recording.ReservationChange{Number: created.Number, Request: request}, changeAt); err != nil {
+		t.Fatal(err)
+	}
+	items, err := store.ActiveReservations(context.Background(), 256, 0)
+	if err != nil || len(items) != 1 || items[0].Disabled || items[0].Priority != 1 || items[0].Margins == nil ||
+		*items[0].Margins != (recording.RecordingMargins{}) {
+		t.Fatalf("reenabled=%+v err=%v", items, err)
+	}
+	request.Disabled = true
+	if err := store.UpdateReservation(context.Background(), recording.ReservationChange{Number: created.Number, Request: request}, changeAt); err != nil {
+		t.Fatal(err)
+	}
+	request.Disabled = false
+	if err := store.UpdateReservation(context.Background(), recording.ReservationChange{Number: created.Number, Request: request},
+		reenable.Program.Start.Add(reenable.Program.Duration)); !errors.Is(err, ErrReservationUnavailable) {
+		t.Fatalf("expired re-enable err=%v", err)
+	}
+	_ = first
+	_ = second
+}
+
+func TestNextReservationUsesPriorityThenPlannedStartAndID(t *testing.T) {
+	_, store := openMigratedStore(t)
+	base := reservationForTest(t, store)
+	cases := []struct {
+		marker   byte
+		eventID  uint16
+		priority uint8
+		start    time.Time
+	}{
+		{marker: 126, eventID: 20, priority: 1, start: base.Program.Start.Add(-time.Minute)},
+		{marker: 125, eventID: 21, priority: 5, start: base.Program.Start},
+		{marker: 124, eventID: 22, priority: 5, start: base.Program.Start},
+	}
+	for _, item := range cases {
+		value := base
+		value.ID, value.Program.EventID, value.Priority, value.Program.Start = testID(t, item.marker), item.eventID, item.priority, item.start
+		if _, err := store.CreateReservation(context.Background(), value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	next, err := store.NextActiveReservation(context.Background(), base.Program.Start)
+	if err != nil || next == nil || next.ID != testID(t, 124) {
+		t.Fatalf("next=%+v err=%v", next, err)
+	}
+}
+
+func TestReservationSettingsSchemaRejectsInvalidAndScannerRejectsCorruption(t *testing.T) {
+	_, store := openMigratedStore(t)
+	reservation := reservationForTest(t, store)
+	created, err := store.CreateReservation(context.Background(), reservation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`UPDATE reservations SET effective_start_margin_seconds=3601 WHERE id=?`,
+		`UPDATE reservations SET effective_start_margin_seconds=0 WHERE id=?`,
+		`UPDATE reservations SET duration_seconds=86400 WHERE id=?`,
+	} {
+		if _, err := store.writer.Exec(statement, created.ID.Bytes()); err == nil {
+			t.Fatalf("invalid SQL was accepted: %s", statement)
+		}
+	}
+	if _, err := store.writer.Exec(`DROP TRIGGER reservations_basic_settings_update`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.writer.Exec(`UPDATE reservations SET effective_start_margin_seconds=0 WHERE id=?`, created.ID.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ActiveReservations(context.Background(), 1, 0); err == nil {
+		t.Fatal("corrupt default margin was accepted")
+	}
+}
+
 func TestReservationFollowUsesLatestCompletedRevision(t *testing.T) {
 	_, store := openMigratedStore(t)
 	reservation := reservationForTest(t, store)
@@ -173,12 +298,12 @@ func TestReservationFollowExtendsActiveRecording(t *testing.T) {
 				t.Fatal(err)
 			}
 			if persistedState != state || stateVersion != int64(2+index) ||
-				endMS != reservation.Program.Start.Add(40*time.Minute).UnixMilli() {
+				endMS != reservation.Program.Start.Add(40*time.Minute+recording.DefaultEndMargin).UnixMilli() {
 				t.Fatalf("state=%s version=%d end=%d", persistedState, stateVersion, endMS)
 			}
 			if state == recording.AttemptRecording {
 				end, err := store.UpdateRecordingProgress(context.Background(), attemptID, 188, claim.Now.Add(4*time.Second))
-				if err != nil || !end.Equal(reservation.Program.Start.Add(40*time.Minute)) {
+				if err != nil || !end.Equal(reservation.Program.Start.Add(40*time.Minute+recording.DefaultEndMargin)) {
 					t.Fatalf("progress end=%s err=%v", end, err)
 				}
 			}
@@ -257,7 +382,7 @@ func TestReservationFollowDoesNotShortenShiftOrFinalizeActiveRecording(t *testin
 				attemptID.Bytes()).Scan(&endMS); err != nil {
 				t.Fatal(err)
 			}
-			if endMS != reservation.Program.Start.Add(reservation.Program.Duration).UnixMilli() {
+			if endMS != reservation.PlannedEnd().UnixMilli() {
 				t.Fatalf("end=%d", endMS)
 			}
 		})
@@ -519,7 +644,7 @@ func TestRecordingAttemptLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	next, err := store.NextActiveReservation(context.Background())
+	next, err := store.NextActiveReservation(context.Background(), reservation.CreatedAt)
 	if err != nil || next == nil || next.ID != created.ID {
 		t.Fatalf("next=%+v err=%v", next, err)
 	}
@@ -531,10 +656,11 @@ func TestRecordingAttemptLifecycle(t *testing.T) {
 	}
 	attempt, err := store.ClaimRecording(context.Background(), claim)
 	if err != nil || attempt.State != recording.AttemptClaimed || attempt.Plan != plan ||
-		!attempt.PlannedStart.Equal(reservation.Program.Start) {
+		!attempt.PlannedStart.Equal(reservation.Program.Start.Add(-recording.DefaultStartMargin)) ||
+		!attempt.PlannedEnd.Equal(reservation.Program.Start.Add(reservation.Program.Duration).Add(recording.DefaultEndMargin)) {
 		t.Fatalf("attempt=%+v err=%v", attempt, err)
 	}
-	if next, err := store.NextActiveReservation(context.Background()); err != nil || next != nil {
+	if next, err := store.NextActiveReservation(context.Background(), reservation.CreatedAt); err != nil || next != nil {
 		t.Fatalf("claimed next=%+v err=%v", next, err)
 	}
 	if _, err := store.ClaimRecording(context.Background(), claim); !errors.Is(err, ErrAttemptExists) {

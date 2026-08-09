@@ -12,15 +12,16 @@ import (
 const (
 	lateStartLimit                     = 5 * time.Minute
 	minimumRunTime                     = 60 * time.Second
-	startupLeadTime                    = 5 * time.Second
 	maximumWakeSize                    = 1
 	DefaultMaximumConcurrentRecordings = 1
 	MaximumConcurrentRecordings        = 8
 )
 
-// ScheduleStoreはまだ録画処理を持たない次の予約を、一件だけ返すインターフェースである。
+// ScheduleStoreは無効予約の期限処理と、まだ録画処理を持たない次の有効予約を提供する。
 type ScheduleStore interface {
-	NextActiveReservation(context.Context) (*core.Reservation, error)
+	ExpireOneDisabledReservation(context.Context, time.Time) (bool, error)
+	NextDisabledReservationDeadline(context.Context, time.Time) (*time.Time, error)
+	NextActiveReservation(context.Context, time.Time) (*core.Reservation, error)
 }
 
 // ReservationExecutorは予約をDBへ確保し、確保済み録画を実行するか未実行として確定する。
@@ -58,7 +59,7 @@ type systemTimer struct{ *time.Timer }
 // Cはタイマーの通知チャンネルを返す。
 func (timer systemTimer) C() <-chan time.Time { return timer.Timer.C }
 
-// SchedulerはDBを正本に、明示上限までの録画を予約開始時刻に起動する。
+// SchedulerはDBを正本に、明示上限までの録画を余白反映後の予定開始時刻に起動する。
 // DB確保後だけ録画用Go routineを作り、予約追加通知、タイマー、録画完了、プロセス終了で次を照合する。
 type Scheduler struct {
 	store             ScheduleStore
@@ -123,7 +124,28 @@ func (scheduler *Scheduler) Run(ctx context.Context) error {
 			continue
 		default:
 		}
-		reservation, err := scheduler.store.NextActiveReservation(ctx)
+		now := scheduler.clock.Now().UTC()
+		if now.IsZero() || now.UnixMilli() < 0 {
+			return scheduler.stopExecutions(cancelExecutions, completed, active, errors.New("recording: invalid scheduler clock"))
+		}
+		expired, err := scheduler.store.ExpireOneDisabledReservation(ctx, now)
+		if err != nil {
+			if ctx.Err() != nil {
+				return scheduler.stopExecutions(cancelExecutions, completed, active, nil)
+			}
+			return scheduler.stopExecutions(cancelExecutions, completed, active, errors.New("recording: expire disabled reservation"))
+		}
+		if expired {
+			continue
+		}
+		disabledDeadline, err := scheduler.store.NextDisabledReservationDeadline(ctx, now)
+		if err != nil {
+			if ctx.Err() != nil {
+				return scheduler.stopExecutions(cancelExecutions, completed, active, nil)
+			}
+			return scheduler.stopExecutions(cancelExecutions, completed, active, errors.New("recording: read disabled reservation deadline"))
+		}
+		reservation, err := scheduler.store.NextActiveReservation(ctx, now)
 		if err != nil {
 			if ctx.Err() != nil {
 				return scheduler.stopExecutions(cancelExecutions, completed, active, nil)
@@ -131,7 +153,17 @@ func (scheduler *Scheduler) Run(ctx context.Context) error {
 			return scheduler.stopExecutions(cancelExecutions, completed, active, errors.New("recording: read next reservation"))
 		}
 		if reservation == nil {
-			completion, stopped := scheduler.wait(ctx, nil, completed)
+			var timer Timer
+			if disabledDeadline != nil {
+				timer = scheduler.clock.NewTimer(disabledDeadline.Sub(now))
+				if timer == nil || timer.C() == nil {
+					return scheduler.stopExecutions(cancelExecutions, completed, active, errors.New("recording: invalid scheduler timer"))
+				}
+			}
+			completion, stopped := scheduler.wait(ctx, timer, completed)
+			if timer != nil {
+				timer.Stop()
+			}
 			if stopped {
 				return scheduler.stopExecutions(cancelExecutions, completed, active, nil)
 			}
@@ -143,11 +175,11 @@ func (scheduler *Scheduler) Run(ctx context.Context) error {
 			}
 			continue
 		}
-		now := scheduler.clock.Now().UTC()
-		if now.IsZero() || now.UnixMilli() < 0 {
-			return scheduler.stopExecutions(cancelExecutions, completed, active, errors.New("recording: invalid scheduler clock"))
+		wakeAt := reservation.PlannedStart()
+		if disabledDeadline != nil && disabledDeadline.Before(wakeAt) {
+			wakeAt = *disabledDeadline
+			reservation = nil
 		}
-		wakeAt := reservation.Program.Start.Add(-startupLeadTime)
 		if wakeAt.After(now) {
 			timer := scheduler.clock.NewTimer(wakeAt.Sub(now))
 			if timer == nil || timer.C() == nil {
@@ -167,30 +199,15 @@ func (scheduler *Scheduler) Run(ctx context.Context) error {
 			}
 			continue
 		}
-		plannedEnd := reservation.Program.Start.Add(reservation.Program.Duration)
-		if now.Sub(reservation.Program.Start) > lateStartLimit || plannedEnd.Sub(now) < minimumRunTime {
+		if reservation == nil {
+			continue
+		}
+		plannedEnd := reservation.PlannedEnd()
+		if now.Sub(wakeAt) > lateStartLimit || plannedEnd.Sub(now) < minimumRunTime {
 			if _, err := scheduler.executor.Miss(ctx, *reservation, core.ReasonLateStartExpired); err != nil {
 				return scheduler.stopExecutions(cancelExecutions, completed, active, err)
 			}
 			continue
-		}
-		if active >= scheduler.maximumConcurrent && now.Before(reservation.Program.Start) {
-			timer := scheduler.clock.NewTimer(reservation.Program.Start.Sub(now))
-			if timer == nil || timer.C() == nil {
-				return scheduler.stopExecutions(cancelExecutions, completed, active, errors.New("recording: invalid scheduler timer"))
-			}
-			completion, stopped := scheduler.wait(ctx, timer, completed)
-			timer.Stop()
-			if stopped {
-				return scheduler.stopExecutions(cancelExecutions, completed, active, nil)
-			}
-			if completion == nil {
-				continue
-			}
-			active--
-			if completion.err != nil {
-				return scheduler.stopExecutions(cancelExecutions, completed, active, completion.err)
-			}
 		}
 		if active >= scheduler.maximumConcurrent {
 			select {

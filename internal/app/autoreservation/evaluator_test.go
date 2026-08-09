@@ -110,6 +110,31 @@ func TestEvaluatorCreatesOnceAndSkipsUnavailableRule(t *testing.T) {
 	}
 }
 
+func TestEvaluatorInheritsDisabledPriorityFollowAndMargins(t *testing.T) {
+	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+	startMargin, endMargin := int32(-10), int32(20)
+	rule := storedRule(1, autoreservation.SearchCondition{Enabled: true})
+	rule.Recording = autoreservation.RecordingSettings{
+		Mode: 5, Priority: 1, Follow: false, StartMargin: &startMargin, EndMargin: &endMargin,
+	}
+	store := &evaluationStore{rules: []autoreservation.Rule{rule}, seen: make(map[catalogmodel.ID]struct{})}
+	result, err := (Evaluator{
+		Store: store, Catalog: evaluationCatalog{programs: []catalogmodel.CurrentProgram{
+			currentProgram(1, now.Add(time.Hour), "番組", "", catalogmodel.FreeYes),
+		}}, Clock: fixedClock{now},
+		NewID:       func() (catalogmodel.ID, error) { return catalogmodel.ID{10}, nil },
+		IsDuplicate: func(error) bool { return false },
+	}).Run(context.Background())
+	if err != nil || result.Created != 1 || len(store.created) != 1 {
+		t.Fatalf("result=%+v created=%+v err=%v", result, store.created, err)
+	}
+	created := store.created[0]
+	if !created.Disabled || created.Priority != 1 || created.RequestedFollow || created.Margins == nil ||
+		*created.Margins != (recording.RecordingMargins{Start: -10 * time.Second, End: 20 * time.Second}) {
+		t.Fatalf("created=%+v", created)
+	}
+}
+
 func TestEvaluatorPreflightsProgramLimit(t *testing.T) {
 	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
 	programs := make([]catalogmodel.CurrentProgram, autoreservation.MaxProgramsPerRun+1)
