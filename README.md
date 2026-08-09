@@ -2,11 +2,12 @@
 
 Sazanami DVRは、Mirakurun／mirakcから番組情報と放送ストリームを受け取り、KonomiTVからの予約を録画する軽量なバックエンドです。Goで実装しており、一つの実行ファイルで動きます。
 
-現在のバージョンは **v0.0.2（ベータ版）** です。基本的な録画の流れは動きますが、対応範囲はまだ限定的です。
+現在のバージョンは **v0.0.3（ベータ版）** です。基本的な録画の流れは動きますが、対応範囲はまだ限定的です。
 
 ## 現在できること
 
 - Mirakurun互換APIからサービスと番組を取得し、SQLiteへ保存する
+- 録画プロセスを止めずに、起動直後と一定間隔で番組表を更新する
 - KonomiTV向けに、状態確認、チャンネル一覧、番組表、予約の一覧・追加・変更・取消しを返す
 - KonomiTVへ、録画設定に必要な`Bitrate.ini`と`EpgTimerSrv.ini`を返す
 - KonomiTVの予約一覧へ、録画中の状態を返す
@@ -46,7 +47,7 @@ go build -o ./bin/sazanami-dvr ./cmd/sazanami-dvr
 
 ## 最短の起動手順
 
-まずDBを作成し、番組情報を一度取得します。`catalog sync`を実行したときだけMirakurunへ接続します。
+まずDBを作成し、番組情報を一度取得します。次の`catalog sync`は一回だけMirakurunへ接続します。
 
 ```console
 ./bin/sazanami-dvr db migrate --data-root <data-root>
@@ -81,7 +82,7 @@ mkdir -m 700 <recording-root>
   --listen 127.0.0.1:4510
 ```
 
-このプロセスは、起動しただけではMirakurunへ接続しません。保存済み予約の開始5秒前になったときだけ放送ストリームを開きます。停止には`SIGINT`または`SIGTERM`を使います。詳しくは[録画機能の運用手順](docs/recording-operations.md)を参照してください。
+このプロセスは、起動直後と既定1時間ごとにMirakurunの版、サービス、番組を確認します。録画用の放送ストリームは、保存済み予約の開始5秒前になったときだけ開きます。更新間隔は`--catalog-refresh-interval`で5分から24時間の範囲に変更できます。停止には`SIGINT`または`SIGTERM`を使います。詳しくは[録画機能の運用手順](docs/recording-operations.md)を参照してください。
 
 KonomiTV側の設定と、画面から一件確認する手順は
 [KonomiTVと接続する](docs/konomitv-setup.md)を参照してください。
@@ -124,7 +125,7 @@ sazanami-dvr db recover --data-root <data-root> --operation-id <uuid>
 | コマンド | ネットワーク動作 |
 |---|---|
 | `catalog sync` | Mirakurunのサービス・番組APIへ一度接続する |
-| `recording serve` | KonomiTV向けに待ち受け、予約時刻だけMirakurunの放送ストリームへ接続する |
+| `recording serve` | KonomiTV向けに待ち受け、起動直後と一定間隔で番組表を更新し、予約時刻だけ放送ストリームへ接続する |
 | `ctrlcmd serve` | チャンネル確認用に待ち受ける |
 | `ui serve` | 運用WebUIを表示する |
 

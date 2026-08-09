@@ -1,4 +1,4 @@
-// Command sazanami-dvrは外部接続を暗黙に開始しない、薄いprocess entry pointである。
+// Command sazanami-dvrは、明示したサブコマンドだけを実行する小さなプロセス入口である。
 package main
 
 import (
@@ -23,6 +23,7 @@ import (
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/recordingfs"
 	sqliteadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/sqlite"
 	webuiadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/webui"
+	"github.com/g0ooo0gle/sazanami-dvr/internal/app/catalogrefresh"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/app/catalogsync"
 	ctrlcmdapp "github.com/g0ooo0gle/sazanami-dvr/internal/app/ctrlcmd"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/app/opsui"
@@ -32,7 +33,7 @@ import (
 )
 
 var (
-	version       = "0.0.2"
+	version       = "0.0.3"
 	productCommit = ""
 )
 
@@ -119,11 +120,13 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	providerName := flags.String("provider", "", "stream provider")
 	baseURL := flags.String("base-url", "", "Mirakurunのoperator設定URL")
 	listenAddress := flags.String("listen", ctrlcmdapp.DefaultAddress, "numeric loopbackの待受アドレス")
+	refreshInterval := flags.Duration("catalog-refresh-interval", catalogrefresh.DefaultInterval, "番組表を更新する間隔")
 	if err := flags.Parse(arguments); err != nil {
 		return errorsStable("invalid-command-arguments")
 	}
 	if *dataRoot == "" || *recordingRootPath == "" || *channelMap == "" || *providerName != "mirakurun" ||
-		*baseURL == "" || flags.NArg() != 0 {
+		*baseURL == "" || *refreshInterval < catalogrefresh.MinimumInterval || *refreshInterval > catalogrefresh.MaximumInterval ||
+		flags.NArg() != 0 {
 		return errorsStable("recording-arguments-required")
 	}
 	config := ctrlcmdapp.RecordingConfig()
@@ -142,6 +145,10 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 		return errorsStable("database-owner-unavailable")
 	}
 	defer store.Close()
+	clock := wallClock{}
+	if _, err := (catalogsync.RecoveryService{Repository: store, Clock: clock}).Reconcile(startupContext); err != nil {
+		return errorsStable("startup-recovery-failed")
+	}
 	recordingRoot, err := recordingfs.OpenRoot(*recordingRootPath)
 	if err != nil {
 		return errorsStable("recording-root-unavailable")
@@ -151,12 +158,21 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	if err != nil {
 		return err
 	}
+	snapshots, err := ctrlcmdruntime.NewSnapshotHolder(snapshot)
+	if err != nil {
+		return errorsStable("recording-snapshot-failed")
+	}
 	streamAdapter, err := mirakurunadapter.NewStream(*baseURL)
 	if err != nil {
 		return errorsStable("provider-configuration-invalid")
 	}
 	defer streamAdapter.CloseIdleConnections()
-	clock := recordingapp.SystemClock{}
+	catalogAdapter, err := mirakurunadapter.New(*baseURL)
+	if err != nil {
+		return errorsStable("provider-configuration-invalid")
+	}
+	defer catalogAdapter.CloseIdleConnections()
+	recordingClock := recordingapp.SystemClock{}
 	ownerID, err := catalogmodel.NewID()
 	if err != nil {
 		return errorsStable("recording-owner-id-generation-failed")
@@ -169,24 +185,24 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 		RemovePartial: recordingRoot.RemovePartial,
 	}
 	executor := recordingapp.Executor{
-		Store: store, Stream: streamAdapter, Files: files, Clock: clock,
+		Store: store, Stream: streamAdapter, Files: files, Clock: recordingClock,
 		NewID: catalogmodel.NewID, OwnerID: ownerID, Generation: 1,
 	}
 	recovery := recordingapp.Recovery{
-		Store: store, Clock: clock,
+		Store: store, Clock: recordingClock,
 		Files: recordingapp.RecoveryFiles{FileOperations: files, Inspect: recordingRoot.Inspect},
 	}
 	if err := recovery.Run(startupContext); err != nil {
 		return errorsStable("recording-recovery-failed")
 	}
-	scheduler, err := recordingapp.NewScheduler(store, executor, clock)
+	scheduler, err := recordingapp.NewScheduler(store, executor, recordingClock)
 	if err != nil {
 		return errorsStable("recording-scheduler-invalid")
 	}
 	reservations := recordingapp.ReservationService{
-		Catalog: snapshot, Store: store, Clock: clock, NewID: catalogmodel.NewID, OnAdded: scheduler.Notify,
+		Catalog: snapshots, Store: store, Clock: recordingClock, NewID: catalogmodel.NewID, OnAdded: scheduler.Notify,
 	}
-	router, err := ctrlcmdruntime.NewRecordingRouter(snapshot, reservations, ctrlcmdruntime.SystemClock{}, codec.DefaultLimits())
+	router, err := ctrlcmdruntime.NewRecordingRouter(snapshots, reservations, ctrlcmdruntime.SystemClock{}, codec.DefaultLimits())
 	if err != nil {
 		return errorsStable("recording-router-failed")
 	}
@@ -203,28 +219,42 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	defer serviceCancel()
 	serverDone := make(chan error, 1)
 	schedulerDone := make(chan error, 1)
+	refreshDone := make(chan error, 1)
 	go func() { serverDone <- server.Serve(serviceContext, listener) }()
 	go func() { schedulerDone <- scheduler.Run(serviceContext) }()
-	fmt.Fprintf(stdout, "録画プロセスをloopback限定で開始しました: services=%d\n", snapshot.Count())
-	var serverErr, schedulerErr error
-	serverFinished, schedulerFinished := false, false
+	refreshOperation := &recordingCatalogRefresh{
+		dataRoot: *dataRoot, channelMap: *channelMap, provider: catalogAdapter,
+		store: store, holder: snapshots, clock: clock,
+	}
+	refresher := catalogrefresh.Runner{
+		Interval: *refreshInterval, Sync: refreshOperation.sync, Observe: observeCatalogRefresh(stdout, stderr),
+	}
+	go func() { refreshDone <- refresher.Run(serviceContext) }()
+	fmt.Fprintf(stdout, "録画プロセスをloopback限定で開始しました: services=%d catalog_refresh_interval=%s\n",
+		snapshot.Count(), refreshInterval.String())
+	var serverErr, schedulerErr, refreshErr error
+	serverFinished, schedulerFinished, refreshFinished := false, false, false
 	select {
 	case serverErr = <-serverDone:
 		serverFinished = true
 	case schedulerErr = <-schedulerDone:
 		schedulerFinished = true
+	case refreshErr = <-refreshDone:
+		refreshFinished = true
 	case <-ctx.Done():
 	}
 	serviceCancel()
 	_ = listener.Close()
 	shutdown := time.NewTimer(30 * time.Second)
 	defer shutdown.Stop()
-	for !serverFinished || !schedulerFinished {
+	for !serverFinished || !schedulerFinished || !refreshFinished {
 		select {
 		case serverErr = <-serverDone:
 			serverFinished = true
 		case schedulerErr = <-schedulerDone:
 			schedulerFinished = true
+		case refreshErr = <-refreshDone:
+			refreshFinished = true
 		case <-shutdown.C:
 			return errorsStable("recording-shutdown-timeout")
 		}
@@ -235,6 +265,9 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	}
 	if schedulerErr != nil {
 		return errorsStable("recording-scheduler-failed")
+	}
+	if refreshErr != nil {
+		return errorsStable("recording-catalog-refresh-failed")
 	}
 	return nil
 }

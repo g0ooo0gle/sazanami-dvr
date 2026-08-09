@@ -17,40 +17,36 @@ import (
 // 動的登録を持たず、未対応commandは応答を書かずに安定したエラーへする。
 type Router struct {
 	status       status.Handler
-	channel      channel.Handler
-	programGuide *programguide.Handler
+	snapshots    SnapshotLoader
+	recording    bool
 	reservations *reservationadapter.Handler
 	limits       codec.Limits
 }
 
 // NewRecordingRouterは番組表とKonomiTV向け予約・録画中確認commandを接続する。
-func NewRecordingRouter(snapshot programguide.Source, operations reservationadapter.Operations, clock status.Clock, limits codec.Limits) (*Router, error) {
-	if snapshot == nil || operations == nil {
+func NewRecordingRouter(snapshots SnapshotLoader, operations reservationadapter.Operations, clock status.Clock, limits codec.Limits) (*Router, error) {
+	if snapshots == nil || snapshots.Load() == nil || operations == nil {
 		return nil, stable("recording-snapshot-failed")
 	}
-	router, err := NewRouter(snapshot, clock, limits)
+	router, err := NewRouter(snapshots, clock, limits)
 	if err != nil {
 		return nil, err
 	}
-	guide, err := programguide.NewHandler(snapshot, limits)
-	if err != nil {
-		return nil, stable("recording-snapshot-failed")
-	}
 	reservations := &reservationadapter.Handler{Operations: operations, Limits: limits}
-	router.programGuide = guide
+	router.recording = true
 	router.reservations = reservations
 	return router, nil
 }
 
-// NewRouterは同じ固定スナップショットを1060と1021へ接続する。
-func NewRouter(snapshot channel.Source, clock status.Clock, limits codec.Limits) (*Router, error) {
-	if snapshot == nil || clock == nil {
+// NewRouterは要求開始時に一度だけスナップショットを取得し、1060と1021へ接続する。
+func NewRouter(snapshots SnapshotLoader, clock status.Clock, limits codec.Limits) (*Router, error) {
+	if snapshots == nil || snapshots.Load() == nil || clock == nil {
 		return nil, stable("channel-snapshot-failed")
 	}
 	return &Router{
-		status:  status.Handler{Source: normalStatus{}, Clock: clock, Limits: limits},
-		channel: channel.Handler{Source: snapshot, Limits: limits},
-		limits:  limits,
+		status:    status.Handler{Source: normalStatus{}, Clock: clock, Limits: limits},
+		snapshots: snapshots,
+		limits:    limits,
 	}, nil
 }
 
@@ -67,12 +63,21 @@ func (router *Router) Handle(ctx context.Context, request []byte, destination io
 	case status.Command:
 		return router.status.Handle(ctx, request, destination)
 	case channel.CommandFileCopy, channel.CommandEnumService:
-		return router.channel.Handle(ctx, request, destination)
+		snapshot := router.snapshots.Load()
+		if snapshot == nil {
+			return stable("channel-snapshot-failed")
+		}
+		return (channel.Handler{Source: snapshot, Limits: router.limits}).Handle(ctx, request, destination)
 	case filecopy2.Command:
 		return (filecopy2.Handler{Limits: router.limits}).Handle(ctx, request, destination)
 	case programguide.Command:
-		if router.programGuide != nil {
-			return router.programGuide.Handle(ctx, request, destination)
+		if router.recording {
+			snapshot := router.snapshots.Load()
+			guide, guideErr := programguide.NewHandler(snapshot, router.limits)
+			if guideErr != nil {
+				return stable("recording-snapshot-failed")
+			}
+			return guide.Handle(ctx, request, destination)
 		}
 	case reservationadapter.CommandList, reservationadapter.CommandAdd, reservationadapter.CommandChange,
 		reservationadapter.CommandDelete, reservationadapter.CommandRecordingOpen, reservationadapter.CommandRecordingClose:

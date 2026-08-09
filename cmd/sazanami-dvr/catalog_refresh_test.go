@@ -1,0 +1,191 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	ctrlcmdruntime "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/runtime"
+	mirakurunadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/provider/mirakurun"
+	sqliteadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/sqlite"
+	"github.com/g0ooo0gle/sazanami-dvr/internal/app/catalogrefresh"
+	"github.com/g0ooo0gle/sazanami-dvr/internal/app/catalogsync"
+	"github.com/g0ooo0gle/sazanami-dvr/internal/core/catalogmodel"
+)
+
+func TestRecordingCatalogRefreshPublishesOnlyValidatedGeneration(t *testing.T) {
+	const (
+		networkID  = 1
+		serviceID  = 3
+		eventID    = 4
+		serviceKey = 100003
+		programKey = 10000300004
+	)
+	var state struct {
+		sync.Mutex
+		service string
+		title   string
+		fail    bool
+		paths   []string
+	}
+	state.service, state.title = "更新前の局", "更新前の番組"
+	providerServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		state.Lock()
+		defer state.Unlock()
+		state.paths = append(state.paths, request.URL.Path)
+		if state.fail {
+			http.Error(writer, "private", http.StatusServiceUnavailable)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/api/version":
+			fmt.Fprint(writer, `{"current":"unknown-compatible","latest":"unknown-compatible"}`)
+		case "/api/services":
+			fmt.Fprintf(writer, `[{"type":1,"name":%q,"serviceId":%d,"id":%d,"networkId":%d}]`,
+				state.service, serviceID, serviceKey, networkID)
+		case "/api/programs":
+			fmt.Fprintf(writer, `[{"id":%d,"networkId":%d,"serviceId":%d,"eventId":%d,"startAt":1786237200000,"duration":1800000,"isFree":true,"name":%q,"description":""}]`,
+				programKey, networkID, serviceID, eventID, state.title)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer providerServer.Close()
+
+	root := migratedRoot(t)
+	store, err := sqliteadapter.OpenStore(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	provider, err := mirakurunadapter.New(providerServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer provider.CloseIdleConnections()
+	identityHash := provider.IdentityHash()
+	backendID := stableBackendID(identityHash)
+	sourceRef := "mirakurun-http-json-v1"
+	initialCorrelation, _ := catalogmodel.NewID()
+	request := catalogsync.Request{
+		Backend:       catalogmodel.Backend{ID: backendID, Kind: "MIRAKURUN", IdentityHash: identityHash, SourceRef: &sourceRef},
+		CorrelationID: initialCorrelation.String(), ServicePageLimit: 256, ProgramPageLimit: 256,
+	}
+	if _, err := (catalogsync.Service{Provider: provider, Repository: store, Clock: wallClock{}}).Sync(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	channelMap := filepath.Join(root, "channels.json")
+	document := fmt.Sprintf(`{"format":"sazanami-channel-map-v1","backend_id":%q,"services":[{"provider_locator":"100003","network_id":1,"service_id":3,"transport_stream_id":2,"provider_name":"","network_name":"テスト","transport_stream_name":"テスト","remote_control_key_id":1,"partial_reception":false,"epg_capture":true,"search":true}]}`,
+		backendID.String())
+	if err := os.WriteFile(channelMap, []byte(document), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	initial, err := ctrlcmdruntime.BuildSnapshot(context.Background(), root, channelMap, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	holder, err := ctrlcmdruntime.NewSnapshotHolder(initial)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	state.Lock()
+	state.service = "更新後の局"
+	state.Unlock()
+	operation := &recordingCatalogRefresh{
+		dataRoot: root, channelMap: channelMap, provider: provider, store: store, holder: holder, clock: wallClock{},
+	}
+	result, reason, err := operation.sync(context.Background())
+	if err != nil || reason != "" || result.Services != 1 || result.Programs != 1 || holder.Load() == initial {
+		t.Fatalf("result=%+v reason=%q switched=%v err=%v", result, reason, holder.Load() != initial, err)
+	}
+	value, err := holder.Load().Current(context.Background())
+	if err != nil || len(value.Services) != 1 || value.Services[0].ServiceName != "更新後の局" {
+		t.Fatalf("snapshot=%+v err=%v", value, err)
+	}
+	programs, err := holder.Load().CurrentProgramsForService(context.Background(), "100003", 16, "")
+	if err != nil || len(programs) != 1 || programs[0].Material.Title == nil || *programs[0].Material.Title != "更新前の番組" {
+		t.Fatalf("programs=%+v err=%v", programs, err)
+	}
+	accepted := holder.Load()
+	badMap := strings.Replace(document, `"provider_locator":"100003"`, `"provider_locator":"999"`, 1)
+	if err := os.WriteFile(channelMap, []byte(badMap), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, reason, err := operation.sync(context.Background()); err == nil || reason != "catalog-refresh-channel-mismatch" || holder.Load() != accepted {
+		t.Fatalf("mismatch reason=%q kept=%v err=%v", reason, holder.Load() == accepted, err)
+	}
+	state.Lock()
+	state.fail = true
+	state.Unlock()
+	if _, reason, err := operation.sync(context.Background()); err == nil || reason != "catalog-refresh-provider-failed" || holder.Load() != accepted {
+		t.Fatalf("provider reason=%q kept=%v err=%v", reason, holder.Load() == accepted, err)
+	}
+	state.Lock()
+	state.fail = false
+	state.Unlock()
+	if err := os.WriteFile(channelMap, []byte(document), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beforeGoroutines := runtime.NumGoroutine()
+	beforeFDs, measureFDs := openFileDescriptorCount()
+	previous := holder.Load()
+	for cycle := range 100 {
+		if _, reason, err := operation.sync(context.Background()); err != nil || reason != "" || holder.Load() == previous {
+			t.Fatalf("cycle=%d reason=%q switched=%v err=%v", cycle+1, reason, holder.Load() != previous, err)
+		}
+		previous = holder.Load()
+	}
+	provider.CloseIdleConnections()
+	runtime.GC()
+	time.Sleep(50 * time.Millisecond)
+	if after := runtime.NumGoroutine(); after > beforeGoroutines+8 {
+		t.Fatalf("goroutines before=%d after=%d", beforeGoroutines, after)
+	}
+	if after, supported := openFileDescriptorCount(); measureFDs && supported && after > beforeFDs+4 {
+		t.Fatalf("file descriptors before=%d after=%d", beforeFDs, after)
+	}
+	state.Lock()
+	paths := append([]string(nil), state.paths...)
+	state.Unlock()
+	for _, path := range paths {
+		if path != "/api/version" && path != "/api/services" && path != "/api/programs" {
+			t.Fatalf("unexpected provider path=%q", path)
+		}
+	}
+}
+
+func openFileDescriptorCount() (int, bool) {
+	entries, err := os.ReadDir("/dev/fd")
+	if err != nil {
+		return 0, false
+	}
+	return len(entries), true
+}
+
+func TestCatalogRefreshOutputIsBoundedAndRedacted(t *testing.T) {
+	var output, diagnostic bytes.Buffer
+	observe := observeCatalogRefresh(&output, &diagnostic)
+	observe(catalogrefresh.Event{Completed: true, Services: 2, Programs: 3, DurationMS: 4})
+	observe(catalogrefresh.Event{Reason: "catalog-refresh-provider-failed", DurationMS: 5})
+	wantOutput := "catalog_refresh result=completed services=2 programs=3 duration_ms=4\n"
+	wantDiagnostic := "catalog_refresh result=failed reason=catalog-refresh-provider-failed duration_ms=5\n"
+	if output.String() != wantOutput || diagnostic.String() != wantDiagnostic {
+		t.Fatalf("output=%q diagnostic=%q", output.String(), diagnostic.String())
+	}
+	for _, private := range []string{"http://", "/home/", "番組", "private"} {
+		if strings.Contains(output.String(), private) || strings.Contains(diagnostic.String(), private) {
+			t.Fatalf("private value=%q", private)
+		}
+	}
+}

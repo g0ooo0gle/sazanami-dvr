@@ -3,6 +3,7 @@ package catalogsync_test
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"os"
 	"sync"
 	"testing"
@@ -145,6 +146,42 @@ func TestFailedGenerationDoesNotReplaceCompletedCatalog(t *testing.T) {
 	request.CorrelationID = "failed"
 	if _, err := service.Sync(context.Background(), request); err == nil {
 		t.Fatal("fault付きsyncが成功しました")
+	}
+	programs, err := store.CurrentPrograms(context.Background(), backendID, 16, catalogmodel.ID{})
+	if err != nil || len(programs) != 1 || *programs[0].Material.Title != "正本" {
+		t.Fatalf("current=%+v err=%v", programs, err)
+	}
+}
+
+func TestValidationRunsBeforeCompletionAndKeepsPreviousCatalog(t *testing.T) {
+	_, store := migratedStore(t)
+	clock := &advancingClock{now: time.Date(2026, 8, 2, 0, 0, 0, 0, time.UTC)}
+	backendID := mustCatalogID(t, 88)
+	backend := catalogmodel.Backend{ID: backendID, Kind: "FAKE", IdentityHash: sha256.Sum256([]byte("fake:validation"))}
+	request := catalogsync.Request{
+		Backend: backend, CorrelationID: "initial", ServicePageLimit: 16, ProgramPageLimit: 16,
+		VerifiedFakeLineage: true,
+	}
+	service := catalogsync.Service{Provider: newHarness(t, "正本", nil).Catalog, Repository: store, Clock: clock}
+	if _, err := service.Sync(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+
+	want := errors.New("candidate rejected")
+	request.CorrelationID = "candidate"
+	service.Provider = newHarness(t, "公開しない番組", nil).Catalog
+	called := 0
+	_, err := service.SyncValidated(context.Background(), request, func(ctx context.Context, generationID catalogmodel.ID) error {
+		called++
+		services, readErr := store.ServicesForGeneration(ctx, backendID, generationID,
+			catalogmodel.GenerationRunning, 16, catalogmodel.ID{})
+		if readErr != nil || len(services) != 1 {
+			t.Fatalf("candidate services=%+v err=%v", services, readErr)
+		}
+		return want
+	})
+	if !errors.Is(err, want) || called != 1 {
+		t.Fatalf("validation calls=%d err=%v", called, err)
 	}
 	programs, err := store.CurrentPrograms(context.Background(), backendID, 16, catalogmodel.ID{})
 	if err != nil || len(programs) != 1 || *programs[0].Material.Title != "正本" {

@@ -191,6 +191,143 @@ func (store *Store) ReconcileRunningSyncs(ctx context.Context, finishedAtMS int6
 	return int(count), nil
 }
 
+// LatestCompletedGenerationは指定backendで最後に完了した番組表世代を返す。
+func (store *Store) LatestCompletedGeneration(ctx context.Context, backendID catalogmodel.ID) (catalogmodel.ID, error) {
+	var value []byte
+	err := store.reader.QueryRowContext(ctx, `SELECT id FROM catalog_syncs
+		WHERE backend_instance_id=? AND state='COMPLETED'
+		ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1`, backendID.Bytes()).Scan(&value)
+	if err != nil {
+		return catalogmodel.ID{}, sanitize("query-latest-completed-generation", err)
+	}
+	var result catalogmodel.ID
+	if err := copyExact(result[:], value); err != nil {
+		return catalogmodel.ID{}, err
+	}
+	return result, nil
+}
+
+// ServicesForGenerationは指定backendの一つの世代からserviceをopaque keysetで読む。
+// RUNNINGは完了前のチャンネル照合にだけ使い、COMPLETEDは公開済みスナップショットに使う。
+func (store *Store) ServicesForGeneration(ctx context.Context, backendID, generationID catalogmodel.ID,
+	state catalogmodel.GenerationState, limit int, after catalogmodel.ID,
+) ([]catalogmodel.CurrentService, error) {
+	if limit < 1 || limit > catalogmodel.MaxQueryPage {
+		return nil, errors.New("sqlite: service query limit outside accepted range")
+	}
+	stateText, err := generationStateText(state)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := store.reader.QueryContext(ctx, `
+		WITH selected_sync AS (
+			SELECT id FROM catalog_syncs WHERE id=? AND backend_instance_id=? AND state=?
+		)
+		SELECT s.id, so.provider_locator, so.display_name, so.network_id,
+		       so.transport_stream_id, so.service_number, so.broadcast_kind, so.validation_state
+		FROM service_observations so
+		JOIN selected_sync cs ON cs.id=so.sync_id
+		JOIN services s ON s.id=so.service_id
+		WHERE s.id > ?
+		ORDER BY s.id LIMIT ?`, generationID.Bytes(), backendID.Bytes(), stateText, after.Bytes(), limit)
+	if err != nil {
+		return nil, sanitize("query-generation-services", err)
+	}
+	defer rows.Close()
+	return scanCurrentServices(rows, limit)
+}
+
+// ProgramsByServiceForGenerationは公開済みの一世代をserviceとeventの順に読む。
+func (store *Store) ProgramsByServiceForGeneration(ctx context.Context, backendID, generationID catalogmodel.ID,
+	limit int, after catalogmodel.ProgramCursor,
+) ([]catalogmodel.CurrentProgram, error) {
+	if limit < 1 || limit > catalogmodel.MaxQueryPage ||
+		(after.ServiceLocator == "") != (after.EventLocator == "") ||
+		!validText(after.ServiceLocator, 0, 256) || !validText(after.EventLocator, 0, 256) {
+		return nil, errors.New("sqlite: program cursor outside accepted range")
+	}
+	rows, err := store.reader.QueryContext(ctx, `
+		WITH selected_sync AS (
+			SELECT id FROM catalog_syncs WHERE id=? AND backend_instance_id=? AND state='COMPLETED'
+		)
+		SELECT pi.id, pr.id, po.provider_service_locator, po.provider_event_locator, po.raw_event_id,
+		       pr.revision_number, pr.content_hash, pr.start_at_utc_ms, pr.duration_ms,
+		       pr.title, pr.description, pr.free_access, pr.validation_state, po.classification
+		FROM program_observations po
+		JOIN selected_sync cs ON cs.id=po.sync_id
+		JOIN program_instances pi ON pi.id=po.program_instance_id
+		JOIN program_revisions pr ON pr.id=po.program_revision_id
+		WHERE (?='' OR po.provider_service_locator>? OR
+		      (po.provider_service_locator=? AND po.provider_event_locator>?))
+		ORDER BY po.provider_service_locator, po.provider_event_locator LIMIT ?`,
+		generationID.Bytes(), backendID.Bytes(), after.ServiceLocator, after.ServiceLocator,
+		after.ServiceLocator, after.EventLocator, limit)
+	if err != nil {
+		return nil, sanitize("query-generation-programs-by-service", err)
+	}
+	defer rows.Close()
+	return scanCurrentPrograms(rows, limit)
+}
+
+// ProgramsForServiceForGenerationは公開済みの一世代から一サービスの番組を読む。
+func (store *Store) ProgramsForServiceForGeneration(ctx context.Context, backendID, generationID catalogmodel.ID,
+	serviceLocator string, limit int, afterEvent string,
+) ([]catalogmodel.CurrentProgram, error) {
+	if limit < 1 || limit > catalogmodel.MaxQueryPage ||
+		!validText(serviceLocator, 1, 256) || !validText(afterEvent, 0, 256) {
+		return nil, errors.New("sqlite: service program cursor outside accepted range")
+	}
+	rows, err := store.reader.QueryContext(ctx, `
+		WITH selected_sync AS (
+			SELECT id FROM catalog_syncs WHERE id=? AND backend_instance_id=? AND state='COMPLETED'
+		)
+		SELECT pi.id, pr.id, po.provider_service_locator, po.provider_event_locator, po.raw_event_id,
+		       pr.revision_number, pr.content_hash, pr.start_at_utc_ms, pr.duration_ms,
+		       pr.title, pr.description, pr.free_access, pr.validation_state, po.classification
+		FROM program_observations po
+		JOIN selected_sync cs ON cs.id=po.sync_id
+		JOIN program_instances pi ON pi.id=po.program_instance_id
+		JOIN program_revisions pr ON pr.id=po.program_revision_id
+		WHERE po.provider_service_locator=? AND (?='' OR po.provider_event_locator>?)
+		ORDER BY po.provider_event_locator LIMIT ?`, generationID.Bytes(), backendID.Bytes(),
+		serviceLocator, afterEvent, afterEvent, limit)
+	if err != nil {
+		return nil, sanitize("query-generation-programs-for-service", err)
+	}
+	defer rows.Close()
+	return scanCurrentPrograms(rows, limit)
+}
+
+// ProgramsMatchingGenerationは公開済みの一世代から予約対象に完全一致する候補を最大2件返す。
+func (store *Store) ProgramsMatchingGeneration(ctx context.Context, backendID, generationID catalogmodel.ID,
+	serviceLocator string, rawEventID, startUTCMS, durationMS int64,
+) ([]catalogmodel.CurrentProgram, error) {
+	if !validText(serviceLocator, 1, 256) || rawEventID < 0 || rawEventID > 65_535 || startUTCMS < 0 ||
+		durationMS < 1_000 || durationMS > int64((24*time.Hour)/time.Millisecond) {
+		return nil, errors.New("sqlite: program match outside accepted range")
+	}
+	rows, err := store.reader.QueryContext(ctx, `
+		WITH selected_sync AS (
+			SELECT id FROM catalog_syncs WHERE id=? AND backend_instance_id=? AND state='COMPLETED'
+		)
+		SELECT pi.id, pr.id, po.provider_service_locator, po.provider_event_locator, po.raw_event_id,
+		       pr.revision_number, pr.content_hash, pr.start_at_utc_ms, pr.duration_ms,
+		       pr.title, pr.description, pr.free_access, pr.validation_state, po.classification
+		FROM program_observations po
+		JOIN selected_sync cs ON cs.id=po.sync_id
+		JOIN program_instances pi ON pi.id=po.program_instance_id
+		JOIN program_revisions pr ON pr.id=po.program_revision_id
+		WHERE po.provider_service_locator=? AND po.raw_event_id=?
+		  AND pr.start_at_utc_ms=? AND pr.duration_ms=?
+		ORDER BY pi.id LIMIT 2`, generationID.Bytes(), backendID.Bytes(), serviceLocator,
+		rawEventID, startUTCMS, durationMS)
+	if err != nil {
+		return nil, sanitize("query-generation-program-match", err)
+	}
+	defer rows.Close()
+	return scanCurrentPrograms(rows, 2)
+}
+
 // CurrentProgramsは指定backendの最後に完了したgenerationだけをopaque keysetで読む。
 func (store *Store) CurrentPrograms(ctx context.Context, backendID catalogmodel.ID, limit int, after catalogmodel.ID) ([]catalogmodel.CurrentProgram, error) {
 	if limit < 1 || limit > catalogmodel.MaxQueryPage {
@@ -397,7 +534,11 @@ func (store *Store) CurrentServices(ctx context.Context, backendID catalogmodel.
 		return nil, sanitize("query-current-services", err)
 	}
 	defer rows.Close()
-	result := make([]catalogmodel.CurrentService, 0, limit)
+	return scanCurrentServices(rows, limit)
+}
+
+func scanCurrentServices(rows *sql.Rows, capacity int) ([]catalogmodel.CurrentService, error) {
+	result := make([]catalogmodel.CurrentService, 0, capacity)
 	for rows.Next() {
 		var item catalogmodel.CurrentService
 		var id []byte
@@ -510,6 +651,17 @@ func validationFromSQL(value string) catalogmodel.Validation {
 		return catalogmodel.ValidationProvisional
 	default:
 		return catalogmodel.ValidationInvalid
+	}
+}
+
+func generationStateText(state catalogmodel.GenerationState) (string, error) {
+	switch state {
+	case catalogmodel.GenerationRunning:
+		return "RUNNING", nil
+	case catalogmodel.GenerationCompleted:
+		return "COMPLETED", nil
+	default:
+		return "", errors.New("sqlite: invalid generation state")
 	}
 }
 
