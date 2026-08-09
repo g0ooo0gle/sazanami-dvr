@@ -116,6 +116,7 @@ func TestEvaluatorInheritsDisabledPriorityFollowAndMargins(t *testing.T) {
 	rule := storedRule(1, autoreservation.SearchCondition{Enabled: true})
 	rule.Recording = autoreservation.RecordingSettings{
 		Mode: 5, Priority: 1, Follow: false, StartMargin: &startMargin, EndMargin: &endMargin,
+		Folders: []autoreservation.Folder{{Path: "ドラマ", Writer: "Write_Default.dll", Name: "RecName_Macro.dll?$Title$"}},
 	}
 	store := &evaluationStore{rules: []autoreservation.Rule{rule}, seen: make(map[catalogmodel.ID]struct{})}
 	result, err := (Evaluator{
@@ -130,7 +131,8 @@ func TestEvaluatorInheritsDisabledPriorityFollowAndMargins(t *testing.T) {
 	}
 	created := store.created[0]
 	if !created.Disabled || created.Priority != 1 || created.RequestedFollow || created.Margins == nil ||
-		*created.Margins != (recording.RecordingMargins{Start: -10 * time.Second, End: 20 * time.Second}) {
+		*created.Margins != (recording.RecordingMargins{Start: -10 * time.Second, End: 20 * time.Second}) ||
+		created.Output != (recording.OutputSettings{Folder: "ドラマ", Template: "$Title$"}) {
 		t.Fatalf("created=%+v", created)
 	}
 }

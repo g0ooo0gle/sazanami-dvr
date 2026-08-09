@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,13 +16,15 @@ import (
 func TestReservationCreateReadbackAndDuplicate(t *testing.T) {
 	root, store := openMigratedStore(t)
 	reservation := reservationForTest(t, store)
+	reservation.Output = recording.OutputSettings{Folder: "ドラマ/保存", Template: "$Title$-$ReserveID$"}
 	created, err := store.CreateReservation(context.Background(), reservation)
 	if err != nil || created.Number != 1 {
 		t.Fatalf("created=%+v err=%v", created, err)
 	}
 	items, err := store.ActiveReservations(context.Background(), 1, 0)
 	if err != nil || len(items) != 1 || items[0].ID != reservation.ID || items[0].Number != created.Number ||
-		!items[0].RequestedFollow || !items[0].EffectiveFollow || items[0].Program.Title != reservation.Program.Title {
+		!items[0].RequestedFollow || !items[0].EffectiveFollow || items[0].Program.Title != reservation.Program.Title ||
+		items[0].Output != reservation.Output {
 		t.Fatalf("items=%+v err=%v", items, err)
 	}
 	duplicate := reservation
@@ -38,7 +41,7 @@ func TestReservationCreateReadbackAndDuplicate(t *testing.T) {
 	}
 	defer reopened.Close()
 	items, err = reopened.ActiveReservations(context.Background(), 256, 0)
-	if err != nil || len(items) != 1 || items[0].Number != 1 {
+	if err != nil || len(items) != 1 || items[0].Number != 1 || items[0].Output != reservation.Output {
 		t.Fatalf("restarted items=%+v err=%v", items, err)
 	}
 }
@@ -152,6 +155,8 @@ func TestReservationSettingsSchemaRejectsInvalidAndScannerRejectsCorruption(t *t
 		`UPDATE reservations SET effective_start_margin_seconds=3601 WHERE id=?`,
 		`UPDATE reservations SET effective_start_margin_seconds=0 WHERE id=?`,
 		`UPDATE reservations SET duration_seconds=86400 WHERE id=?`,
+		`UPDATE reservations SET output_folder=replace(hex(zeroblob(257)), '00', 'a') WHERE id=?`,
+		`UPDATE reservations SET output_template=replace(hex(zeroblob(513)), '00', 'a') WHERE id=?`,
 	} {
 		if _, err := store.writer.Exec(statement, created.ID.Bytes()); err == nil {
 			t.Fatalf("invalid SQL was accepted: %s", statement)
@@ -163,8 +168,46 @@ func TestReservationSettingsSchemaRejectsInvalidAndScannerRejectsCorruption(t *t
 	if _, err := store.writer.Exec(`UPDATE reservations SET effective_start_margin_seconds=0 WHERE id=?`, created.ID.Bytes()); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.writer.Exec(`UPDATE reservations SET output_folder='../bad' WHERE id=?`, created.ID.Bytes()); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := store.ActiveReservations(context.Background(), 1, 0); err == nil {
 		t.Fatal("corrupt default margin was accepted")
+	}
+}
+
+func TestExpandedOutputNameFailureRollsBackCreateAndChange(t *testing.T) {
+	_, store := openMigratedStore(t)
+	reservation := reservationForTest(t, store)
+	reservation.ID = testID(t, 219)
+	reservation.Program.EventID = 219
+	reservation.Program.Title = strings.Repeat("長", 100)
+	reservation.Output = recording.OutputSettings{Template: "$Title$"}
+	if _, err := store.CreateReservation(context.Background(), reservation); err == nil {
+		t.Fatal("展開後の上限を超える予約を作成しました")
+	}
+	var created int
+	if err := store.reader.QueryRow(`SELECT count(*) FROM reservations WHERE id=?`, reservation.ID.Bytes()).Scan(&created); err != nil || created != 0 {
+		t.Fatalf("created=%d err=%v", created, err)
+	}
+
+	reservation.Output = recording.OutputSettings{}
+	stored, err := store.CreateReservation(context.Background(), reservation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	change := recording.ReservationChange{Number: stored.Number, Request: recording.ReservationRequest{
+		NetworkID: reservation.Program.NetworkID, TransportStreamID: reservation.Program.TransportStreamID,
+		ServiceID: reservation.Program.ServiceID, EventID: reservation.Program.EventID,
+		Start: reservation.Program.Start, Duration: reservation.Program.Duration, Priority: reservation.Priority,
+		RequestedFollow: reservation.RequestedFollow, Output: recording.OutputSettings{Template: "$Title$"},
+	}}
+	if err := store.UpdateReservation(context.Background(), change, reservation.CreatedAt.Add(time.Second)); err == nil {
+		t.Fatal("展開後の上限を超える設定へ変更しました")
+	}
+	items, err := store.ActiveReservations(context.Background(), 1, 0)
+	if err != nil || len(items) != 1 || items[0].Output != (recording.OutputSettings{}) || items[0].Version != 1 {
+		t.Fatalf("items=%+v err=%v", items, err)
 	}
 }
 
@@ -438,13 +481,14 @@ func TestReservationUpdateCancelAndRecordingStatus(t *testing.T) {
 		NetworkID: reservation.Program.NetworkID, TransportStreamID: reservation.Program.TransportStreamID,
 		ServiceID: reservation.Program.ServiceID, EventID: reservation.Program.EventID,
 		Start: reservation.Program.Start, Duration: reservation.Program.Duration, Priority: 5,
+		Output: recording.OutputSettings{Folder: "更新後", Template: "$SDYYYY$-$Title$"},
 	}}
 	now := reservation.CreatedAt.Add(time.Second)
 	if err := store.UpdateReservation(context.Background(), change, now); err != nil {
 		t.Fatal(err)
 	}
 	items, err := store.ActiveReservations(context.Background(), 1, 0)
-	if err != nil || len(items) != 1 || items[0].Priority != 5 || items[0].Version != 2 {
+	if err != nil || len(items) != 1 || items[0].Priority != 5 || items[0].Version != 2 || items[0].Output != change.Request.Output {
 		t.Fatalf("items=%+v err=%v", items, err)
 	}
 	change.Request.EventID++

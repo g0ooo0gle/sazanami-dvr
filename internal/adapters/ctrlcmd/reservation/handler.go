@@ -4,6 +4,7 @@ package reservation
 import (
 	"context"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/codec"
@@ -288,7 +289,7 @@ func decodeReservation(reader *codec.Reader, change *recording.ReservationChange
 	change.Request = recording.ReservationRequest{
 		NetworkID: networkID, TransportStreamID: transportID, ServiceID: serviceID, EventID: eventID,
 		Start: start, Duration: time.Duration(duration) * time.Second, Priority: settings.priority,
-		RequestedFollow: settings.follow, Disabled: settings.disabled, Margins: settings.margins,
+		RequestedFollow: settings.follow, Disabled: settings.disabled, Margins: settings.margins, Output: settings.output,
 	}
 	return nil
 }
@@ -327,6 +328,7 @@ type decodedSettings struct {
 	follow   bool
 	disabled bool
 	margins  *recording.RecordingMargins
+	output   recording.OutputSettings
 }
 
 func decodeSettings(reader *codec.Reader) (decodedSettings, error) {
@@ -356,7 +358,7 @@ func decodeSettings(reader *codec.Reader) (decodedSettings, error) {
 		if err != nil {
 			return err
 		}
-		folders, err := decodeFolderVector(item)
+		settings.output, err = decodeOutputFolderVector(item)
 		if err != nil {
 			return err
 		}
@@ -392,13 +394,13 @@ func decodeSettings(reader *codec.Reader) (decodedSettings, error) {
 		if err != nil {
 			return err
 		}
-		partialFolders, err := decodeFolderVector(item)
+		partialFolders, err := decodeFolderCount(item)
 		if err != nil {
 			return err
 		}
 		if (recordingMode != 1 && recordingMode != 5) || settings.priority < 1 || settings.priority > 5 ||
 			followValue > 1 || serviceMode != 0 ||
-			exact != 0 || batch != "" || folders != 0 || suspend != 0 || reboot != 0 || useMargins > 1 ||
+			exact != 0 || batch != "" || suspend != 0 || reboot != 0 || useMargins > 1 ||
 			continued != 0 || partial != 0 || tuner != 0 || partialFolders != 0 {
 			return failure(codec.Unsupported, "recording-setting-out-of-profile", 0)
 		}
@@ -421,7 +423,54 @@ func decodeSettings(reader *codec.Reader) (decodedSettings, error) {
 	return settings, err
 }
 
-func decodeFolderVector(reader *codec.Reader) (int, error) {
+func decodeOutputFolderVector(reader *codec.Reader) (recording.OutputSettings, error) {
+	var result recording.OutputSettings
+	count := 0
+	err := reader.Vector(4, 1, func(item *codec.Reader, _ int) error {
+		count++
+		return item.Structure(func(folder *codec.Reader) error {
+			pathValue, err := folder.String()
+			if err != nil {
+				return err
+			}
+			writer, err := folder.String()
+			if err != nil {
+				return err
+			}
+			name, err := folder.String()
+			if err != nil {
+				return err
+			}
+			reserved, err := folder.String()
+			if err != nil {
+				return err
+			}
+			const plugin = "RecName_Macro.dll"
+			template := ""
+			switch {
+			case name == plugin:
+			case strings.HasPrefix(name, plugin+"?") && len(name) > len(plugin)+1:
+				template = name[len(plugin)+1:]
+			default:
+				return failure(codec.Unsupported, "recording-setting-out-of-profile", 0)
+			}
+			result = recording.OutputSettings{Folder: pathValue, Template: template}
+			if writer != "Write_Default.dll" || reserved != "" || result.Validate() != nil {
+				return failure(codec.Unsupported, "recording-setting-out-of-profile", 0)
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		return recording.OutputSettings{}, err
+	}
+	if count == 1 && result.Folder == "" && result.Template == "" {
+		return recording.OutputSettings{}, nil
+	}
+	return result, nil
+}
+
+func decodeFolderCount(reader *codec.Reader) (int, error) {
 	count := 0
 	err := reader.Vector(4, 1, func(item *codec.Reader, _ int) error {
 		count++
@@ -467,7 +516,15 @@ func reservationSize(reservation recording.Reservation, limits codec.Limits) (in
 	if err != nil {
 		return 0, err
 	}
-	return minimumReserveSize + title + station, nil
+	folders, err := reservationFoldersSize(reservation, limits)
+	if err != nil {
+		return 0, err
+	}
+	files, err := reservationFileNamesSize(reservation, limits)
+	if err != nil {
+		return 0, err
+	}
+	return minimumReserveSize + title + station + folders - 8 + files - 8, nil
 }
 
 func writeReservations(ctx context.Context, writer *codec.Writer, operations Operations, limits codec.Limits, expected int) error {
@@ -531,20 +588,24 @@ func writeReservation(writer *codec.Writer, reservation recording.Reservation, l
 	if err := writer.SystemTime(reservation.Program.Start); err != nil {
 		return err
 	}
-	if err := writeSettings(writer, reservation); err != nil {
+	if err := writeSettings(writer, reservation, limits); err != nil {
 		return err
 	}
 	if err := writer.I32(0); err != nil {
 		return err
 	}
-	if err := writeEmptyVector(writer); err != nil {
+	if err := writeReservationFileNames(writer, reservation, limits); err != nil {
 		return err
 	}
 	return writer.I32(0)
 }
 
-func writeSettings(writer *codec.Writer, reservation recording.Reservation) error {
-	if err := writer.I32(51); err != nil {
+func writeSettings(writer *codec.Writer, reservation recording.Reservation, limits codec.Limits) error {
+	folders, err := reservationFoldersSize(reservation, limits)
+	if err != nil {
+		return err
+	}
+	if err := writer.I32(int32(43 + folders)); err != nil {
 		return err
 	}
 	followValue, recordingMode := uint8(0), uint8(1)
@@ -568,7 +629,7 @@ func writeSettings(writer *codec.Writer, reservation recording.Reservation) erro
 	if err := writer.String(""); err != nil {
 		return err
 	}
-	if err := writeEmptyVector(writer); err != nil {
+	if err := writeReservationFolders(writer, reservation, limits); err != nil {
 		return err
 	}
 	if err := writer.U8(0); err != nil {
@@ -603,6 +664,95 @@ func writeSettings(writer *codec.Writer, reservation recording.Reservation) erro
 	return writeEmptyVector(writer)
 }
 
+func reservationFoldersSize(reservation recording.Reservation, limits codec.Limits) (int64, error) {
+	if reservation.Output == (recording.OutputSettings{}) {
+		return 8, nil
+	}
+	if reservation.Output.Validate() != nil {
+		return 0, failure(codec.Internal, "invalid-stored-reservation-output", int64(reservation.Number))
+	}
+	values := []string{reservation.Output.Folder, "Write_Default.dll", "RecName_Macro.dll", ""}
+	if reservation.Output.Template != "" {
+		values[2] += "?" + reservation.Output.Template
+	}
+	size := int64(12)
+	for _, value := range values {
+		field, err := codec.StringSize(value, limits)
+		if err != nil {
+			return 0, err
+		}
+		size += field
+	}
+	return size, nil
+}
+
+func writeReservationFolders(writer *codec.Writer, reservation recording.Reservation, limits codec.Limits) error {
+	size, err := reservationFoldersSize(reservation, limits)
+	if err != nil {
+		return err
+	}
+	count := int32(0)
+	if reservation.Output != (recording.OutputSettings{}) {
+		count = 1
+	}
+	if err := writer.I32(int32(size)); err != nil {
+		return err
+	}
+	if err := writer.I32(count); err != nil || count == 0 {
+		return err
+	}
+	if err := writer.I32(int32(size - 8)); err != nil {
+		return err
+	}
+	name := "RecName_Macro.dll"
+	if reservation.Output.Template != "" {
+		name += "?" + reservation.Output.Template
+	}
+	for _, value := range []string{reservation.Output.Folder, "Write_Default.dll", name, ""} {
+		if err := writer.String(value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func reservationFileNamesSize(reservation recording.Reservation, limits codec.Limits) (int64, error) {
+	value, ok, err := recording.ScheduledOutputPath(reservation)
+	if err != nil {
+		return 0, failure(codec.Internal, "invalid-stored-reservation-output", int64(reservation.Number))
+	}
+	if !ok {
+		return 8, nil
+	}
+	size, err := codec.StringSize(value, limits)
+	if err != nil {
+		return 0, err
+	}
+	return 8 + size, nil
+}
+
+func writeReservationFileNames(writer *codec.Writer, reservation recording.Reservation, limits codec.Limits) error {
+	size, err := reservationFileNamesSize(reservation, limits)
+	if err != nil {
+		return err
+	}
+	value, ok, err := recording.ScheduledOutputPath(reservation)
+	if err != nil {
+		return err
+	}
+	if err := writer.I32(int32(size)); err != nil {
+		return err
+	}
+	count := int32(0)
+	if ok {
+		count = 1
+	}
+	if err := writer.I32(count); err != nil || !ok {
+		return err
+	}
+	return writer.String(value)
+}
+
 func writeEmptyVector(writer *codec.Writer) error {
 	if err := writer.I32(8); err != nil {
 		return err
@@ -616,7 +766,7 @@ func validateStoredReservation(reservation recording.Reservation) error {
 		reservation.Program.Start.IsZero() || reservation.Program.Start.Location() != time.UTC ||
 		reservation.Program.Duration < time.Second || reservation.Program.Duration > 24*time.Hour ||
 		reservation.Program.Duration%time.Second != 0 || !reservation.PlannedEnd().After(reservation.PlannedStart()) ||
-		reservation.PlannedEnd().Sub(reservation.PlannedStart()) > recording.MaxEffectiveDuration {
+		reservation.PlannedEnd().Sub(reservation.PlannedStart()) > recording.MaxEffectiveDuration || reservation.Output.Validate() != nil {
 		return failure(codec.Internal, "invalid-stored-reservation", int64(reservation.Number))
 	}
 	return nil

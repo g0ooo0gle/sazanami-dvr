@@ -103,7 +103,12 @@ func (evaluator Evaluator) Run(ctx context.Context) (Result, error) {
 			request, err := evaluator.Catalog.ReservationRequestForProgram(program, candidate.rule.Recording.Priority,
 				candidate.rule.Recording.Follow)
 			settings := candidate.rule.Recording
+			output, supported := automaticOutputSettings(settings)
+			if !supported {
+				continue
+			}
 			request.Disabled = settings.Mode == 5
+			request.Output = output
 			if settings.StartMargin != nil {
 				request.Margins = &recording.RecordingMargins{
 					Start: time.Duration(*settings.StartMargin) * time.Second,
@@ -130,7 +135,7 @@ func (evaluator Evaluator) Run(ctx context.Context) (Result, error) {
 			_, err = evaluator.Store.CreateAutomaticReservation(ctx, candidate.rule.Number, recording.Reservation{
 				ID: id, Version: 1, State: recording.ReservationActive, Program: snapshot,
 				Priority: request.Priority, RequestedFollow: request.RequestedFollow,
-				Disabled: request.Disabled, Margins: request.Margins,
+				Disabled: request.Disabled, Margins: request.Margins, Output: request.Output,
 				CreatedAt: now, UpdatedAt: now,
 			})
 			if err != nil {
@@ -237,8 +242,12 @@ func prepareRule(rule autoreservation.Rule) preparedRule {
 	}
 	if search.Fuzzy || len(search.Contents) != 0 || search.ExcludeContents || len(search.Video) != 0 || len(search.Audio) != 0 ||
 		search.CheckRecordedTitle || (settings.Mode != 1 && settings.Mode != 5) || settings.ServiceMode != 0 || settings.Exact || settings.Batch != "" ||
-		len(settings.Folders) != 0 || settings.Suspend != 0 || settings.Reboot ||
+		settings.Suspend != 0 || settings.Reboot ||
 		settings.Continue || settings.PartialMode != 0 || settings.TunerID != 0 || len(settings.PartialFolders) != 0 {
+		prepared.unavailable = true
+		return prepared
+	}
+	if _, ok := automaticOutputSettings(settings); !ok {
 		prepared.unavailable = true
 		return prepared
 	}
@@ -261,6 +270,30 @@ func prepareRule(rule autoreservation.Rule) preparedRule {
 		prepared.keyword, prepared.exclude = keyword, exclude
 	}
 	return prepared
+}
+
+func automaticOutputSettings(settings autoreservation.RecordingSettings) (recording.OutputSettings, bool) {
+	if len(settings.Folders) == 0 {
+		return recording.OutputSettings{}, true
+	}
+	if len(settings.Folders) != 1 {
+		return recording.OutputSettings{}, false
+	}
+	folder := settings.Folders[0]
+	if folder.Writer != "Write_Default.dll" {
+		return recording.OutputSettings{}, false
+	}
+	const plugin = "RecName_Macro.dll"
+	template := ""
+	switch {
+	case folder.Name == plugin:
+	case strings.HasPrefix(folder.Name, plugin+"?") && len(folder.Name) > len(plugin)+1:
+		template = folder.Name[len(plugin)+1:]
+	default:
+		return recording.OutputSettings{}, false
+	}
+	output := recording.OutputSettings{Folder: folder.Path, Template: template}
+	return output, output.Validate() == nil
 }
 
 func compilePattern(value string, caseSensitive bool) (*regexp.Regexp, error) {

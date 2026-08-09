@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -237,6 +238,7 @@ func (*e2eLease) Close() error  { return nil }
 func TestReservationToFinalFileSurvivesRestart(t *testing.T) {
 	dataRoot, store := openMigratedStore(t)
 	reservation := reservationForTest(t, store)
+	reservation.Output = core.OutputSettings{Folder: "実験/録画", Template: "$ReserveID$-$Title$"}
 	created, err := store.CreateReservation(context.Background(), reservation)
 	if err != nil {
 		t.Fatal(err)
@@ -308,6 +310,10 @@ func TestReservationToFinalFileSurvivesRestart(t *testing.T) {
 	if err != nil || len(items) != 1 || items[0].State != core.AttemptSucceeded || items[0].ByteCount != 376 ||
 		items[0].Availability != core.AvailabilityFinal || items[0].Recovered || stream.opens != 2 {
 		t.Fatalf("items=%+v opens=%d err=%v", items, stream.opens, err)
+	}
+	expectedPath, ok, err := core.ScheduledOutputPath(created)
+	if err != nil || !ok || items[0].Plan.FinalPath != expectedPath || !strings.HasPrefix(expectedPath, "実験/録画/") {
+		t.Fatalf("plan=%+v expected=%q ok=%v err=%v", items[0].Plan, expectedPath, ok, err)
 	}
 	var terminalReason string
 	if err := store.reader.QueryRow(`SELECT terminal_reason FROM recording_attempts WHERE id=?`, items[0].ID.Bytes()).Scan(&terminalReason); err != nil ||
