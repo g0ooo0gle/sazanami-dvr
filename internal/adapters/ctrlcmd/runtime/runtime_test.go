@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -50,7 +51,7 @@ func (emptyReservationOperations) Change(context.Context, recording.ReservationC
 func (emptyReservationOperations) Delete(context.Context, int32) error            { return nil }
 func (emptyReservationOperations) Recording(context.Context, int32) (bool, error) { return false, nil }
 
-func (catalog *recordingCatalog) CurrentProgramsByService(_ context.Context, _ catalogmodel.ID, limit int, after catalogmodel.ProgramCursor) ([]catalogmodel.CurrentProgram, error) {
+func (catalog *recordingCatalog) ProgramsByServiceForGeneration(_ context.Context, _, _ catalogmodel.ID, limit int, after catalogmodel.ProgramCursor) ([]catalogmodel.CurrentProgram, error) {
 	result := make([]catalogmodel.CurrentProgram, 0, limit)
 	for _, program := range catalog.programs {
 		if program.ServiceLocator > after.ServiceLocator ||
@@ -64,7 +65,7 @@ func (catalog *recordingCatalog) CurrentProgramsByService(_ context.Context, _ c
 	return result, nil
 }
 
-func (catalog *recordingCatalog) CurrentProgramsForService(_ context.Context, _ catalogmodel.ID, serviceLocator string, limit int, afterEvent string) ([]catalogmodel.CurrentProgram, error) {
+func (catalog *recordingCatalog) ProgramsForServiceForGeneration(_ context.Context, _, _ catalogmodel.ID, serviceLocator string, limit int, afterEvent string) ([]catalogmodel.CurrentProgram, error) {
 	result := make([]catalogmodel.CurrentProgram, 0, limit)
 	for _, program := range catalog.programs {
 		if program.ServiceLocator != serviceLocator || program.EventLocator <= afterEvent {
@@ -78,7 +79,7 @@ func (catalog *recordingCatalog) CurrentProgramsForService(_ context.Context, _ 
 	return result, nil
 }
 
-func (catalog *recordingCatalog) CurrentProgramsMatching(_ context.Context, _ catalogmodel.ID, locator string, eventID, start, duration int64) ([]catalogmodel.CurrentProgram, error) {
+func (catalog *recordingCatalog) ProgramsMatchingGeneration(_ context.Context, _, _ catalogmodel.ID, locator string, eventID, start, duration int64) ([]catalogmodel.CurrentProgram, error) {
 	result := make([]catalogmodel.CurrentProgram, 0, 2)
 	for _, program := range catalog.programs {
 		if program.ServiceLocator == locator && program.RawEventID != nil && *program.RawEventID == eventID &&
@@ -103,7 +104,13 @@ func (catalog *fakeCatalog) CurrentBackends(_ context.Context, limit int, after 
 	return result, nil
 }
 
-func (catalog *fakeCatalog) CurrentServices(_ context.Context, _ catalogmodel.ID, limit int, after catalogmodel.ID) ([]catalogmodel.CurrentService, error) {
+func (catalog *fakeCatalog) LatestCompletedGeneration(context.Context, catalogmodel.ID) (catalogmodel.ID, error) {
+	return testID(101), nil
+}
+
+func (catalog *fakeCatalog) ServicesForGeneration(_ context.Context, _, _ catalogmodel.ID,
+	_ catalogmodel.GenerationState, limit int, after catalogmodel.ID,
+) ([]catalogmodel.CurrentService, error) {
 	if catalog.serviceErr != nil {
 		return nil, catalog.serviceErr
 	}
@@ -220,6 +227,60 @@ func TestBuildSnapshotMatchesAndSortsWithoutChangingCatalog(t *testing.T) {
 	if current.Key == changedValue.Key {
 		t.Fatal("設定変更後もsnapshot keyが同一です")
 	}
+}
+
+func TestCandidateSnapshotSwitchKeepsOldValueImmutable(t *testing.T) {
+	root, path, catalog, backendID := validFixture(t)
+	initial, err := BuildSnapshot(context.Background(), root, path, catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	holder, err := NewSnapshotHolder(initial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldValue, _ := initial.Current(context.Background())
+	catalog.services[0].DisplayName = "更新後のサービス"
+	candidateID := testID(102)
+	candidate, err := BuildCandidateSnapshot(context.Background(), root, path, backendID, candidateID, catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidate.generationID != candidateID || initial.generationID == candidate.generationID {
+		t.Fatalf("initial=%s candidate=%s", initial.generationID.String(), candidate.generationID.String())
+	}
+	if err := holder.Store(candidate); err != nil {
+		t.Fatal(err)
+	}
+	newValue, _ := holder.Load().Current(context.Background())
+	oldAgain, _ := initial.Current(context.Background())
+	if newValue.Services[0].ServiceName != "更新後のサービス" || oldAgain.Services[0].ServiceName != oldValue.Services[0].ServiceName {
+		t.Fatalf("old=%+v new=%+v", oldAgain.Services[0], newValue.Services[0])
+	}
+	if err := holder.Store(nil); err == nil || holder.Load() != candidate {
+		t.Fatalf("nil store err=%v", err)
+	}
+	var wait sync.WaitGroup
+	for range 4 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			for range 100 {
+				if holder.Load() == nil {
+					t.Error("holder returned nil")
+				}
+			}
+		}()
+	}
+	for range 100 {
+		if err := holder.Store(initial); err != nil {
+			t.Fatal(err)
+		}
+		if err := holder.Store(candidate); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wait.Wait()
 }
 
 func TestSnapshotFindsOneReservableProgram(t *testing.T) {
@@ -450,6 +511,57 @@ func TestServiceTypeAndCatalogCountBoundaries(t *testing.T) {
 type fixedClock struct{ instant time.Time }
 
 func (clock fixedClock) Now() time.Time { return clock.instant }
+
+type countingLoader struct {
+	snapshot *Snapshot
+	loads    int
+}
+
+func (loader *countingLoader) Load() *Snapshot {
+	loader.loads++
+	return loader.snapshot
+}
+
+func TestRouterLoadsSnapshotOncePerCatalogRequest(t *testing.T) {
+	root, path, base, _ := validFixture(t)
+	catalog := &recordingCatalog{fakeCatalog: base}
+	snapshot, err := BuildSnapshot(context.Background(), root, path, catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loader := &countingLoader{snapshot: snapshot}
+	router, err := NewRecordingRouter(loader, emptyReservationOperations{}, SystemClock{}, codec.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	loader.loads = 0
+	request := make([]byte, 8)
+	binary.LittleEndian.PutUint32(request, uint32(channel.CommandEnumService))
+	if err := router.Handle(context.Background(), request, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if loader.loads != 1 {
+		t.Fatalf("channel loads=%d", loader.loads)
+	}
+
+	loader.loads = 0
+	programBody := make([]byte, 40)
+	binary.LittleEndian.PutUint32(programBody[0:4], 40)
+	binary.LittleEndian.PutUint32(programBody[4:8], 4)
+	for index, selector := range [...]uint64{0xffffffffffff, 0xffffffffffff, 1, 0x7fffffffffffffff} {
+		binary.LittleEndian.PutUint64(programBody[8+index*8:16+index*8], selector)
+	}
+	programRequest := make([]byte, 8+len(programBody))
+	binary.LittleEndian.PutUint32(programRequest[0:4], uint32(programguide.Command))
+	binary.LittleEndian.PutUint32(programRequest[4:8], uint32(len(programBody)))
+	copy(programRequest[8:], programBody)
+	if err := router.Handle(context.Background(), programRequest, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if loader.loads != 1 {
+		t.Fatalf("program loads=%d", loader.loads)
+	}
+}
 
 func TestRouterDispatchesOnlyAcceptedCommands(t *testing.T) {
 	root, path, catalog, _ := validFixture(t)

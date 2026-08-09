@@ -31,7 +31,7 @@ func TestVersion(t *testing.T) {
 	if code := run([]string{"--version"}, &output, &diagnostic); code != 0 {
 		t.Fatalf("code=%d err=%q", code, diagnostic.String())
 	}
-	if got, want := output.String(), "sazanami-dvr 0.0.2\n"; got != want {
+	if got, want := output.String(), "sazanami-dvr 0.0.3\n"; got != want {
 		t.Fatalf("version=%q want=%q", got, want)
 	}
 }
@@ -292,7 +292,7 @@ func TestCtrlCmdRejectsUnsafeListenBeforeDatabase(t *testing.T) {
 	}
 }
 
-func TestRecordingServeDoesNotConnectBeforeReservationTime(t *testing.T) {
+func TestRecordingServeRefreshesCatalogWithoutOpeningStreamBeforeReservationTime(t *testing.T) {
 	root := migratedRoot(t)
 	backendID := seedCtrlCmdCatalog(t, root)
 	channelMap := filepath.Join(root, "channels.json")
@@ -301,9 +301,17 @@ func TestRecordingServeDoesNotConnectBeforeReservationTime(t *testing.T) {
 		t.Fatal(err)
 	}
 	recordingRoot := filepath.Join(t.TempDir(), "recordings")
-	var calls atomic.Int32
-	providerServer := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		calls.Add(1)
+	var catalogCalls, streamCalls atomic.Int32
+	var calledOnce sync.Once
+	catalogCalled := make(chan struct{})
+	providerServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if strings.HasSuffix(request.URL.Path, "/stream") {
+			streamCalls.Add(1)
+			return
+		}
+		catalogCalls.Add(1)
+		calledOnce.Do(func() { close(catalogCalled) })
+		http.Error(writer, "synthetic", http.StatusServiceUnavailable)
 	}))
 	defer providerServer.Close()
 	address := unusedLoopbackAddress(t)
@@ -323,9 +331,15 @@ func TestRecordingServeDoesNotConnectBeforeReservationTime(t *testing.T) {
 		cancel()
 		t.Fatalf("録画processが起動しませんでした: %q", diagnostic.String())
 	}
-	if calls.Load() != 0 {
+	select {
+	case <-catalogCalled:
+	case <-time.After(5 * time.Second):
 		cancel()
-		t.Fatalf("予約開始前にproviderへ%d回接続しました", calls.Load())
+		t.Fatal("起動直後の番組表更新が始まりませんでした")
+	}
+	if catalogCalls.Load() == 0 || streamCalls.Load() != 0 {
+		cancel()
+		t.Fatalf("catalog=%d stream=%d", catalogCalls.Load(), streamCalls.Load())
 	}
 	connection, err := net.DialTimeout("tcp", address, time.Second)
 	if err != nil {
@@ -355,9 +369,9 @@ func TestRecordingServeDoesNotConnectBeforeReservationTime(t *testing.T) {
 		cancel()
 		t.Fatalf("response header=%x body=%x", header, body)
 	}
-	if calls.Load() != 0 {
+	if streamCalls.Load() != 0 {
 		cancel()
-		t.Fatalf("予約一覧取得でproviderへ%d回接続しました", calls.Load())
+		t.Fatalf("予約一覧取得でstreamへ%d回接続しました", streamCalls.Load())
 	}
 	cancel()
 	select {
@@ -385,6 +399,33 @@ func TestRecordingServeRejectsUnsafeListenBeforeOpeningRoots(t *testing.T) {
 	}, &output, &diagnostic)
 	if code != 1 || !strings.Contains(diagnostic.String(), "loopback-listen-required") || strings.Contains(diagnostic.String(), private) {
 		t.Fatalf("code=%d diagnostic=%q", code, diagnostic.String())
+	}
+}
+
+func TestRecordingServeValidatesCatalogRefreshIntervalBeforeOpeningRoots(t *testing.T) {
+	base := []string{
+		"recording", "serve", "--data-root", "/private/not-for-output",
+		"--recording-root", "/private/not-for-output/recordings",
+		"--channel-map", "/private/not-for-output/channels.json", "--provider", "mirakurun",
+		"--base-url", "http://127.0.0.1:40773", "--listen", "127.0.0.1:4510",
+	}
+	for _, interval := range []string{"4m59.999999999s", "24h0m0.000000001s"} {
+		var output, diagnostic bytes.Buffer
+		arguments := append(append([]string(nil), base...), "--catalog-refresh-interval", interval)
+		code := runContext(context.Background(), arguments, &output, &diagnostic)
+		if code != 1 || !strings.Contains(diagnostic.String(), "recording-arguments-required") ||
+			strings.Contains(diagnostic.String(), "/private") {
+			t.Fatalf("interval=%q code=%d diagnostic=%q", interval, code, diagnostic.String())
+		}
+	}
+	for _, interval := range []string{"5m", "24h"} {
+		var output, diagnostic bytes.Buffer
+		arguments := append(append([]string(nil), base...), "--catalog-refresh-interval", interval)
+		code := runContext(context.Background(), arguments, &output, &diagnostic)
+		if code != 1 || !strings.Contains(diagnostic.String(), "current-database-required") ||
+			strings.Contains(diagnostic.String(), "/private") {
+			t.Fatalf("interval=%q code=%d diagnostic=%q", interval, code, diagnostic.String())
+		}
 	}
 }
 

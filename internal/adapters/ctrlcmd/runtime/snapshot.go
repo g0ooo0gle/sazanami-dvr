@@ -20,23 +20,29 @@ const catalogPageSize = 256
 // CatalogReaderは完成済みカタログからチャンネル応答に必要な項目だけを読む境界である。
 type CatalogReader interface {
 	CurrentBackends(context.Context, int, catalogmodel.ID) ([]catalogmodel.CurrentBackend, error)
-	CurrentServices(context.Context, catalogmodel.ID, int, catalogmodel.ID) ([]catalogmodel.CurrentService, error)
+	LatestCompletedGeneration(context.Context, catalogmodel.ID) (catalogmodel.ID, error)
+	ServicesForGeneration(context.Context, catalogmodel.ID, catalogmodel.ID, catalogmodel.GenerationState,
+		int, catalogmodel.ID) ([]catalogmodel.CurrentService, error)
 }
 
 type programCatalogReader interface {
-	CurrentProgramsByService(context.Context, catalogmodel.ID, int, catalogmodel.ProgramCursor) ([]catalogmodel.CurrentProgram, error)
-	CurrentProgramsForService(context.Context, catalogmodel.ID, string, int, string) ([]catalogmodel.CurrentProgram, error)
-	CurrentProgramsMatching(context.Context, catalogmodel.ID, string, int64, int64, int64) ([]catalogmodel.CurrentProgram, error)
+	ProgramsByServiceForGeneration(context.Context, catalogmodel.ID, catalogmodel.ID,
+		int, catalogmodel.ProgramCursor) ([]catalogmodel.CurrentProgram, error)
+	ProgramsForServiceForGeneration(context.Context, catalogmodel.ID, catalogmodel.ID,
+		string, int, string) ([]catalogmodel.CurrentProgram, error)
+	ProgramsMatchingGeneration(context.Context, catalogmodel.ID, catalogmodel.ID,
+		string, int64, int64, int64) ([]catalogmodel.CurrentProgram, error)
 }
 
-// Snapshotは起動時に確定したチャンネル集合を保持する。実行中の再読込は行わない。
+// Snapshotは一つの完了済み番組表世代と、その世代に対応するチャンネル集合を保持する。
 type Snapshot struct {
-	value     channel.Snapshot
-	backendID catalogmodel.ID
-	programs  programCatalogReader
+	value        channel.Snapshot
+	backendID    catalogmodel.ID
+	generationID catalogmodel.ID
+	programs     programCatalogReader
 }
 
-// BuildSnapshotは設定と最新の完成済みカタログを全件照合し、待受に使える固定スナップショットを作る。
+// BuildSnapshotは設定と最新の完成済み番組表を照合し、世代を固定したスナップショットを作る。
 func BuildSnapshot(ctx context.Context, dataRoot, path string, reader CatalogReader) (*Snapshot, error) {
 	if ctx == nil || reader == nil {
 		return nil, stable("channel-snapshot-failed")
@@ -56,7 +62,39 @@ func BuildSnapshot(ctx context.Context, dataRoot, path string, reader CatalogRea
 	if backend.Kind != "MIRAKURUN" {
 		return nil, stable("channel-backend-unavailable")
 	}
-	catalog, err := readCatalog(ctx, reader, backendID)
+	generationID, err := reader.LatestCompletedGeneration(ctx, backendID)
+	if err != nil {
+		return nil, stable("channel-catalog-unavailable")
+	}
+	return buildSnapshot(ctx, configuration, backendID, generationID, catalogmodel.GenerationCompleted, reader)
+}
+
+// BuildCandidateSnapshotは完了直前のRUNNING世代をチャンネル設定へ照合する。
+// 戻り値は呼び出し側が同じ世代をCOMPLETEDにできた場合だけ公開してよい。
+func BuildCandidateSnapshot(ctx context.Context, dataRoot, path string, backendID, generationID catalogmodel.ID,
+	reader CatalogReader,
+) (*Snapshot, error) {
+	if ctx == nil || reader == nil {
+		return nil, stable("channel-snapshot-failed")
+	}
+	configuration, err := loadChannelMap(dataRoot, path)
+	if err != nil {
+		return nil, err
+	}
+	configuredBackend, err := catalogmodel.ParseID(configuration.BackendID)
+	if err != nil {
+		return nil, stable("channel-map-field-invalid")
+	}
+	if configuredBackend != backendID {
+		return nil, stable("channel-backend-unavailable")
+	}
+	return buildSnapshot(ctx, configuration, backendID, generationID, catalogmodel.GenerationRunning, reader)
+}
+
+func buildSnapshot(ctx context.Context, configuration channelMap, backendID, generationID catalogmodel.ID,
+	state catalogmodel.GenerationState, reader CatalogReader,
+) (*Snapshot, error) {
+	catalog, err := readCatalog(ctx, reader, backendID, generationID, state)
 	if err != nil {
 		return nil, err
 	}
@@ -73,7 +111,7 @@ func BuildSnapshot(ctx context.Context, dataRoot, path string, reader CatalogRea
 	}
 	value.Services = verified
 	programs, _ := reader.(programCatalogReader)
-	return &Snapshot{value: value, backendID: backendID, programs: programs}, nil
+	return &Snapshot{value: value, backendID: backendID, generationID: generationID, programs: programs}, nil
 }
 
 // FindProgramは放送ID、開始時刻、継続時間が一致する完成済み番組を一件だけ返す。
@@ -96,8 +134,8 @@ func (snapshot *Snapshot) FindProgram(ctx context.Context, request recording.Res
 		return recording.ProgramSnapshot{}, stable("program-not-reservable")
 	}
 	durationMS := request.Duration.Milliseconds()
-	programs, err := snapshot.programs.CurrentProgramsMatching(ctx, snapshot.backendID, selected.ProviderLocator,
-		int64(request.EventID), request.Start.UnixMilli(), durationMS)
+	programs, err := snapshot.programs.ProgramsMatchingGeneration(ctx, snapshot.backendID, snapshot.generationID,
+		selected.ProviderLocator, int64(request.EventID), request.Start.UnixMilli(), durationMS)
 	if err != nil || len(programs) != 1 {
 		return recording.ProgramSnapshot{}, stable("program-not-reservable")
 	}
@@ -145,12 +183,15 @@ func (snapshot *Snapshot) Count() int {
 	return len(snapshot.value.Services)
 }
 
+// Loadは固定スナップショット自身を返し、動的保持器と同じrouter境界で利用できるようにする。
+func (snapshot *Snapshot) Load() *Snapshot { return snapshot }
+
 // CurrentProgramsByServiceは完成済み番組表を放送サービス順に読み進める。
 func (snapshot *Snapshot) CurrentProgramsByService(ctx context.Context, limit int, after catalogmodel.ProgramCursor) ([]catalogmodel.CurrentProgram, error) {
 	if snapshot == nil || snapshot.programs == nil || ctx == nil {
 		return nil, stable("program-catalog-unavailable")
 	}
-	return snapshot.programs.CurrentProgramsByService(ctx, snapshot.backendID, limit, after)
+	return snapshot.programs.ProgramsByServiceForGeneration(ctx, snapshot.backendID, snapshot.generationID, limit, after)
 }
 
 // CurrentProgramsForServiceは、選択済みの一つのサービスについて、イベント識別子順に番組を読み進める。
@@ -158,7 +199,8 @@ func (snapshot *Snapshot) CurrentProgramsForService(ctx context.Context, service
 	if snapshot == nil || snapshot.programs == nil || ctx == nil {
 		return nil, stable("program-catalog-unavailable")
 	}
-	return snapshot.programs.CurrentProgramsForService(ctx, snapshot.backendID, serviceLocator, limit, afterEvent)
+	return snapshot.programs.ProgramsForServiceForGeneration(ctx, snapshot.backendID, snapshot.generationID,
+		serviceLocator, limit, afterEvent)
 }
 
 func findBackend(ctx context.Context, reader CatalogReader, target catalogmodel.ID) (catalogmodel.CurrentBackend, error) {
@@ -189,12 +231,14 @@ func findBackend(ctx context.Context, reader CatalogReader, target catalogmodel.
 	}
 }
 
-func readCatalog(ctx context.Context, reader CatalogReader, backendID catalogmodel.ID) ([]catalogmodel.CurrentService, error) {
+func readCatalog(ctx context.Context, reader CatalogReader, backendID, generationID catalogmodel.ID,
+	state catalogmodel.GenerationState,
+) ([]catalogmodel.CurrentService, error) {
 	result := make([]catalogmodel.CurrentService, 0, catalogPageSize)
 	locators := make(map[string]struct{})
 	var after catalogmodel.ID
 	for {
-		page, err := reader.CurrentServices(ctx, backendID, catalogPageSize, after)
+		page, err := reader.ServicesForGeneration(ctx, backendID, generationID, state, catalogPageSize, after)
 		if err != nil || len(page) > catalogPageSize {
 			return nil, stable("channel-catalog-unavailable")
 		}

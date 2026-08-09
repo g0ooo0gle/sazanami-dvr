@@ -173,6 +173,69 @@ func TestCurrentProgramsByServiceAndMatching(t *testing.T) {
 	}
 }
 
+func TestGenerationQueriesPinCompletedAndAllowOnlyRunningCandidateServices(t *testing.T) {
+	_, store := openMigratedStore(t)
+	reservation := reservationForTest(t, store)
+	backendID := reservation.Program.BackendID
+	completedID, err := store.LatestCompletedGeneration(context.Background(), backendID)
+	if err != nil || completedID != testID(t, 111) {
+		t.Fatalf("completed=%s err=%v", completedID.String(), err)
+	}
+	services, err := store.ServicesForGeneration(context.Background(), backendID, completedID,
+		catalogmodel.GenerationCompleted, 16, catalogmodel.ID{})
+	if err != nil || len(services) != 1 || services[0].ProviderLocator != reservation.Program.ProviderServiceLocator {
+		t.Fatalf("completed services=%+v err=%v", services, err)
+	}
+	programs, err := store.ProgramsByServiceForGeneration(context.Background(), backendID, completedID,
+		16, catalogmodel.ProgramCursor{})
+	if err != nil || len(programs) != 1 {
+		t.Fatalf("completed programs=%+v err=%v", programs, err)
+	}
+	selected, err := store.ProgramsForServiceForGeneration(context.Background(), backendID, completedID,
+		reservation.Program.ProviderServiceLocator, 16, "")
+	if err != nil || len(selected) != 1 {
+		t.Fatalf("service programs=%+v err=%v", selected, err)
+	}
+	matches, err := store.ProgramsMatchingGeneration(context.Background(), backendID, completedID,
+		reservation.Program.ProviderServiceLocator, int64(reservation.Program.EventID),
+		reservation.Program.Start.UnixMilli(), reservation.Program.Duration.Milliseconds())
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("matches=%+v err=%v", matches, err)
+	}
+
+	runningID := testID(t, 112)
+	if err := store.BeginSync(context.Background(), catalogmodel.Sync{
+		ID: runningID, BackendID: backendID, StartedAtMS: reservation.Program.Start.UnixMilli() + 1,
+		CorrelationID: "running-candidate",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	networkID, transportID, serviceID := int64(1), int64(2), int64(3)
+	if err := store.StoreServices(context.Background(), runningID, []catalogmodel.ServiceObservation{{
+		ProviderLocator: reservation.Program.ProviderServiceLocator, NetworkID: &networkID,
+		TransportID: &transportID, ServiceID: &serviceID, DisplayName: "候補局",
+		Validation: catalogmodel.ValidationValid,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := store.ServicesForGeneration(context.Background(), backendID, runningID,
+		catalogmodel.GenerationRunning, 16, catalogmodel.ID{})
+	if err != nil || len(candidate) != 1 || candidate[0].DisplayName != "候補局" {
+		t.Fatalf("candidate=%+v err=%v", candidate, err)
+	}
+	notPublished, err := store.ServicesForGeneration(context.Background(), backendID, runningID,
+		catalogmodel.GenerationCompleted, 16, catalogmodel.ID{})
+	if err != nil || len(notPublished) != 0 {
+		t.Fatalf("running was published: %+v err=%v", notPublished, err)
+	}
+	if latest, err := store.LatestCompletedGeneration(context.Background(), backendID); err != nil || latest != completedID {
+		t.Fatalf("latest=%s err=%v", latest.String(), err)
+	}
+	if _, err := store.ServicesForGeneration(context.Background(), backendID, runningID, 0, 16, catalogmodel.ID{}); err == nil {
+		t.Fatal("invalid generation state was accepted")
+	}
+}
+
 func TestRecordingAttemptLifecycle(t *testing.T) {
 	_, store := openMigratedStore(t)
 	reservation := reservationForTest(t, store)

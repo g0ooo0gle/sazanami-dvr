@@ -28,6 +28,16 @@ type Sync struct {
 	VerifiedFakeLineage bool
 }
 
+// GenerationStateは番組表世代を事前検証する段階と、利用者へ公開できる段階を区別する。
+type GenerationState uint8
+
+const (
+	// GenerationRunningは取得中または完了直前の検証中で、まだ公開してはいけない世代である。
+	GenerationRunning GenerationState = iota + 1
+	// GenerationCompletedは取得と事前検証を終え、固定読み取りに利用できる世代である。
+	GenerationCompleted
+)
+
 // ServiceObservationはprovider表現を正規化したservice観測である。
 type ServiceObservation struct {
 	ProviderLocator string

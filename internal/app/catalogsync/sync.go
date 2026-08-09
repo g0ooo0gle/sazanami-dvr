@@ -42,6 +42,41 @@ type Result struct {
 	CompletedAt time.Time
 }
 
+// FailureStageは定期更新が秘密情報を出さずに失敗箇所を分類するための段階である。
+type FailureStage uint8
+
+const (
+	// FailureInternalは依存や要求自体が不正な段階である。
+	FailureInternal FailureStage = iota + 1
+	// FailureProviderは外部providerの接続、応答、観測値を処理する段階である。
+	FailureProvider
+	// FailureStoreは永続化または世代確定の段階である。
+	FailureStore
+	// FailureValidationは保存済み候補を完了前に検証する段階である。
+	FailureValidation
+)
+
+// Failureは元のエラーを保ったまま、番組表更新の失敗段階だけを追加する。
+type Failure struct {
+	Stage FailureStage
+	err   error
+}
+
+// Errorは外部へ追加情報を出さず、元のエラーメッセージを返す。
+func (failure *Failure) Error() string { return failure.err.Error() }
+
+// Unwrapは既存のエラー判定を維持するため、元のエラーを返す。
+func (failure *Failure) Unwrap() error { return failure.err }
+
+// StageOfはcatalog syncの失敗段階を返す。分類できないエラーはFailureInternalとする。
+func StageOf(err error) FailureStage {
+	var failure *Failure
+	if errors.As(err, &failure) {
+		return failure.Stage
+	}
+	return FailureInternal
+}
+
 // Serviceはprovider I/Oと短いrepository transactionの順序を所有する。
 type Service struct {
 	Provider   providercatalog.CatalogProvider
@@ -51,31 +86,48 @@ type Service struct {
 
 // Syncはservices、programsを順にnormal endまで読み、最後にだけgenerationをCOMPLETEDへ遷移させる。
 func (service Service) Sync(ctx context.Context, request Request) (result Result, returnErr error) {
+	return service.sync(ctx, request, nil)
+}
+
+// SyncValidatedは全データの保存後、COMPLETEDへ遷移する直前に候補世代を検証する。
+// validateが失敗した世代はFAILEDへ閉じ、以前の完了世代を維持する。
+func (service Service) SyncValidated(ctx context.Context, request Request,
+	validate func(context.Context, catalogmodel.ID) error,
+) (Result, error) {
+	if validate == nil {
+		return Result{}, stage(FailureInternal, errors.New("catalogsync: missing validation"))
+	}
+	return service.sync(ctx, request, validate)
+}
+
+func (service Service) sync(ctx context.Context, request Request,
+	validate func(context.Context, catalogmodel.ID) error,
+) (result Result, returnErr error) {
 	if ctx == nil || service.Provider == nil || service.Repository == nil || service.Clock == nil {
-		return result, errors.New("catalogsync: missing dependency")
+		return result, stage(FailureInternal, errors.New("catalogsync: missing dependency"))
 	}
 	if request.Backend.Kind != "FAKE" && request.Backend.Kind != "MIRAKURUN" {
-		return result, errors.New("catalogsync: backend kind is not accepted")
+		return result, stage(FailureInternal, errors.New("catalogsync: backend kind is not accepted"))
 	}
 	if request.Backend.Kind == "MIRAKURUN" && request.VerifiedFakeLineage {
-		return result, errors.New("catalogsync: real backend cannot use Fake lineage")
+		return result, stage(FailureInternal, errors.New("catalogsync: real backend cannot use Fake lineage"))
 	}
 	if request.CorrelationID == "" || len(request.CorrelationID) > 128 {
-		return result, errors.New("catalogsync: invalid correlation")
+		return result, stage(FailureInternal, errors.New("catalogsync: invalid correlation"))
 	}
 	if request.ServicePageLimit < 1 || request.ServicePageLimit > provider.MaxCatalogPage ||
 		request.ProgramPageLimit < 1 || request.ProgramPageLimit > provider.MaxCatalogPage {
-		return result, errors.New("catalogsync: page limit outside accepted range")
+		return result, stage(FailureInternal, errors.New("catalogsync: page limit outside accepted range"))
 	}
 
 	started := service.Clock.Now().UTC()
 	request.Backend.ObservedAtMS = started.UnixMilli()
 	if err := service.Repository.EnsureBackend(ctx, request.Backend); err != nil {
-		return result, err
+		return result, stage(FailureStore, err)
 	}
 	syncID, err := catalogmodel.NewID()
 	if err != nil {
-		return result, errors.New("catalogsync: generate sync id")
+		return result, stage(FailureInternal, errors.New("catalogsync: generate sync id"))
 	}
 	result.SyncID = syncID
 	syncRecord := catalogmodel.Sync{
@@ -83,7 +135,7 @@ func (service Service) Sync(ctx context.Context, request Request) (result Result
 		CorrelationID: request.CorrelationID, VerifiedFakeLineage: request.VerifiedFakeLineage,
 	}
 	if err := service.Repository.BeginSync(ctx, syncRecord); err != nil {
-		return result, err
+		return result, stage(FailureStore, err)
 	}
 	completed := false
 	defer func() {
@@ -92,7 +144,7 @@ func (service Service) Sync(ctx context.Context, request Request) (result Result
 		}
 		failureContext := context.WithoutCancel(ctx)
 		if err := service.Repository.FailSync(failureContext, syncID, service.Clock.Now().UTC().UnixMilli(), failureReason(returnErr)); err != nil && returnErr == nil {
-			returnErr = err
+			returnErr = stage(FailureStore, err)
 		}
 	}()
 
@@ -100,7 +152,7 @@ func (service Service) Sync(ctx context.Context, request Request) (result Result
 		CorrelationID: request.CorrelationID + "-services", Limit: request.ServicePageLimit,
 	})
 	if err != nil {
-		return result, err
+		return result, stage(FailureProvider, err)
 	}
 	if err := service.consumeServices(ctx, syncID, services, &result.Services); err != nil {
 		return result, err
@@ -110,15 +162,20 @@ func (service Service) Sync(ctx context.Context, request Request) (result Result
 		CorrelationID: request.CorrelationID + "-programs", Limit: request.ProgramPageLimit,
 	})
 	if err != nil {
-		return result, err
+		return result, stage(FailureProvider, err)
 	}
 	if err := service.consumePrograms(ctx, syncID, request.VerifiedFakeLineage, programs, &result.Programs); err != nil {
 		return result, err
 	}
+	if validate != nil {
+		if err := validate(ctx, syncID); err != nil {
+			return result, stage(FailureValidation, err)
+		}
+	}
 
 	finished := service.Clock.Now().UTC()
 	if err := service.Repository.CompleteSync(ctx, syncID, finished.UnixMilli(), result.Services, result.Programs); err != nil {
-		return result, err
+		return result, stage(FailureStore, err)
 	}
 	completed = true
 	result.CompletedAt = finished
@@ -128,65 +185,65 @@ func (service Service) Sync(ctx context.Context, request Request) (result Result
 func (service Service) consumeServices(ctx context.Context, syncID catalogmodel.ID, cursor providercatalog.ServiceCursor, total *int) (err error) {
 	defer func() {
 		if closeErr := cursor.Close(); err == nil && closeErr != nil {
-			err = closeErr
+			err = stage(FailureProvider, closeErr)
 		}
 	}()
 	for pages := 0; pages < maxServicePages; pages++ {
 		page, nextErr := cursor.Next(ctx)
 		if nextErr != nil {
-			return nextErr
+			return stage(FailureProvider, nextErr)
 		}
 		if len(page.Items) > provider.MaxCatalogPage || *total > maxServiceCount-len(page.Items) {
-			return errors.New("catalogsync: service operation exceeds accepted limit")
+			return stage(FailureProvider, errors.New("catalogsync: service operation exceeds accepted limit"))
 		}
 		converted := make([]catalogmodel.ServiceObservation, len(page.Items))
 		for index, observation := range page.Items {
 			converted[index], err = convertService(observation)
 			if err != nil {
-				return err
+				return stage(FailureProvider, err)
 			}
 		}
 		if err := storeServiceChunks(ctx, service.Repository, syncID, converted); err != nil {
-			return err
+			return stage(FailureStore, err)
 		}
 		*total += len(converted)
 		if page.End {
 			return nil
 		}
 	}
-	return errors.New("catalogsync: service page limit exceeded")
+	return stage(FailureProvider, errors.New("catalogsync: service page limit exceeded"))
 }
 
 func (service Service) consumePrograms(ctx context.Context, syncID catalogmodel.ID, verified bool, cursor providercatalog.ProgramCursor, total *int) (err error) {
 	defer func() {
 		if closeErr := cursor.Close(); err == nil && closeErr != nil {
-			err = closeErr
+			err = stage(FailureProvider, closeErr)
 		}
 	}()
 	for pages := 0; pages < maxProgramPages; pages++ {
 		page, nextErr := cursor.Next(ctx)
 		if nextErr != nil {
-			return nextErr
+			return stage(FailureProvider, nextErr)
 		}
 		if len(page.Items) > provider.MaxCatalogPage || *total > maxProgramCount-len(page.Items) {
-			return errors.New("catalogsync: program operation exceeds accepted limit")
+			return stage(FailureProvider, errors.New("catalogsync: program operation exceeds accepted limit"))
 		}
 		converted := make([]catalogmodel.ProgramObservation, len(page.Items))
 		for index, observation := range page.Items {
 			converted[index], err = convertProgram(observation)
 			if err != nil {
-				return err
+				return stage(FailureProvider, err)
 			}
 		}
 		if err := storeProgramChunks(ctx, service.Repository, syncID, verified, converted); err != nil {
-			return err
+			return stage(FailureStore, err)
 		}
 		*total += len(converted)
 		if page.End {
 			return nil
 		}
 	}
-	return errors.New("catalogsync: program page limit exceeded")
+	return stage(FailureProvider, errors.New("catalogsync: program page limit exceeded"))
 }
 
 func storeServiceChunks(ctx context.Context, repository catalogmodel.Repository, syncID catalogmodel.ID, values []catalogmodel.ServiceObservation) error {
@@ -289,6 +346,17 @@ func failureReason(err error) string {
 		return "provider-" + string(failure.Reason)
 	}
 	return "sync-failed"
+}
+
+func stage(value FailureStage, err error) error {
+	if err == nil {
+		return nil
+	}
+	var failure *Failure
+	if errors.As(err, &failure) {
+		return err
+	}
+	return &Failure{Stage: value, err: err}
 }
 
 func pointer[T any](value T) *T { return &value }
