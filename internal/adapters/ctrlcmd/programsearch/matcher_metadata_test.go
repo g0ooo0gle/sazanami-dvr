@@ -28,12 +28,12 @@ func TestPreparedConditionMatchesContentAndComponents(t *testing.T) {
 		search core.SearchCondition
 		want   bool
 	}{
-		{name: "major", search: core.SearchCondition{Contents: []core.ContentRange{{Content: wireNibbles(1, 0xff)}}}, want: true},
-		{name: "middle", search: core.SearchCondition{Contents: []core.ContentRange{{Content: wireNibbles(1, 2)}}}, want: true},
-		{name: "wrong middle", search: core.SearchCondition{Contents: []core.ContentRange{{Content: wireNibbles(1, 3)}}}},
-		{name: "extended user", search: core.SearchCondition{Contents: []core.ContentRange{{Content: wireNibbles(0x0e, 0), User: wireNibbles(3, 4)}}}, want: true},
-		{name: "wrong extended user", search: core.SearchCondition{Contents: []core.ContentRange{{Content: wireNibbles(0x0e, 0), User: wireNibbles(3, 5)}}}},
-		{name: "exclude", search: core.SearchCondition{Contents: []core.ContentRange{{Content: wireNibbles(1, 2)}}, ExcludeContents: true}},
+		{name: "major", search: core.SearchCondition{Contents: []core.ContentRange{{Content: konomiWireNibbles(1, 0xff)}}}, want: true},
+		{name: "middle", search: core.SearchCondition{Contents: []core.ContentRange{{Content: konomiWireNibbles(1, 2)}}}, want: true},
+		{name: "wrong middle", search: core.SearchCondition{Contents: []core.ContentRange{{Content: konomiWireNibbles(1, 3)}}}},
+		{name: "extended user", search: core.SearchCondition{Contents: []core.ContentRange{{Content: konomiWireNibbles(0x0e, 0), User: konomiWireNibbles(3, 4)}}}, want: true},
+		{name: "wrong extended user", search: core.SearchCondition{Contents: []core.ContentRange{{Content: konomiWireNibbles(0x0e, 0), User: konomiWireNibbles(3, 5)}}}},
+		{name: "exclude", search: core.SearchCondition{Contents: []core.ContentRange{{Content: konomiWireNibbles(1, 2)}}, ExcludeContents: true}},
 		{name: "video", search: core.SearchCondition{Video: []uint16{0x01b3}}, want: true},
 		{name: "wrong video", search: core.SearchCondition{Video: []uint16{0x01b2}}},
 		{name: "audio", search: core.SearchCondition{Audio: []uint16{0x0203}}, want: true},
@@ -129,7 +129,7 @@ func TestHandlerAppliesMetadataAndFuzzyConditions(t *testing.T) {
 	search := core.SearchCondition{
 		Enabled: true, Fuzzy: true, Keyword: "テスト番組",
 		Services: []core.ServiceRange{{NetworkID: 1, TransportStreamID: 2, ServiceID: 3}},
-		Contents: []core.ContentRange{{Content: wireNibbles(1, 0xff)}}, Video: []uint16{0x01b3}, Audio: []uint16{0x0203},
+		Contents: []core.ContentRange{{Content: konomiWireNibbles(1, 0xff)}}, Video: []uint16{0x01b3}, Audio: []uint16{0x0203},
 	}
 	source := &memorySource{snapshot: channel.Snapshot{Key: "metadata", Services: []channel.Service{service}}, programs: []catalogmodel.CurrentProgram{matched, unmatched}}
 	handler, err := NewHandler(source, codec.DefaultLimits(), make(chan struct{}, 1))
@@ -146,15 +146,16 @@ func TestHandlerAppliesMetadataAndFuzzyConditions(t *testing.T) {
 	}
 }
 
-func wireNibbles(first, second uint8) uint16 {
-	return uint16(first)<<8 | uint16(second)
+func konomiWireNibbles(first, second uint8) uint16 {
+	return uint16(second)<<8 | uint16(first)
 }
 
-func TestKonomiTVContentNibbleOrder(t *testing.T) {
+func TestKonomiTVContentNibbleWireOrder(t *testing.T) {
 	metadata := catalogmodel.ProgramMetadata{Genres: []catalogmodel.Genre{{Level1: 1, Level2: 2}}}
-	major := preparedCondition{search: core.SearchCondition{Contents: []core.ContentRange{{Content: 0x01ff}}}}
-	reversed := preparedCondition{search: core.SearchCondition{Contents: []core.ContentRange{{Content: 0xff01}}}}
-	if !major.matchesContents(metadata) || reversed.matchesContents(metadata) {
-		t.Fatal("KonomiTVが送る大分類・中分類のバイト順を解釈できません")
+	middle := preparedCondition{search: core.SearchCondition{Contents: []core.ContentRange{{Content: 0x0201}}}}
+	major := preparedCondition{search: core.SearchCondition{Contents: []core.ContentRange{{Content: 0xff01}}}}
+	semanticOrder := preparedCondition{search: core.SearchCondition{Contents: []core.ContentRange{{Content: 0x0102}}}}
+	if !middle.matchesContents(metadata) || !major.matchesContents(metadata) || semanticOrder.matchesContents(metadata) {
+		t.Fatal("KonomiTVが通信路へ書く大分類・中分類のバイト順を解釈できません")
 	}
 }

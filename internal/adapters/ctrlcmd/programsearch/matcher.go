@@ -112,8 +112,8 @@ func (prepared preparedCondition) matchesContents(metadata catalogmodel.ProgramM
 	}
 	matched := false
 	for _, condition := range prepared.search.Contents {
-		level1, level2 := uint8(condition.Content>>8), uint8(condition.Content)
-		user1, user2 := uint8(condition.User>>8), uint8(condition.User)
+		level1, level2 := uint8(condition.Content), uint8(condition.Content>>8)
+		user1, user2 := uint8(condition.User), uint8(condition.User>>8)
 		if level1 == 0xff && level2 == 0xff {
 			matched = len(metadata.Genres) == 0
 		} else {
