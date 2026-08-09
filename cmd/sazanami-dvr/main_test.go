@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -31,8 +32,20 @@ func TestVersion(t *testing.T) {
 	if code := run([]string{"--version"}, &output, &diagnostic); code != 0 {
 		t.Fatalf("code=%d err=%q", code, diagnostic.String())
 	}
-	if got, want := output.String(), "sazanami-dvr 0.0.19\n"; got != want {
+	if got, want := output.String(), "sazanami-dvr 0.0.20\n"; got != want {
 		t.Fatalf("version=%q want=%q", got, want)
+	}
+}
+
+func TestRunRestrictsProcessFileCreation(t *testing.T) {
+	previous := syscall.Umask(0o002)
+	t.Cleanup(func() { syscall.Umask(previous) })
+	var output, diagnostic bytes.Buffer
+	if code := run([]string{"--version"}, &output, &diagnostic); code != 0 {
+		t.Fatalf("code=%d err=%q", code, diagnostic.String())
+	}
+	if got := syscall.Umask(0o077); got != 0o077 {
+		t.Fatalf("umask=%03o", got)
 	}
 }
 

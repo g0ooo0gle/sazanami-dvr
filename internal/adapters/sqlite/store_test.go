@@ -74,6 +74,55 @@ func TestMigrateFreshDatabaseAndOpenPools(t *testing.T) {
 	}
 }
 
+func TestRestrictDatabaseSidecarsNarrowsExistingModes(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database := filepath.Join(root, databaseFilename)
+	if err := os.WriteFile(database, []byte("database"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if err := os.WriteFile(database+suffix, []byte("sidecar"), 0o664); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := restrictDatabaseSidecars(database); err != nil {
+		t.Fatal(err)
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		info, err := os.Lstat(database + suffix)
+		if err != nil || !ownerOnlyRegular(info) {
+			t.Fatalf("sidecar=%s mode=%v err=%v", suffix, fileMode(info), err)
+		}
+	}
+}
+
+func TestRestrictDatabaseSidecarsRejectsSymlink(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database := filepath.Join(root, databaseFilename)
+	if err := os.WriteFile(database, []byte("database"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(database, database+"-wal"); err != nil {
+		t.Fatal(err)
+	}
+	if err := restrictDatabaseSidecars(database); err == nil {
+		t.Fatal("WALのsymlinkを受理しました")
+	}
+}
+
+func fileMode(info os.FileInfo) os.FileMode {
+	if info == nil {
+		return 0
+	}
+	return info.Mode()
+}
+
 func TestMigrateVersionOneWithVerifiedBackup(t *testing.T) {
 	root := t.TempDir()
 	if err := os.Chmod(root, 0o700); err != nil {

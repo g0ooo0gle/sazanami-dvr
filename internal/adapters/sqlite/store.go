@@ -27,6 +27,9 @@ func openWriter(ctx context.Context, dataRoot string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := restrictDatabaseSidecars(path); err != nil {
+		return nil, err
+	}
 	database, err := sqlitedriver.Open(buildWriterDSN(path))
 	if err != nil {
 		return nil, sanitize("open-writer", err)
@@ -38,6 +41,10 @@ func openWriter(ctx context.Context, dataRoot string) (*sql.DB, error) {
 		return nil, sanitize("ping-writer", err)
 	}
 	if err := verifyPragmas(ctx, database, false); err != nil {
+		_ = database.Close()
+		return nil, err
+	}
+	if err := restrictDatabaseSidecars(path); err != nil {
 		_ = database.Close()
 		return nil, err
 	}
@@ -194,6 +201,28 @@ func verifyDatabaseMode(path string) error {
 	info, err := os.Lstat(path)
 	if err != nil || !ownerOnlyRegular(info) {
 		return errors.New("sqlite: database mode is not 0600")
+	}
+	return nil
+}
+
+// restrictDatabaseSidecarsはSQLiteがumaskを使って作ったWALとSHMを0600へ狭め、同じ条件を読み戻す。
+func restrictDatabaseSidecars(path string) error {
+	for _, suffix := range []string{"-wal", "-shm"} {
+		sidecar := path + suffix
+		info, err := os.Lstat(sidecar)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return errors.New("sqlite: invalid database sidecar")
+		}
+		if err := os.Chmod(sidecar, 0o600); err != nil {
+			return errors.New("sqlite: restrict database sidecar")
+		}
+		info, err = os.Lstat(sidecar)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 || !ownerOnlyRegular(info) {
+			return errors.New("sqlite: database sidecar is not owner-only")
+		}
 	}
 	return nil
 }
