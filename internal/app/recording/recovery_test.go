@@ -106,23 +106,35 @@ func TestRecoveryResumesEverySafeFinalizationWindow(t *testing.T) {
 		{name: "before final database commit", observation: core.FileObservation{Final: regularFact(376)}, published: true,
 			directorySync: true, want: []string{"directory-sync"}},
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			item := recoveryItem(t, core.AttemptFinalizing)
-			item.FileSynced = true
-			item.FinalizationToken = appID(t, 52)
-			item.FinalPublished = test.published
-			item.DirectorySynced = test.directorySync
-			item.Availability = core.AvailabilityPartial
-			memory := recoveryMemory{item: item, observation: test.observation}
-			if err := recoveryForTest(&memory).Run(context.Background()); err != nil {
-				t.Fatal(err)
-			}
-			if !equalStrings(memory.operations, test.want) || len(memory.finish) != 1 ||
-				memory.finish[0].State != core.AttemptSucceeded || !memory.finish[0].Recovered {
-				t.Fatalf("operations=%v finish=%+v", memory.operations, memory.finish)
-			}
-		})
+	results := []struct {
+		name   string
+		state  core.AttemptState
+		reason core.TerminalReason
+	}{
+		{name: "normal", state: core.AttemptSucceeded, reason: core.ReasonCompleted},
+		{name: "user stopped", state: core.AttemptPartial, reason: core.ReasonUserRequestedStop},
+	}
+	for _, final := range results {
+		for _, test := range tests {
+			t.Run(final.name+"/"+test.name, func(t *testing.T) {
+				item := recoveryItem(t, core.AttemptFinalizing)
+				item.PlannedState = final.state
+				item.PlannedReason = final.reason
+				item.FileSynced = true
+				item.FinalizationToken = appID(t, 52)
+				item.FinalPublished = test.published
+				item.DirectorySynced = test.directorySync
+				item.Availability = core.AvailabilityPartial
+				memory := recoveryMemory{item: item, observation: test.observation}
+				if err := recoveryForTest(&memory).Run(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				if !equalStrings(memory.operations, test.want) || len(memory.finish) != 1 ||
+					memory.finish[0].State != final.state || memory.finish[0].Reason != final.reason || !memory.finish[0].Recovered {
+					t.Fatalf("operations=%v finish=%+v", memory.operations, memory.finish)
+				}
+			})
+		}
 	}
 }
 
@@ -216,10 +228,15 @@ func recoveryItem(t *testing.T, state core.AttemptState) core.RecoveryItem {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return core.RecoveryItem{Attempt: core.Attempt{
+	item := core.RecoveryItem{Attempt: core.Attempt{
 		ID: id, ReservationID: appID(t, 51), State: state, PlannedStart: start,
 		PlannedEnd: start.Add(time.Hour), ByteCount: 376, Plan: plan,
 	}}
+	if state == core.AttemptFinalizing || state == core.AttemptSucceeded {
+		item.PlannedState = core.AttemptSucceeded
+		item.PlannedReason = core.ReasonCompleted
+	}
+	return item
 }
 
 func regularFact(size int64) core.FileFact {

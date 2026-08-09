@@ -42,6 +42,33 @@ type e2eLease struct {
 	connection int
 }
 
+type stopE2EStream struct {
+	clock  *e2eClock
+	stop   func() error
+	called bool
+}
+
+func (stream *stopE2EStream) OpenStream(context.Context, providerstream.Request) (providerstream.Lease, error) {
+	return &stopE2ELease{stream: stream}, nil
+}
+
+type stopE2ELease struct{ stream *stopE2EStream }
+
+func (lease *stopE2ELease) Read(_ context.Context, destination []byte) (int, providerstream.Terminal, error) {
+	copy(destination, bytes.Repeat([]byte{0x47}, 188))
+	if !lease.stream.called {
+		lease.stream.called = true
+		if err := lease.stream.stop(); err != nil {
+			return 0, providerstream.Terminal{}, err
+		}
+	}
+	lease.stream.clock.now = lease.stream.clock.now.Add(5 * time.Second)
+	return 188, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
+}
+
+func (*stopE2ELease) Cancel() error { return nil }
+func (*stopE2ELease) Close() error  { return nil }
+
 type parallelE2EStream struct {
 	clock   *e2eClock
 	end     time.Time
@@ -146,6 +173,61 @@ func TestActiveExtensionReachesRunningExecutor(t *testing.T) {
 	if err := store.reader.QueryRow(`SELECT planned_end_utc_ms FROM recording_attempts WHERE reservation_id=?`,
 		created.ID.Bytes()).Scan(&plannedEndMS); err != nil || plannedEndMS != stream.end.UnixMilli() {
 		t.Fatalf("planned_end=%d err=%v", plannedEndMS, err)
+	}
+}
+
+func TestPersistedUserStopPublishesPartialFileWithoutInMemoryNotification(t *testing.T) {
+	_, store := openMigratedStore(t)
+	reservation := reservationForTest(t, store)
+	created, err := store.CreateReservation(context.Background(), reservation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordingRoot, err := recordingfs.OpenRoot(filepath.Join(t.TempDir(), "recordings"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recordingRoot.Close()
+	clock := &e2eClock{now: reservation.Program.Start}
+	stream := &stopE2EStream{clock: clock}
+	stream.stop = func() error {
+		result, stopErr := store.StopReservation(context.Background(), created.Number, clock.now.Add(time.Second))
+		if stopErr != nil || !result.Notify || result.ReservationID != created.ID {
+			return errors.New("unexpected stop result")
+		}
+		return nil
+	}
+	ids := []catalogmodel.ID{testID(t, 235), testID(t, 236), testID(t, 237)}
+	nextID := 0
+	executor := apprecording.Executor{
+		Store: store, Stream: stream, Clock: clock, OwnerID: testID(t, 238), Generation: 1,
+		NewID: func() (catalogmodel.ID, error) {
+			id := ids[nextID]
+			nextID++
+			return id, nil
+		},
+		Files: apprecording.FileOperations{
+			CreatePartial: func(plan core.FilePlan) (apprecording.PartialFile, error) {
+				return recordingRoot.CreatePartial(plan)
+			},
+			LinkFinal: recordingRoot.LinkFinal, SyncDirectory: recordingRoot.SyncDirectory,
+			RemovePartial: recordingRoot.RemovePartial,
+		},
+		WithDeadline: func(ctx context.Context, _ time.Time) (context.Context, context.CancelFunc) {
+			return context.WithCancel(ctx)
+		},
+	}
+	result, err := executor.Execute(context.Background(), created)
+	if err != nil || result.State != core.AttemptPartial || result.Reason != core.ReasonUserRequestedStop || !stream.called {
+		t.Fatalf("result=%+v called=%v err=%v", result, stream.called, err)
+	}
+	history, err := store.RecordingHistoryItem(context.Background(), created.Number)
+	if err != nil || history == nil || !history.Playable() || history.ByteCount != 188 {
+		t.Fatalf("history=%+v err=%v", history, err)
+	}
+	observation, err := recordingRoot.Inspect(history.Plan)
+	if err != nil || observation.Partial.Exists || !observation.Final.Regular || observation.Final.Size != 188 {
+		t.Fatalf("observation=%+v err=%v", observation, err)
 	}
 }
 

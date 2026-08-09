@@ -20,7 +20,7 @@ type ReservationStore interface {
 	CreateReservation(context.Context, recording.Reservation) (recording.Reservation, error)
 	ActiveReservations(context.Context, int, int32) ([]recording.Reservation, error)
 	UpdateReservation(context.Context, recording.ReservationChange, time.Time) error
-	CancelReservation(context.Context, int32, time.Time) error
+	StopReservation(context.Context, int32, time.Time) (recording.StopResult, error)
 	ReservationRecording(context.Context, int32) (bool, error)
 }
 
@@ -36,6 +36,7 @@ type ReservationService struct {
 	Clock   Clock
 	NewID   func() (catalogmodel.ID, error)
 	OnAdded func()
+	OnStop  func(catalogmodel.ID)
 }
 
 // Addは終了前の番組を照合し、DBへの保存完了後に作成済み予約を返す。
@@ -98,7 +99,8 @@ func (service ReservationService) Change(ctx context.Context, change recording.R
 	return nil
 }
 
-// Deleteは録画開始前の予約を取消し状態へ進め、予約番号と履歴を残す。
+// Deleteは録画開始前の予約を取り消すか、実行中の一件へ利用者停止を要求する。
+// 停止通知はDBの確定後だけ送り、通知が届かなくてもDBの要求を正本として扱う。
 func (service ReservationService) Delete(ctx context.Context, number int32) error {
 	if ctx == nil || service.Store == nil || service.Clock == nil || number < 1 {
 		return errors.New("recording: invalid reservation operation")
@@ -107,8 +109,12 @@ func (service ReservationService) Delete(ctx context.Context, number int32) erro
 	if now.IsZero() || now.UnixMilli() < 0 {
 		return errors.New("recording: invalid clock")
 	}
-	if err := service.Store.CancelReservation(ctx, number, now); err != nil {
+	result, err := service.Store.StopReservation(ctx, number, now)
+	if err != nil {
 		return err
+	}
+	if result.Notify && service.OnStop != nil {
+		service.OnStop(result.ReservationID)
 	}
 	if service.OnAdded != nil {
 		service.OnAdded()

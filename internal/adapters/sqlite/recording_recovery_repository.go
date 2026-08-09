@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"time"
 
@@ -15,11 +16,13 @@ func (store *Store) RecoveryAttempts(ctx context.Context, limit int, after catal
 		return nil, errors.New("sqlite: invalid recovery query")
 	}
 	rows, err := store.reader.QueryContext(ctx, `SELECT a.id, a.reservation_id, a.state,
-		a.planned_start_utc_ms, a.planned_end_utc_ms, a.byte_count, a.finalization_token, a.recovered,
+		a.planned_start_utc_ms, a.planned_end_utc_ms, a.byte_count, a.finalization_token,
+		a.planned_final_state, a.planned_terminal_reason, a.recovered,
 		s.relative_partial_path, s.relative_final_path, s.file_synced, s.final_published,
 		s.directory_synced, s.availability
 		FROM recording_attempts a JOIN recording_segments s ON s.attempt_id=a.id AND s.ordinal=0
-		WHERE a.id>? AND a.state IN ('CLAIMED','STARTING','RECORDING','FINALIZING','SUCCEEDED')
+		WHERE a.id>? AND (a.state IN ('CLAIMED','STARTING','RECORDING','FINALIZING','SUCCEEDED') OR
+			(a.state='PARTIAL' AND a.terminal_reason='USER_REQUESTED_STOP'))
 		ORDER BY a.id LIMIT ?`, after.Bytes(), limit)
 	if err != nil {
 		return nil, sanitize("query-recording-recovery", err)
@@ -30,11 +33,18 @@ func (store *Store) RecoveryAttempts(ctx context.Context, limit int, after catal
 		var item recording.RecoveryItem
 		var id, reservationID, token []byte
 		var startMS, endMS, byteCount int64
+		var plannedState, plannedReason sql.NullString
 		var recovered, fileSynced, finalPublished, directorySynced int64
 		if err := rows.Scan(&id, &reservationID, &item.State, &startMS, &endMS, &byteCount, &token,
-			&recovered, &item.Plan.PartialPath, &item.Plan.FinalPath, &fileSynced, &finalPublished,
+			&plannedState, &plannedReason, &recovered, &item.Plan.PartialPath, &item.Plan.FinalPath, &fileSynced, &finalPublished,
 			&directorySynced, &item.Availability); err != nil {
 			return nil, sanitize("scan-recording-recovery", err)
+		}
+		if plannedState.Valid {
+			item.PlannedState = recording.AttemptState(plannedState.String)
+		}
+		if plannedReason.Valid {
+			item.PlannedReason = recording.TerminalReason(plannedReason.String)
 		}
 		if err := validateRecoveryValues(item, startMS, endMS, byteCount, recovered, fileSynced,
 			finalPublished, directorySynced, len(token)); err != nil {
@@ -66,7 +76,7 @@ func (store *Store) RecoveryAttempts(ctx context.Context, limit int, after catal
 	return items, nil
 }
 
-// SetRecordingAvailabilityは成功履歴を変えず、完成ファイルの現在の利用状態だけを更新する。
+// SetRecordingAvailabilityは録画結果を変えず、公開済みファイルの現在の利用状態だけを更新する。
 func (store *Store) SetRecordingAvailability(ctx context.Context, attemptID catalogmodel.ID, availability recording.Availability, reason recording.TerminalReason, now time.Time) error {
 	if store == nil || store.writer == nil || ctx == nil || attemptID == (catalogmodel.ID{}) ||
 		now.IsZero() || now.Location() != time.UTC || now.UnixMilli() < 0 {
@@ -97,7 +107,8 @@ func (store *Store) SetRecordingAvailability(ctx context.Context, attemptID cata
 	}
 	result, err := store.writer.ExecContext(ctx, `UPDATE recording_segments SET availability=?, integrity_reason=?,
 		updated_at_utc_ms=? WHERE attempt_id=? AND ordinal=0 AND state='FINALIZED'
-		AND EXISTS (SELECT 1 FROM recording_attempts a WHERE a.id=? AND a.state='SUCCEEDED')
+		AND EXISTS (SELECT 1 FROM recording_attempts a WHERE a.id=? AND
+			(a.state='SUCCEEDED' OR (a.state='PARTIAL' AND a.terminal_reason='USER_REQUESTED_STOP')))
 		AND (availability<>? OR COALESCE(integrity_reason,'')<>?)`, availability, integrity, now.UnixMilli(),
 		attemptID.Bytes(), attemptID.Bytes(), availability, integrityText)
 	if err != nil {
@@ -117,7 +128,7 @@ func validateRecoveryValues(item recording.RecoveryItem, startMS, endMS, byteCou
 	}
 	switch item.State {
 	case recording.AttemptClaimed, recording.AttemptStarting, recording.AttemptRecording,
-		recording.AttemptFinalizing, recording.AttemptSucceeded:
+		recording.AttemptFinalizing, recording.AttemptSucceeded, recording.AttemptPartial:
 	default:
 		return errors.New("sqlite: invalid recording recovery state")
 	}
@@ -127,26 +138,38 @@ func validateRecoveryValues(item recording.RecoveryItem, startMS, endMS, byteCou
 	default:
 		return errors.New("sqlite: invalid recording availability")
 	}
-	if (item.State == recording.AttemptFinalizing || item.State == recording.AttemptSucceeded) &&
+	if (item.State == recording.AttemptFinalizing || item.State == recording.AttemptSucceeded || item.State == recording.AttemptPartial) &&
 		(fileSynced != 1 || tokenBytes != 16 || byteCount < 188) {
 		return errors.New("sqlite: completed recording lacks finalization evidence")
 	}
 	if (directorySynced == 1 && finalPublished != 1) || (finalPublished == 1 && fileSynced != 1) {
 		return errors.New("sqlite: recording publication flags are inconsistent")
 	}
-	if item.State == recording.AttemptSucceeded && (finalPublished != 1 || directorySynced != 1) {
+	if (item.State == recording.AttemptSucceeded || item.State == recording.AttemptPartial) &&
+		(finalPublished != 1 || directorySynced != 1) {
 		return errors.New("sqlite: successful recording lacks publication evidence")
 	}
 	if item.State == recording.AttemptFinalizing && item.Availability != recording.AvailabilityPartial {
 		return errors.New("sqlite: finalizing recording is not partial")
 	}
-	if item.State == recording.AttemptSucceeded && item.Availability != recording.AvailabilityFinal &&
+	if (item.State == recording.AttemptSucceeded || item.State == recording.AttemptPartial) && item.Availability != recording.AvailabilityFinal &&
 		item.Availability != recording.AvailabilityMissing && item.Availability != recording.AvailabilityMismatched {
 		return errors.New("sqlite: successful recording has invalid availability")
 	}
-	if item.State != recording.AttemptFinalizing && item.State != recording.AttemptSucceeded &&
+	if item.State != recording.AttemptFinalizing && item.State != recording.AttemptSucceeded && item.State != recording.AttemptPartial &&
 		(tokenBytes != 0 || fileSynced != 0 || finalPublished != 0 || directorySynced != 0) {
 		return errors.New("sqlite: early recording has finalization evidence")
+	}
+	if item.State == recording.AttemptFinalizing || item.State == recording.AttemptSucceeded || item.State == recording.AttemptPartial {
+		validNormal := item.PlannedState == recording.AttemptSucceeded &&
+			(item.PlannedReason == recording.ReasonCompleted || item.PlannedReason == recording.ReasonCompletedAfterReconnect)
+		validStopped := item.PlannedState == recording.AttemptPartial && item.PlannedReason == recording.ReasonUserRequestedStop
+		if !validNormal && !validStopped {
+			return errors.New("sqlite: recording finalization plan is invalid")
+		}
+		if item.State == recording.AttemptSucceeded && !validNormal || item.State == recording.AttemptPartial && !validStopped {
+			return errors.New("sqlite: terminal recording differs from finalization plan")
+		}
 	}
 	return nil
 }

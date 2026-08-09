@@ -49,7 +49,7 @@ func (recovery Recovery) Run(ctx context.Context) error {
 				return errors.New("recording: inspect recovery file")
 			}
 			switch item.State {
-			case core.AttemptSucceeded:
+			case core.AttemptSucceeded, core.AttemptPartial:
 				err = recovery.reconcileSuccess(ctx, item, observation)
 			case core.AttemptFinalizing:
 				err = recovery.recoverFinalizing(ctx, item, observation)
@@ -147,7 +147,7 @@ func (recovery Recovery) finishPublication(ctx context.Context, item core.Recove
 		}
 	}
 	finish := core.FinishRequest{
-		AttemptID: item.ID, State: core.AttemptSucceeded, Reason: core.ReasonCompleted,
+		AttemptID: item.ID, State: item.PlannedState, Reason: item.PlannedReason,
 		ByteCount: item.ByteCount, Availability: core.AvailabilityFinal, Recovered: true, Now: recovery.now(),
 	}
 	if err := recovery.Store.FinishAttempt(ctx, finish); err != nil {

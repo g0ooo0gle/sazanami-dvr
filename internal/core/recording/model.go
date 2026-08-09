@@ -241,6 +241,8 @@ const (
 	ReasonProcessInterrupted TerminalReason = "PROCESS_INTERRUPTED"
 	// ReasonProcessShutdownは明示停止によって録画を終了したことを表す。
 	ReasonProcessShutdown TerminalReason = "PROCESS_SHUTDOWN"
+	// ReasonUserRequestedStopは利用者が録画中の予約を明示的に停止したことを表す。
+	ReasonUserRequestedStop TerminalReason = "USER_REQUESTED_STOP"
 	// ReasonFileMissingはDBが期待する録画ファイルを確認できないことを表す。
 	ReasonFileMissing TerminalReason = "FILE_MISSING"
 	// ReasonFileIntegrityMismatchはファイルの種類、サイズ、リンク関係がDBと一致しないことを表す。
@@ -255,7 +257,7 @@ func (reason TerminalReason) Valid() bool {
 		ReasonStreamEndedEarly, ReasonStreamCancelled, ReasonStreamReconnectExhausted, ReasonFileCreateFailed,
 		ReasonFileWriteFailed, ReasonFileSyncFailed, ReasonFinalNameConflict,
 		ReasonFinalPublicationFailed, ReasonFinalDatabaseFailed,
-		ReasonProcessInterrupted, ReasonProcessShutdown, ReasonFileMissing, ReasonFileIntegrityMismatch:
+		ReasonProcessInterrupted, ReasonProcessShutdown, ReasonUserRequestedStop, ReasonFileMissing, ReasonFileIntegrityMismatch:
 		return true
 	default:
 		return false
@@ -345,6 +347,13 @@ type Attempt struct {
 	Plan          FilePlan
 }
 
+// StopResultは予約取消しまたは録画停止をDBへ確定した結果である。
+// Notifyがtrueの場合だけ、ReservationIDに対応する実行中録画へ停止を早める通知を送る。
+type StopResult struct {
+	ReservationID catalogmodel.ID
+	Notify        bool
+}
+
 // HistoryItemは一回の終了済み録画を外部形式から独立して読み出すための保存済み事実である。
 // FilePlanはadapter内の安全なfile解決にだけ使い、HTTPやCtrlCmdへ直接公開しない。
 type HistoryItem struct {
@@ -399,9 +408,11 @@ func (item HistoryItem) Validate() error {
 	return nil
 }
 
-// Playableは完成済み録画としてCtrlCmdとHTTPへ公開できる場合だけtrueを返す。
+// Playableは正常完了または利用者停止で安全に確定し、CtrlCmdとHTTPへ公開できる場合だけtrueを返す。
 func (item HistoryItem) Playable() bool {
-	return item.Validate() == nil && item.State == AttemptSucceeded && item.Reason.successful() &&
+	completed := item.State == AttemptSucceeded && item.Reason.successful()
+	userStopped := item.State == AttemptPartial && item.Reason == ReasonUserRequestedStop
+	return item.Validate() == nil && (completed || userStopped) &&
 		item.ActualStart != nil && item.ActualEnd.Sub(*item.ActualStart) >= time.Second && item.ByteCount >= 188 && item.SegmentState == SegmentFinalized &&
 		item.Availability == AvailabilityFinal && item.FileSynced && item.FinalPublished && item.DirectorySynced
 }
@@ -419,6 +430,8 @@ func terminalAttemptState(state AttemptState) bool {
 type RecoveryItem struct {
 	Attempt
 	FinalizationToken catalogmodel.ID
+	PlannedState      AttemptState
+	PlannedReason     TerminalReason
 	FileSynced        bool
 	FinalPublished    bool
 	DirectorySynced   bool
@@ -446,6 +459,8 @@ type FinalizeRequest struct {
 	AttemptID catalogmodel.ID
 	Token     catalogmodel.ID
 	ByteCount int64
+	State     AttemptState
+	Reason    TerminalReason
 	Now       time.Time
 }
 
@@ -455,6 +470,10 @@ func (request FinalizeRequest) Validate() error {
 	if request.AttemptID == zero || request.Token == zero || request.ByteCount < 188 ||
 		request.Now.IsZero() || request.Now.Location() != time.UTC || request.Now.UnixMilli() < 0 {
 		return errors.New("recording: invalid finalize request")
+	}
+	if (request.State != AttemptSucceeded || !request.Reason.successful()) &&
+		(request.State != AttemptPartial || request.Reason != ReasonUserRequestedStop) {
+		return errors.New("recording: invalid planned final result")
 	}
 	return nil
 }
@@ -483,7 +502,11 @@ func (request FinishRequest) Validate() error {
 			return errors.New("recording: invalid successful finish")
 		}
 	case AttemptPartial:
-		if request.Reason.successful() || request.ByteCount < 188 || request.Availability != AvailabilityPartial {
+		if request.Reason == ReasonUserRequestedStop {
+			if request.ByteCount < 188 || request.Availability != AvailabilityFinal {
+				return errors.New("recording: invalid stopped partial finish")
+			}
+		} else if request.Reason.successful() || request.ByteCount < 188 || request.Availability != AvailabilityPartial {
 			return errors.New("recording: invalid partial finish")
 		}
 	case AttemptFailed, AttemptCancelled:

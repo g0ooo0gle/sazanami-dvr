@@ -223,12 +223,46 @@ func TestChangeDeleteAndRecordingStatus(t *testing.T) {
 	}
 }
 
+func TestDeleteAcceptsFixedKonomiTVWireRequest(t *testing.T) {
+	request := []byte{
+		0xf6, 0x03, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00,
+		0x0c, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+		0x07, 0x00, 0x00, 0x00,
+	}
+	if built := numberRequest(t, CommandDelete, 7, true); !bytes.Equal(built, request) {
+		t.Fatalf("request=%x", built)
+	}
+	operations := &fakeOperations{}
+	var response bytes.Buffer
+	if err := (Handler{Operations: operations, Limits: codec.DefaultLimits()}).Handle(
+		context.Background(), request, &response); err != nil {
+		t.Fatal(err)
+	}
+	frame, err := codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
+	if err != nil || frame.Code != ResultSuccess || len(operations.deleted) != 1 || operations.deleted[0] != 7 {
+		t.Fatalf("frame=%+v deleted=%v err=%v", frame, operations.deleted, err)
+	}
+}
+
 func TestMutationAndStatusRejectMalformedOrInactiveInput(t *testing.T) {
 	operations := &fakeOperations{}
 	handler := Handler{Operations: operations, Limits: codec.DefaultLimits()}
+	excess := append(numberRequest(t, CommandDelete, 1, true), 0)
+	binary.LittleEndian.PutUint32(excess[4:8], 13)
+	truncated := numberRequest(t, CommandDelete, 1, true)[:19]
+	binary.LittleEndian.PutUint32(truncated[4:8], 11)
+	multiple := []byte{
+		0xf6, 0x03, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
+		0x10, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+		0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+	}
 	requests := [][]byte{
 		changeRequest(t, 0, 3),
 		numberRequest(t, CommandDelete, 0, true),
+		numberRequest(t, CommandDelete, -1, true),
+		multiple,
+		truncated,
+		excess,
 		numberRequest(t, CommandRecordingOpen, 1, false),
 		numberRequest(t, CommandRecordingClose, 0, false),
 	}

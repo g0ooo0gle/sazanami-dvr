@@ -40,8 +40,9 @@ func (store *Store) CompletedRecordings(ctx context.Context, limit int, after in
 	if store == nil || store.reader == nil || ctx == nil || limit < 1 || limit > recording.MaxHistoryPage || after < 0 {
 		return nil, errors.New("sqlite: invalid completed recording query")
 	}
-	query := `SELECT ` + historyColumns + historyFrom + ` WHERE a.state='SUCCEEDED'
-		AND a.terminal_reason IN ('COMPLETED','COMPLETED_AFTER_RECONNECT')
+	query := `SELECT ` + historyColumns + historyFrom + ` WHERE (
+		(a.state='SUCCEEDED' AND a.terminal_reason IN ('COMPLETED','COMPLETED_AFTER_RECONNECT')) OR
+		(a.state='PARTIAL' AND a.terminal_reason='USER_REQUESTED_STOP'))
 		AND s.state='FINALIZED' AND s.availability='FINAL' AND s.file_synced=1
 		AND s.final_published=1 AND s.directory_synced=1 AND a.byte_count>=188 AND m.reserve_id>?
 		ORDER BY m.reserve_id LIMIT ?`

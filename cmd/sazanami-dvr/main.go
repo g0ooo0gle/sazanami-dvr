@@ -36,7 +36,7 @@ import (
 )
 
 var (
-	version       = "0.0.14"
+	version       = "0.0.15"
 	productCommit = ""
 )
 
@@ -214,7 +214,8 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 		return errorsStable("recording-scheduler-invalid")
 	}
 	reservations := recordingapp.ReservationService{
-		Catalog: snapshots, Store: store, Clock: recordingClock, NewID: catalogmodel.NewID, OnAdded: scheduler.Notify,
+		Catalog: snapshots, Store: store, Clock: recordingClock, NewID: catalogmodel.NewID,
+		OnAdded: scheduler.Notify, OnStop: scheduler.NotifyStop,
 	}
 	automaticRules := autoreservationapp.RuleService{Store: store, Clock: recordingClock, NewID: catalogmodel.NewID}
 	liveManager, err := liverelay.NewManager(snapshots, liveStreamAdapter)

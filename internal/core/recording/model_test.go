@@ -57,7 +57,10 @@ func TestFilePlanAndRecordingRequests(t *testing.T) {
 	if err := claim.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	finalize := FinalizeRequest{AttemptID: claim.AttemptID, Token: idForTest(t, 9), ByteCount: 188, Now: now}
+	finalize := FinalizeRequest{
+		AttemptID: claim.AttemptID, Token: idForTest(t, 9), ByteCount: 188,
+		State: AttemptSucceeded, Reason: ReasonCompleted, Now: now,
+	}
 	if err := finalize.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -75,6 +78,17 @@ func TestFilePlanAndRecordingRequests(t *testing.T) {
 	finish.ByteCount = 187
 	if err := finish.Validate(); err == nil {
 		t.Fatal("188 bytes未満の成功が受理されました")
+	}
+	finish = FinishRequest{
+		AttemptID: claim.AttemptID, State: AttemptPartial, Reason: ReasonUserRequestedStop,
+		ByteCount: 188, Availability: AvailabilityFinal, Now: now,
+	}
+	if err := finish.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	finish.Reason = ReasonStreamEndedEarly
+	if err := finish.Validate(); err == nil {
+		t.Fatal("利用者停止以外の部分録画が完成ファイル扱いになりました")
 	}
 }
 

@@ -317,7 +317,77 @@ func (store *Store) UpdateReservation(ctx context.Context, change recording.Rese
 	return nil
 }
 
-// CancelReservationは録画開始前の予約だけを終了状態へ進め、取消理由を残す。
+// StopReservationは録画開始前の取消し、または実行中録画への停止要求を一つのトランザクションで確定する。
+// 実行中通知に使う内部予約IDは、DBの確定後だけ呼出し元へ返す。
+func (store *Store) StopReservation(ctx context.Context, number int32, now time.Time) (recording.StopResult, error) {
+	if store == nil || store.writer == nil || ctx == nil || number < 1 || now.IsZero() ||
+		now.Location() != time.UTC || now.UnixMilli() < 0 {
+		return recording.StopResult{}, errors.New("sqlite: invalid reservation stop")
+	}
+	tx, err := store.writer.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		return recording.StopResult{}, sanitize("begin-reservation-stop", err)
+	}
+	defer tx.Rollback()
+	var reservationID, attemptID []byte
+	var reservationState recording.ReservationState
+	var attemptState sql.NullString
+	var requested sql.NullInt64
+	err = tx.QueryRowContext(ctx, `SELECT r.id, r.state, a.id, a.state, a.stop_requested_at_utc_ms
+		FROM ctrlcmd_reservation_ids m JOIN reservations r ON r.id=m.reservation_id
+		LEFT JOIN recording_attempts a ON a.reservation_id=r.id WHERE m.reserve_id=?`, number).
+		Scan(&reservationID, &reservationState, &attemptID, &attemptState, &requested)
+	if errors.Is(err, sql.ErrNoRows) {
+		return recording.StopResult{}, ErrReservationUnavailable
+	}
+	if err != nil {
+		return recording.StopResult{}, sanitize("read-reservation-stop", err)
+	}
+	if reservationState != recording.ReservationActive {
+		return recording.StopResult{}, ErrReservationUnavailable
+	}
+	nowMS := now.UnixMilli()
+	if !attemptState.Valid {
+		result, updateErr := tx.ExecContext(ctx, `UPDATE reservations SET state='FINISHED', version=version+1,
+			updated_at_utc_ms=?, finished_at_utc_ms=?, terminal_reason='CANCELLED_BY_USER'
+			WHERE id=? AND state='ACTIVE'`, nowMS, nowMS, reservationID)
+		if updateErr != nil {
+			return recording.StopResult{}, sanitize("cancel-reservation", updateErr)
+		}
+		if affected(result) != 1 {
+			return recording.StopResult{}, ErrReservationUnavailable
+		}
+		if err := tx.Commit(); err != nil {
+			return recording.StopResult{}, sanitize("commit-reservation-cancel", err)
+		}
+		return recording.StopResult{}, nil
+	}
+	if attemptState.String != string(recording.AttemptClaimed) && attemptState.String != string(recording.AttemptStarting) &&
+		attemptState.String != string(recording.AttemptRecording) {
+		return recording.StopResult{}, ErrReservationUnavailable
+	}
+	if !requested.Valid {
+		result, updateErr := tx.ExecContext(ctx, `UPDATE recording_attempts SET stop_requested_at_utc_ms=?,
+			state_version=state_version+1, updated_at_utc_ms=? WHERE id=? AND state IN ('CLAIMED','STARTING','RECORDING')
+			AND stop_requested_at_utc_ms IS NULL`, nowMS, nowMS, attemptID)
+		if updateErr != nil {
+			return recording.StopResult{}, sanitize("request-recording-stop", updateErr)
+		}
+		if affected(result) != 1 {
+			return recording.StopResult{}, ErrReservationUnavailable
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return recording.StopResult{}, sanitize("commit-recording-stop", err)
+	}
+	var id catalogmodel.ID
+	if err := copyExact(id[:], reservationID); err != nil {
+		return recording.StopResult{}, err
+	}
+	return recording.StopResult{ReservationID: id, Notify: true}, nil
+}
+
+// CancelReservationは内部の自動予約取消しから使う、録画開始前だけの互換操作である。
 func (store *Store) CancelReservation(ctx context.Context, number int32, now time.Time) error {
 	if store == nil || store.writer == nil || ctx == nil || number < 1 || now.IsZero() ||
 		now.Location() != time.UTC || now.UnixMilli() < 0 {
@@ -450,6 +520,23 @@ func (store *Store) StartAttempt(ctx context.Context, attemptID catalogmodel.ID,
 	return store.transitionAttempt(ctx, attemptID, recording.AttemptClaimed, recording.AttemptStarting, now)
 }
 
+// AttemptStopRequestedは一回の録画処理に利用者停止が保存済みかを、副作用なしで返す。
+func (store *Store) AttemptStopRequested(ctx context.Context, attemptID catalogmodel.ID) (bool, error) {
+	if store == nil || store.reader == nil || ctx == nil || attemptID == (catalogmodel.ID{}) {
+		return false, errors.New("sqlite: invalid recording stop query")
+	}
+	var requested int
+	err := store.reader.QueryRowContext(ctx, `SELECT stop_requested_at_utc_ms IS NOT NULL FROM recording_attempts
+		WHERE id=? AND state IN ('CLAIMED','STARTING','RECORDING')`, attemptID.Bytes()).Scan(&requested)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, ErrAttemptState
+	}
+	if err != nil {
+		return false, sanitize("read-recording-stop", err)
+	}
+	return requested == 1, nil
+}
+
 // RecordingStartedは録画処理とファイル区間を書込み中へ進め、現在の予定終了時刻を返す。
 func (store *Store) RecordingStarted(ctx context.Context, attemptID catalogmodel.ID, now time.Time) (time.Time, error) {
 	if err := validateRecordingUpdate(store, ctx, attemptID, now); err != nil {
@@ -547,9 +634,11 @@ func (store *Store) BeginFinalization(ctx context.Context, request recording.Fin
 	defer tx.Rollback()
 	nowMS := request.Now.UnixMilli()
 	result, err := tx.ExecContext(ctx, `UPDATE recording_attempts SET state='FINALIZING', state_version=state_version+1,
-		byte_count=?, heartbeat_utc_ms=?, finalization_token=?, updated_at_utc_ms=?
-		WHERE id=? AND state='RECORDING' AND byte_count<=?`, request.ByteCount, nowMS, request.Token.Bytes(),
-		nowMS, request.AttemptID.Bytes(), request.ByteCount)
+		byte_count=?, heartbeat_utc_ms=?, finalization_token=?, planned_final_state=?, planned_terminal_reason=?, updated_at_utc_ms=?
+		WHERE id=? AND state='RECORDING' AND byte_count<=?
+		AND ((?='PARTIAL' AND stop_requested_at_utc_ms IS NOT NULL) OR (?='SUCCEEDED' AND stop_requested_at_utc_ms IS NULL))`,
+		request.ByteCount, nowMS, request.Token.Bytes(), request.State, request.Reason, nowMS, request.AttemptID.Bytes(),
+		request.ByteCount, request.State, request.State)
 	if err != nil {
 		return sanitize("mark-recording-finalizing", err)
 	}
@@ -594,8 +683,10 @@ func (store *Store) FinishAttempt(ctx context.Context, request recording.FinishR
 	var reservationID []byte
 	var current recording.AttemptState
 	var actualStart sql.NullInt64
-	err = tx.QueryRowContext(ctx, `SELECT reservation_id, state, actual_start_utc_ms FROM recording_attempts WHERE id=?`,
-		request.AttemptID.Bytes()).Scan(&reservationID, &current, &actualStart)
+	var plannedState, plannedReason sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT reservation_id, state, actual_start_utc_ms,
+		planned_final_state, planned_terminal_reason FROM recording_attempts WHERE id=?`,
+		request.AttemptID.Bytes()).Scan(&reservationID, &current, &actualStart, &plannedState, &plannedReason)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrAttemptState
 	}
@@ -606,7 +697,15 @@ func (store *Store) FinishAttempt(ctx context.Context, request recording.FinishR
 		current == recording.AttemptCancelled || current == recording.AttemptMissed {
 		return ErrAttemptState
 	}
-	if request.State == recording.AttemptSucceeded && current != recording.AttemptFinalizing {
+	if (request.State == recording.AttemptSucceeded ||
+		(request.State == recording.AttemptPartial && request.Reason == recording.ReasonUserRequestedStop)) &&
+		current != recording.AttemptFinalizing {
+		return ErrAttemptState
+	}
+	if current == recording.AttemptFinalizing && (request.State == recording.AttemptSucceeded ||
+		(request.State == recording.AttemptPartial && request.Reason == recording.ReasonUserRequestedStop)) &&
+		(!plannedState.Valid || !plannedReason.Valid ||
+			plannedState.String != string(request.State) || plannedReason.String != string(request.Reason)) {
 		return ErrAttemptState
 	}
 	nowMS := request.Now.UnixMilli()
@@ -627,7 +726,8 @@ func (store *Store) FinishAttempt(ctx context.Context, request recording.FinishR
 	if affected(result) != 1 {
 		return ErrAttemptState
 	}
-	if request.State == recording.AttemptSucceeded {
+	if request.State == recording.AttemptSucceeded ||
+		(request.State == recording.AttemptPartial && request.Reason == recording.ReasonUserRequestedStop) {
 		result, err = tx.ExecContext(ctx, `UPDATE recording_segments SET state='FINALIZED', byte_count=?,
 			availability='FINAL', updated_at_utc_ms=? WHERE attempt_id=? AND ordinal=0 AND state='PARTIAL'
 			AND file_synced=1 AND final_published=1 AND directory_synced=1`, request.ByteCount, nowMS,

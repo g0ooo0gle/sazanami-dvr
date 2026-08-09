@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -229,7 +230,8 @@ func TestReservationFollowDoesNotShortenShiftOrFinalizeActiveRecording(t *testin
 					t.Fatal(err)
 				}
 				if err := store.BeginFinalization(context.Background(), recording.FinalizeRequest{
-					AttemptID: attemptID, Token: testID(t, byte(200+index)), ByteCount: 188, Now: now.Add(4 * time.Second),
+					AttemptID: attemptID, Token: testID(t, byte(200+index)), ByteCount: 188,
+					State: recording.AttemptSucceeded, Reason: recording.ReasonCompleted, Now: now.Add(4 * time.Second),
 				}); err != nil {
 					t.Fatal(err)
 				}
@@ -350,6 +352,22 @@ func TestReservationUpdateCancelAndRecordingStatus(t *testing.T) {
 	items, err = reopened.ActiveReservations(context.Background(), 1, 0)
 	if err != nil || len(items) != 0 {
 		t.Fatalf("restarted items=%+v err=%v", items, err)
+	}
+}
+
+func TestStopReservationCancelsBeforeRecordingWithoutNotification(t *testing.T) {
+	_, store := openMigratedStore(t)
+	reservation := reservationForTest(t, store)
+	created, err := store.CreateReservation(context.Background(), reservation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := store.StopReservation(context.Background(), created.Number, reservation.CreatedAt.Add(time.Second))
+	if err != nil || result.Notify || result.ReservationID != (catalogmodel.ID{}) {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if _, err := store.StopReservation(context.Background(), created.Number, reservation.CreatedAt.Add(2*time.Second)); !errors.Is(err, ErrReservationUnavailable) {
+		t.Fatalf("終了済み予約の停止が成功しました: %v", err)
 	}
 }
 
@@ -550,7 +568,8 @@ func TestRecordingAttemptLifecycle(t *testing.T) {
 		t.Fatalf("減少したbyte数が受理されました: %v", err)
 	}
 	finalize := recording.FinalizeRequest{
-		AttemptID: claim.AttemptID, Token: testID(t, 121), ByteCount: 376, Now: now.Add(5 * time.Second),
+		AttemptID: claim.AttemptID, Token: testID(t, 121), ByteCount: 376,
+		State: recording.AttemptSucceeded, Reason: recording.ReasonCompleted, Now: now.Add(5 * time.Second),
 	}
 	if err := store.BeginFinalization(context.Background(), finalize); err != nil {
 		t.Fatal(err)
@@ -679,6 +698,141 @@ func TestRecordingAttemptCanFinishWithoutOpeningStream(t *testing.T) {
 	if err != nil || attemptState != "MISSED" || reservationState != "FINISHED" || availability != "MISSING" || recovered != 1 {
 		t.Fatalf("attempt=%s reservation=%s availability=%s recovered=%d err=%v",
 			attemptState, reservationState, availability, recovered, err)
+	}
+}
+
+func TestUserStopIsPersistedIdempotentlyAndPublishesOnlyItsPartialRecording(t *testing.T) {
+	_, store := openMigratedStore(t)
+	reservation := reservationForTest(t, store)
+	created, err := store.CreateReservation(context.Background(), reservation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := reservation.CreatedAt.Add(time.Minute)
+	plan := recording.FilePlan{PartialPath: "2026/08/stopped.ts.partial", FinalPath: "2026/08/stopped.ts"}
+	claim := recording.ClaimRequest{
+		ReservationID: created.ID, AttemptID: testID(t, 131), SegmentID: testID(t, 132),
+		OwnerID: testID(t, 133), OwnerGeneration: 1, Now: now, Plan: plan,
+	}
+	if _, err := store.ClaimRecording(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.StartAttempt(context.Background(), claim.AttemptID, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	stopAt := now.Add(2 * time.Second)
+	for index := 0; index < 2; index++ {
+		result, err := store.StopReservation(context.Background(), created.Number, stopAt.Add(time.Duration(index)*time.Second))
+		if err != nil || !result.Notify || result.ReservationID != created.ID {
+			t.Fatalf("stop=%+v err=%v", result, err)
+		}
+	}
+	requested, err := store.AttemptStopRequested(context.Background(), claim.AttemptID)
+	if err != nil || !requested {
+		t.Fatalf("requested=%v err=%v", requested, err)
+	}
+	if _, err := store.RecordingStarted(context.Background(), claim.AttemptID, now.Add(4*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpdateRecordingProgress(context.Background(), claim.AttemptID, 376, now.Add(5*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	normal := recording.FinalizeRequest{
+		AttemptID: claim.AttemptID, Token: testID(t, 134), ByteCount: 376,
+		State: recording.AttemptSucceeded, Reason: recording.ReasonCompleted, Now: now.Add(6 * time.Second),
+	}
+	if err := store.BeginFinalization(context.Background(), normal); !errors.Is(err, ErrAttemptState) {
+		t.Fatalf("停止要求後の正常完成が受理されました: %v", err)
+	}
+	stopped := normal
+	stopped.Token = testID(t, 135)
+	stopped.State = recording.AttemptPartial
+	stopped.Reason = recording.ReasonUserRequestedStop
+	if err := store.BeginFinalization(context.Background(), stopped); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StopReservation(context.Background(), created.Number, now.Add(7*time.Second)); !errors.Is(err, ErrReservationUnavailable) {
+		t.Fatalf("完成処理中の停止が成功しました: %v", err)
+	}
+	if err := store.MarkFinalPublished(context.Background(), claim.AttemptID, now.Add(8*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkDirectorySynced(context.Background(), claim.AttemptID, now.Add(9*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	finish := recording.FinishRequest{
+		AttemptID: claim.AttemptID, State: recording.AttemptPartial, Reason: recording.ReasonUserRequestedStop,
+		ByteCount: 376, Availability: recording.AvailabilityFinal, Now: now.Add(10 * time.Second),
+	}
+	if err := store.FinishAttempt(context.Background(), finish); err != nil {
+		t.Fatal(err)
+	}
+	history, err := store.RecordingHistoryItem(context.Background(), created.Number)
+	if err != nil || history == nil || !history.Playable() || history.State != recording.AttemptPartial ||
+		history.Reason != recording.ReasonUserRequestedStop {
+		t.Fatalf("history=%+v err=%v", history, err)
+	}
+	completed, err := store.CompletedRecordings(context.Background(), 1, 0)
+	if err != nil || len(completed) != 1 || completed[0].Number != created.Number {
+		t.Fatalf("completed=%+v err=%v", completed, err)
+	}
+	recoveryItems, err := store.RecoveryAttempts(context.Background(), recording.MaxRecoveryPage, catalogmodel.ID{})
+	if err != nil || len(recoveryItems) != 1 || recoveryItems[0].PlannedState != recording.AttemptPartial ||
+		recoveryItems[0].PlannedReason != recording.ReasonUserRequestedStop {
+		t.Fatalf("recovery=%+v err=%v", recoveryItems, err)
+	}
+}
+
+func TestConcurrentUserStopRequestsConvergeOnOneTimestamp(t *testing.T) {
+	_, store := openMigratedStore(t)
+	reservation := reservationForTest(t, store)
+	created, err := store.CreateReservation(context.Background(), reservation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := reservation.CreatedAt.Add(time.Minute)
+	claim := recording.ClaimRequest{
+		ReservationID: created.ID, AttemptID: testID(t, 136), SegmentID: testID(t, 137),
+		OwnerID: testID(t, 138), OwnerGeneration: 1, Now: now,
+		Plan: recording.FilePlan{PartialPath: "2026/08/concurrent.ts.partial", FinalPath: "2026/08/concurrent.ts"},
+	}
+	if _, err := store.ClaimRecording(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	const requests = 16
+	errorsFound := make(chan error, requests)
+	var group sync.WaitGroup
+	for index := 0; index < requests; index++ {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			result, stopErr := store.StopReservation(context.Background(), created.Number, now.Add(time.Second))
+			if stopErr != nil {
+				errorsFound <- stopErr
+				return
+			}
+			if !result.Notify || result.ReservationID != created.ID {
+				errorsFound <- errors.New("unexpected stop result")
+			}
+		}()
+	}
+	group.Wait()
+	close(errorsFound)
+	for stopErr := range errorsFound {
+		t.Fatal(stopErr)
+	}
+	var requestedAt, version int64
+	if err := store.reader.QueryRow(`SELECT stop_requested_at_utc_ms, state_version FROM recording_attempts WHERE id=?`,
+		claim.AttemptID.Bytes()).Scan(&requestedAt, &version); err != nil || requestedAt != now.Add(time.Second).UnixMilli() || version != 2 {
+		t.Fatalf("requested_at=%d version=%d err=%v", requestedAt, version, err)
+	}
+	if _, err := store.writer.Exec(`UPDATE recording_attempts SET stop_requested_at_utc_ms=? WHERE id=?`,
+		now.Add(2*time.Second).UnixMilli(), claim.AttemptID.Bytes()); err == nil {
+		t.Fatal("保存済みの停止要求時刻が上書きされました")
+	}
+	if _, err := store.writer.Exec(`UPDATE recording_attempts SET planned_final_state='PARTIAL' WHERE id=?`,
+		claim.AttemptID.Bytes()); err == nil {
+		t.Fatal("終了理由のない完成計画が保存されました")
 	}
 }
 
