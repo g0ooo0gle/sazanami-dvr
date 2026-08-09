@@ -26,6 +26,8 @@ type e2eStream struct {
 	end             time.Time
 	opens           int
 	disconnectFirst bool
+	onRead          func()
+	hooked          bool
 }
 
 func (stream *e2eStream) OpenStream(context.Context, providerstream.Request) (providerstream.Lease, error) {
@@ -41,12 +43,78 @@ type e2eLease struct {
 
 func (lease *e2eLease) Read(_ context.Context, destination []byte) (int, providerstream.Terminal, error) {
 	copy(destination, bytes.Repeat([]byte{0x47}, 188))
+	if lease.stream.onRead != nil && !lease.stream.hooked {
+		lease.stream.hooked = true
+		lease.stream.onRead()
+	}
 	if lease.stream.disconnectFirst && lease.connection == 0 {
 		return 188, providerstream.Terminal{Done: true, Reason: providerstream.TerminalEarlyEOF},
 			provider.NewFailure(provider.ReasonEarlyEOF, "test")
 	}
 	lease.stream.clock.now = lease.stream.end
 	return 188, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
+}
+
+func TestActiveExtensionReachesRunningExecutor(t *testing.T) {
+	_, store := openMigratedStore(t)
+	defer store.Close()
+	reservation := reservationForTest(t, store)
+	created, err := store.CreateReservation(context.Background(), reservation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := storeFollowRevision(t, store, reservation, reservation.Program.Start, 40*time.Minute, 230)
+	recordingRoot, err := recordingfs.OpenRoot(filepath.Join(t.TempDir(), "recordings"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recordingRoot.Close()
+	clock := &e2eClock{now: reservation.Program.Start}
+	var applied bool
+	var followErr error
+	stream := &e2eStream{clock: clock, end: reservation.Program.Start.Add(40 * time.Minute)}
+	stream.onRead = func() {
+		applied, followErr = store.ApplyReservationFollow(context.Background(), core.ReservationFollowRequest{
+			ReservationID: created.ID, ExpectedVersion: created.Version,
+			ExpectedRevisionID: created.Program.ProgramRevisionID, TargetRevisionID: target.ProgramRevisionID,
+			Now: reservation.Program.Start.Add(10 * time.Second),
+		})
+	}
+	ids := []catalogmodel.ID{testID(t, 231), testID(t, 232), testID(t, 233)}
+	nextID := 0
+	executor := apprecording.Executor{
+		Store: store, Stream: stream, Clock: clock, OwnerID: testID(t, 234), Generation: 1,
+		NewID: func() (catalogmodel.ID, error) {
+			id := ids[nextID]
+			nextID++
+			return id, nil
+		},
+		Files: apprecording.FileOperations{
+			CreatePartial: func(plan core.FilePlan) (apprecording.PartialFile, error) {
+				return recordingRoot.CreatePartial(plan)
+			},
+			LinkFinal: recordingRoot.LinkFinal, SyncDirectory: recordingRoot.SyncDirectory,
+			RemovePartial: recordingRoot.RemovePartial,
+		},
+		WithDeadline: func(ctx context.Context, _ time.Time) (context.Context, context.CancelFunc) {
+			return context.WithCancel(ctx)
+		},
+	}
+	result, err := executor.Execute(context.Background(), created)
+	if err != nil || followErr != nil || !applied || result.State != core.AttemptSucceeded ||
+		result.Reason != core.ReasonCompleted || !stream.hooked {
+		t.Fatalf("result=%+v applied=%v hooked=%v err=%v follow_err=%v",
+			result, applied, stream.hooked, err, followErr)
+	}
+	items, err := store.ActiveReservations(context.Background(), 1, 0)
+	if err != nil || len(items) != 0 {
+		t.Fatalf("active=%+v err=%v", items, err)
+	}
+	var plannedEndMS int64
+	if err := store.reader.QueryRow(`SELECT planned_end_utc_ms FROM recording_attempts WHERE reservation_id=?`,
+		created.ID.Bytes()).Scan(&plannedEndMS); err != nil || plannedEndMS != stream.end.UnixMilli() {
+		t.Fatalf("planned_end=%d err=%v", plannedEndMS, err)
+	}
 }
 
 func (*e2eLease) Cancel() error { return nil }

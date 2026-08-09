@@ -193,13 +193,95 @@ func (store *Store) ApplyReservationFollow(ctx context.Context, request recordin
 	if err != nil {
 		return false, sanitize("apply-reservation-follow", err)
 	}
-	if affected(result) != 1 {
+	applied := affected(result) == 1
+	if !applied {
+		applied, err = applyActiveRecordingExtension(ctx, tx, request, startMS, durationMS)
+		if err != nil {
+			return false, err
+		}
+	}
+	if !applied {
 		return false, nil
 	}
 	if err := tx.Commit(); err != nil {
 		return false, sanitize("commit-reservation-follow", err)
 	}
 	return true, nil
+}
+
+// applyActiveRecordingExtensionは実行中の一件だけについて、予約と録画終了時刻を同時に延ばす。
+func applyActiveRecordingExtension(ctx context.Context, tx *sql.Tx, request recording.ReservationFollowRequest,
+	targetStartMS, targetDurationMS int64,
+) (bool, error) {
+	var reservationStartMS, reservationDurationSeconds, attemptEndMS int64
+	var attemptID []byte
+	var attemptState recording.AttemptState
+	err := tx.QueryRowContext(ctx, `SELECT r.start_at_utc_ms, r.duration_seconds,
+		a.id, a.state, a.planned_end_utc_ms
+		FROM reservations r JOIN recording_attempts a ON a.reservation_id=r.id
+		WHERE r.id=? AND r.version=? AND r.state='ACTIVE' AND r.requested_follow=1
+		  AND r.program_revision_id=?`, request.ReservationID.Bytes(), request.ExpectedVersion,
+		request.ExpectedRevisionID.Bytes()).Scan(&reservationStartMS, &reservationDurationSeconds,
+		&attemptID, &attemptState, &attemptEndMS)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, sanitize("read-active-recording-extension", err)
+	}
+	if reservationStartMS < 0 || reservationDurationSeconds < 1 || targetStartMS != reservationStartMS ||
+		targetDurationMS < 60_000 || targetDurationMS > 12*60*60*1_000 || targetDurationMS%1_000 != 0 {
+		return false, nil
+	}
+	targetEndMS := targetStartMS + targetDurationMS
+	reservationEndMS := reservationStartMS + reservationDurationSeconds*1_000
+	if targetEndMS <= attemptEndMS || reservationEndMS != attemptEndMS {
+		return false, nil
+	}
+	switch attemptState {
+	case recording.AttemptClaimed, recording.AttemptStarting, recording.AttemptRecording:
+	default:
+		return false, nil
+	}
+	var verified int
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
+		SELECT 1 FROM program_revisions target JOIN program_revisions previous
+		  ON previous.id=? AND previous.program_instance_id=target.program_instance_id
+		JOIN program_observations po ON po.program_revision_id=target.id
+		JOIN catalog_syncs cs ON cs.id=po.sync_id
+		JOIN reservations r ON r.id=?
+		WHERE target.id=? AND target.program_instance_id=r.program_instance_id
+		  AND target.revision_number>previous.revision_number
+		  AND cs.backend_instance_id=r.backend_instance_id AND cs.state='COMPLETED'
+		  AND cs.id=(SELECT id FROM catalog_syncs WHERE backend_instance_id=r.backend_instance_id
+			AND state='COMPLETED' ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1)
+	)`, request.ExpectedRevisionID.Bytes(), request.ReservationID.Bytes(),
+		request.TargetRevisionID.Bytes()).Scan(&verified); err != nil {
+		return false, sanitize("verify-active-recording-extension", err)
+	}
+	if verified != 1 {
+		return false, nil
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE reservations SET program_revision_id=?, duration_seconds=?,
+		version=version+1, updated_at_utc_ms=? WHERE id=? AND version=? AND state='ACTIVE'
+		AND requested_follow=1 AND program_revision_id=? AND start_at_utc_ms=? AND duration_seconds=?`,
+		request.TargetRevisionID.Bytes(), targetDurationMS/1_000, request.Now.UnixMilli(),
+		request.ReservationID.Bytes(), request.ExpectedVersion, request.ExpectedRevisionID.Bytes(),
+		reservationStartMS, reservationDurationSeconds)
+	if err != nil {
+		return false, sanitize("update-active-recording-reservation", err)
+	}
+	if affected(result) != 1 {
+		return false, nil
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE recording_attempts SET planned_end_utc_ms=?,
+		state_version=state_version+1, updated_at_utc_ms=?
+		WHERE id=? AND state=? AND planned_end_utc_ms=?`, targetEndMS, request.Now.UnixMilli(),
+		attemptID, attemptState, attemptEndMS)
+	if err != nil {
+		return false, sanitize("update-active-recording-end", err)
+	}
+	return affected(result) == 1, nil
 }
 
 // UpdateReservationは変更不可の番組情報を照合し、録画開始前の設定だけを更新する。
@@ -360,14 +442,14 @@ func (store *Store) StartAttempt(ctx context.Context, attemptID catalogmodel.ID,
 	return store.transitionAttempt(ctx, attemptID, recording.AttemptClaimed, recording.AttemptStarting, now)
 }
 
-// RecordingStartedはストリーム接続後に、録画処理とファイル区間を一緒に書込み中へ進める。
-func (store *Store) RecordingStarted(ctx context.Context, attemptID catalogmodel.ID, now time.Time) error {
+// RecordingStartedは録画処理とファイル区間を書込み中へ進め、現在の予定終了時刻を返す。
+func (store *Store) RecordingStarted(ctx context.Context, attemptID catalogmodel.ID, now time.Time) (time.Time, error) {
 	if err := validateRecordingUpdate(store, ctx, attemptID, now); err != nil {
-		return err
+		return time.Time{}, err
 	}
 	tx, err := store.writer.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
-		return sanitize("begin-recording-start", err)
+		return time.Time{}, sanitize("begin-recording-start", err)
 	}
 	defer tx.Rollback()
 	nowMS := now.UnixMilli()
@@ -375,33 +457,41 @@ func (store *Store) RecordingStarted(ctx context.Context, attemptID catalogmodel
 		actual_start_utc_ms=?, heartbeat_utc_ms=?, updated_at_utc_ms=? WHERE id=? AND state='STARTING'`,
 		nowMS, nowMS, nowMS, attemptID.Bytes())
 	if err != nil {
-		return sanitize("mark-recording-started", err)
+		return time.Time{}, sanitize("mark-recording-started", err)
 	}
 	if affected(result) != 1 {
-		return ErrAttemptState
+		return time.Time{}, ErrAttemptState
 	}
 	result, err = tx.ExecContext(ctx, `UPDATE recording_segments SET state='WRITING', updated_at_utc_ms=?
 		WHERE attempt_id=? AND ordinal=0 AND state='PLANNED'`, nowMS, attemptID.Bytes())
 	if err != nil {
-		return sanitize("mark-recording-segment-started", err)
+		return time.Time{}, sanitize("mark-recording-segment-started", err)
 	}
 	if affected(result) != 1 {
-		return ErrAttemptState
+		return time.Time{}, ErrAttemptState
+	}
+	var plannedEndMS int64
+	if err := tx.QueryRowContext(ctx, `SELECT planned_end_utc_ms FROM recording_attempts
+		WHERE id=? AND state='RECORDING'`, attemptID.Bytes()).Scan(&plannedEndMS); err != nil {
+		return time.Time{}, sanitize("read-recording-start-end", err)
+	}
+	if plannedEndMS < 0 {
+		return time.Time{}, errors.New("sqlite: corrupt recording planned end")
 	}
 	if err := tx.Commit(); err != nil {
-		return sanitize("commit-recording-start", err)
+		return time.Time{}, sanitize("commit-recording-start", err)
 	}
-	return nil
+	return time.UnixMilli(plannedEndMS).UTC(), nil
 }
 
-// UpdateRecordingProgressは5秒ごとのバイト数と生存時刻を、短いトランザクションで保存する。
-func (store *Store) UpdateRecordingProgress(ctx context.Context, attemptID catalogmodel.ID, byteCount int64, now time.Time) error {
+// UpdateRecordingProgressは5秒ごとのバイト数と生存時刻を保存し、現在の予定終了時刻を返す。
+func (store *Store) UpdateRecordingProgress(ctx context.Context, attemptID catalogmodel.ID, byteCount int64, now time.Time) (time.Time, error) {
 	if byteCount < 0 || validateRecordingUpdate(store, ctx, attemptID, now) != nil {
-		return errors.New("sqlite: invalid recording progress")
+		return time.Time{}, errors.New("sqlite: invalid recording progress")
 	}
 	tx, err := store.writer.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
-		return sanitize("begin-recording-progress", err)
+		return time.Time{}, sanitize("begin-recording-progress", err)
 	}
 	defer tx.Rollback()
 	nowMS := now.UnixMilli()
@@ -409,24 +499,32 @@ func (store *Store) UpdateRecordingProgress(ctx context.Context, attemptID catal
 		updated_at_utc_ms=? WHERE id=? AND state='RECORDING' AND byte_count<=?`,
 		byteCount, nowMS, nowMS, attemptID.Bytes(), byteCount)
 	if err != nil {
-		return sanitize("update-recording-attempt-progress", err)
+		return time.Time{}, sanitize("update-recording-attempt-progress", err)
 	}
 	if affected(result) != 1 {
-		return ErrAttemptState
+		return time.Time{}, ErrAttemptState
 	}
 	result, err = tx.ExecContext(ctx, `UPDATE recording_segments SET byte_count=?, updated_at_utc_ms=?
 		WHERE attempt_id=? AND ordinal=0 AND state='WRITING' AND byte_count<=?`,
 		byteCount, nowMS, attemptID.Bytes(), byteCount)
 	if err != nil {
-		return sanitize("update-recording-segment-progress", err)
+		return time.Time{}, sanitize("update-recording-segment-progress", err)
 	}
 	if affected(result) != 1 {
-		return ErrAttemptState
+		return time.Time{}, ErrAttemptState
+	}
+	var plannedEndMS int64
+	if err := tx.QueryRowContext(ctx, `SELECT planned_end_utc_ms FROM recording_attempts
+		WHERE id=? AND state='RECORDING'`, attemptID.Bytes()).Scan(&plannedEndMS); err != nil {
+		return time.Time{}, sanitize("read-recording-planned-end", err)
+	}
+	if plannedEndMS < 0 {
+		return time.Time{}, errors.New("sqlite: corrupt recording planned end")
 	}
 	if err := tx.Commit(); err != nil {
-		return sanitize("commit-recording-progress", err)
+		return time.Time{}, sanitize("commit-recording-progress", err)
 	}
-	return nil
+	return time.UnixMilli(plannedEndMS).UTC(), nil
 }
 
 // BeginFinalizationはファイル同期済みのバイト数とトークンを保存し、完成名を公開できる状態へ進める。

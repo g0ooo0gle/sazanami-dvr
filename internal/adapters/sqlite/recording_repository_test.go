@@ -115,6 +115,191 @@ func TestReservationFollowUsesLatestCompletedRevision(t *testing.T) {
 	}
 }
 
+func TestReservationFollowExtendsActiveRecording(t *testing.T) {
+	states := []recording.AttemptState{recording.AttemptClaimed, recording.AttemptStarting, recording.AttemptRecording}
+	for index, state := range states {
+		t.Run(string(state), func(t *testing.T) {
+			_, store := openMigratedStore(t)
+			defer store.Close()
+			reservation := reservationForTest(t, store)
+			created, err := store.CreateReservation(context.Background(), reservation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			attemptID := testID(t, byte(130+index))
+			plan, err := recording.NewFilePlan(reservation.Program.Start, attemptID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			claim := recording.ClaimRequest{
+				ReservationID: created.ID, AttemptID: attemptID, SegmentID: testID(t, byte(140+index)),
+				OwnerID: testID(t, byte(150+index)), OwnerGeneration: 1,
+				Now: reservation.CreatedAt.Add(time.Minute), Plan: plan,
+			}
+			if _, err := store.ClaimRecording(context.Background(), claim); err != nil {
+				t.Fatal(err)
+			}
+			if state == recording.AttemptStarting || state == recording.AttemptRecording {
+				if err := store.StartAttempt(context.Background(), attemptID, claim.Now.Add(time.Second)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if state == recording.AttemptRecording {
+				if _, err := store.RecordingStarted(context.Background(), attemptID, claim.Now.Add(2*time.Second)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			target := storeFollowRevision(t, store, reservation, reservation.Program.Start, 40*time.Minute,
+				byte(160+index))
+			applied, err := store.ApplyReservationFollow(context.Background(), recording.ReservationFollowRequest{
+				ReservationID: created.ID, ExpectedVersion: created.Version,
+				ExpectedRevisionID: created.Program.ProgramRevisionID, TargetRevisionID: target.ProgramRevisionID,
+				Now: claim.Now.Add(3 * time.Second),
+			})
+			if err != nil || !applied {
+				t.Fatalf("applied=%v err=%v", applied, err)
+			}
+			items, err := store.ActiveReservations(context.Background(), 1, 0)
+			if err != nil || len(items) != 1 || items[0].Version != 2 ||
+				items[0].Program.ProgramRevisionID != target.ProgramRevisionID ||
+				items[0].Program.Duration != 40*time.Minute || !items[0].Program.Start.Equal(reservation.Program.Start) {
+				t.Fatalf("items=%+v err=%v", items, err)
+			}
+			var endMS, stateVersion int64
+			var persistedState recording.AttemptState
+			if err := store.reader.QueryRow(`SELECT state, state_version, planned_end_utc_ms
+				FROM recording_attempts WHERE id=?`, attemptID.Bytes()).Scan(&persistedState, &stateVersion, &endMS); err != nil {
+				t.Fatal(err)
+			}
+			if persistedState != state || stateVersion != int64(2+index) ||
+				endMS != reservation.Program.Start.Add(40*time.Minute).UnixMilli() {
+				t.Fatalf("state=%s version=%d end=%d", persistedState, stateVersion, endMS)
+			}
+			if state == recording.AttemptRecording {
+				end, err := store.UpdateRecordingProgress(context.Background(), attemptID, 188, claim.Now.Add(4*time.Second))
+				if err != nil || !end.Equal(reservation.Program.Start.Add(40*time.Minute)) {
+					t.Fatalf("progress end=%s err=%v", end, err)
+				}
+			}
+		})
+	}
+}
+
+func TestReservationFollowDoesNotShortenShiftOrFinalizeActiveRecording(t *testing.T) {
+	cases := []struct {
+		name       string
+		startShift time.Duration
+		duration   time.Duration
+		finalizing bool
+	}{
+		{name: "shorter", duration: 20 * time.Minute},
+		{name: "shifted start", startShift: 5 * time.Minute, duration: 35 * time.Minute},
+		{name: "finalizing", duration: 40 * time.Minute, finalizing: true},
+	}
+	for index, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			_, store := openMigratedStore(t)
+			defer store.Close()
+			reservation := reservationForTest(t, store)
+			created, err := store.CreateReservation(context.Background(), reservation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			attemptID := testID(t, byte(170+index))
+			plan, err := recording.NewFilePlan(reservation.Program.Start, attemptID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := reservation.CreatedAt.Add(time.Minute)
+			claim := recording.ClaimRequest{
+				ReservationID: created.ID, AttemptID: attemptID, SegmentID: testID(t, byte(180+index)),
+				OwnerID: testID(t, byte(190+index)), OwnerGeneration: 1, Now: now, Plan: plan,
+			}
+			if _, err := store.ClaimRecording(context.Background(), claim); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.StartAttempt(context.Background(), attemptID, now.Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.RecordingStarted(context.Background(), attemptID, now.Add(2*time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if test.finalizing {
+				if _, err := store.UpdateRecordingProgress(context.Background(), attemptID, 188, now.Add(3*time.Second)); err != nil {
+					t.Fatal(err)
+				}
+				if err := store.BeginFinalization(context.Background(), recording.FinalizeRequest{
+					AttemptID: attemptID, Token: testID(t, byte(200+index)), ByteCount: 188, Now: now.Add(4 * time.Second),
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			target := storeFollowRevision(t, store, reservation, reservation.Program.Start.Add(test.startShift),
+				test.duration, byte(210+index))
+			applied, err := store.ApplyReservationFollow(context.Background(), recording.ReservationFollowRequest{
+				ReservationID: created.ID, ExpectedVersion: created.Version,
+				ExpectedRevisionID: created.Program.ProgramRevisionID, TargetRevisionID: target.ProgramRevisionID,
+				Now: now.Add(5 * time.Second),
+			})
+			if err != nil || applied {
+				t.Fatalf("applied=%v err=%v", applied, err)
+			}
+			items, err := store.ActiveReservations(context.Background(), 1, 0)
+			if err != nil || len(items) != 1 || items[0].Version != 1 ||
+				items[0].Program.ProgramRevisionID != reservation.Program.ProgramRevisionID ||
+				items[0].Program.Duration != reservation.Program.Duration {
+				t.Fatalf("items=%+v err=%v", items, err)
+			}
+			var endMS int64
+			if err := store.reader.QueryRow(`SELECT planned_end_utc_ms FROM recording_attempts WHERE id=?`,
+				attemptID.Bytes()).Scan(&endMS); err != nil {
+				t.Fatal(err)
+			}
+			if endMS != reservation.Program.Start.Add(reservation.Program.Duration).UnixMilli() {
+				t.Fatalf("end=%d", endMS)
+			}
+		})
+	}
+}
+
+func storeFollowRevision(t *testing.T, store *Store, reservation recording.Reservation, start time.Time,
+	duration time.Duration, idByte byte,
+) recording.FollowTarget {
+	t.Helper()
+	syncID := testID(t, idByte)
+	if err := store.BeginSync(context.Background(), catalogmodel.Sync{
+		ID: syncID, BackendID: reservation.Program.BackendID, StartedAtMS: 3, CorrelationID: "active-follow-target",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	networkID, transportID, serviceID := int64(1), int64(2), int64(3)
+	tuningTarget := reservation.Program.TuningTarget
+	if err := store.StoreServices(context.Background(), syncID, []catalogmodel.ServiceObservation{{
+		ProviderLocator: tuningTarget, NetworkID: &networkID, TransportID: &transportID, ServiceID: &serviceID,
+		DisplayName: "テスト局", TuningTarget: &tuningTarget, Validation: catalogmodel.ValidationValid,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	startMS, durationMS, eventID := start.UnixMilli(), duration.Milliseconds(), int64(reservation.Program.EventID)
+	title := "延長後"
+	if err := store.StorePrograms(context.Background(), syncID, false, []catalogmodel.ProgramObservation{{
+		ServiceLocator: tuningTarget, EventLocator: "4", RawEventID: &eventID,
+		Material: catalogmodel.RevisionMaterial{StartUTCMS: &startMS, DurationMS: &durationMS,
+			Title: &title, Validation: catalogmodel.ValidationValid},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompleteSync(context.Background(), syncID, startMS+1, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	target, err := store.CurrentFollowTarget(context.Background(), reservation.Program.BackendID,
+		reservation.Program.ProgramInstanceID)
+	if err != nil || target == nil {
+		t.Fatalf("target=%+v err=%v", target, err)
+	}
+	return *target
+}
+
 func TestReservationUpdateCancelAndRecordingStatus(t *testing.T) {
 	root, store := openMigratedStore(t)
 	reservation := reservationForTest(t, store)
@@ -355,13 +540,13 @@ func TestRecordingAttemptLifecycle(t *testing.T) {
 	if err := store.CancelReservation(context.Background(), created.Number, now.Add(time.Second)); !errors.Is(err, ErrReservationUnavailable) {
 		t.Fatalf("録画開始後の取消しが成功しました: %v", err)
 	}
-	if err := store.RecordingStarted(context.Background(), claim.AttemptID, now.Add(2*time.Second)); err != nil {
+	if _, err := store.RecordingStarted(context.Background(), claim.AttemptID, now.Add(2*time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateRecordingProgress(context.Background(), claim.AttemptID, 376, now.Add(3*time.Second)); err != nil {
+	if _, err := store.UpdateRecordingProgress(context.Background(), claim.AttemptID, 376, now.Add(3*time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateRecordingProgress(context.Background(), claim.AttemptID, 188, now.Add(4*time.Second)); !errors.Is(err, ErrAttemptState) {
+	if _, err := store.UpdateRecordingProgress(context.Background(), claim.AttemptID, 188, now.Add(4*time.Second)); !errors.Is(err, ErrAttemptState) {
 		t.Fatalf("減少したbyte数が受理されました: %v", err)
 	}
 	finalize := recording.FinalizeRequest{

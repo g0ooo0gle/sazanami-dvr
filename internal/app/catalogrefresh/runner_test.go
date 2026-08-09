@@ -8,6 +8,12 @@ import (
 	"time"
 )
 
+func TestDefaultIntervalObservesActiveExtension(t *testing.T) {
+	if DefaultInterval != 5*time.Minute {
+		t.Fatalf("default=%s minimum=%s", DefaultInterval, MinimumInterval)
+	}
+}
+
 func TestRunStartsImmediatelyWaitsAfterCompletionAndDoesNotOverlap(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
