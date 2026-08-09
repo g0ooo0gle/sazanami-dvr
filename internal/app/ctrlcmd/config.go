@@ -3,6 +3,7 @@ package ctrlcmd
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"time"
 )
 
@@ -23,12 +24,14 @@ type Config struct {
 	MaxRequestBody     int
 	HeaderTimeout      time.Duration
 	ConnectionLifetime time.Duration
+	AllowLAN           bool
 }
 
 // RecordingConfigは番組表と予約操作の14秒上限を使う録画プロセス向け設定を返す。
 func RecordingConfig() Config {
 	config := DefaultConfig()
 	config.ConnectionLifetime = MaximumLifetime
+	config.AllowLAN = true
 	return config
 }
 
@@ -50,9 +53,9 @@ func (c Config) Validate() error {
 	if err != nil || port == "" {
 		return fmt.Errorf("ctrlcmd: listen address must include an explicit host and port")
 	}
-	ip := net.ParseIP(host)
-	if ip == nil || !(ip.Equal(net.IPv4(127, 0, 0, 1)) || ip.Equal(net.IPv6loopback)) {
-		return fmt.Errorf("ctrlcmd: non-loopback listen address is forbidden")
+	ip, err := netip.ParseAddr(host)
+	if err != nil || !acceptedAddress(ip, c.AllowLAN) {
+		return fmt.Errorf("ctrlcmd: listen address is outside accepted scope")
 	}
 	if c.MaxConnections < 1 || c.MaxConnections > DefaultConnections {
 		return fmt.Errorf("ctrlcmd: max connections outside accepted limit")
@@ -72,10 +75,27 @@ func (c Config) Validate() error {
 	return nil
 }
 
-func validateBoundAddress(address net.Addr) error {
+func validateBoundAddress(address net.Addr, allowPrivateLAN bool) error {
 	tcp, ok := address.(*net.TCPAddr)
-	if !ok || tcp.IP == nil || !(tcp.IP.Equal(net.IPv4(127, 0, 0, 1)) || tcp.IP.Equal(net.IPv6loopback)) {
-		return fmt.Errorf("ctrlcmd: listener is not bound to an explicit loopback address")
+	if !ok || tcp.IP == nil {
+		return fmt.Errorf("ctrlcmd: listener is outside accepted scope")
+	}
+	ip, ok := netip.AddrFromSlice(tcp.IP)
+	if !ok || !acceptedAddress(ip.Unmap(), allowPrivateLAN) {
+		return fmt.Errorf("ctrlcmd: listener is outside accepted scope")
 	}
 	return nil
+}
+
+func acceptedAddress(ip netip.Addr, allowPrivateLAN bool) bool {
+	if !ip.IsValid() || ip.IsMulticast() || ip.IsLinkLocalUnicast() {
+		return false
+	}
+	if ip.IsUnspecified() {
+		return allowPrivateLAN
+	}
+	if ip.IsLoopback() {
+		return true
+	}
+	return allowPrivateLAN && ip.IsPrivate()
 }

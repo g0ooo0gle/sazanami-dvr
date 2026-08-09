@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/recording"
 )
@@ -70,6 +71,55 @@ func (root *Root) Close() error {
 // PartialFileは作成済みの部分ファイルを、非公開の絶対パスを漏らさず操作する。
 type PartialFile struct {
 	file *os.File
+}
+
+// FinalFileは検証済みの完成録画を絶対pathを漏らさず読み出す。
+type FinalFile struct {
+	file     *os.File
+	path     string
+	identity os.FileInfo
+	modTime  time.Time
+}
+
+// Readは完成録画の現在位置からdataを読む。
+func (file *FinalFile) Read(data []byte) (int, error) {
+	if file == nil || file.file == nil || file.path == "" || file.identity == nil {
+		return 0, errors.New("recordingfs: invalid final read")
+	}
+	current, err := os.Lstat(file.path)
+	if err != nil || !validRegularInfo(current, 1) || !os.SameFile(file.identity, current) {
+		return 0, errors.New("recordingfs: final file changed")
+	}
+	return file.file.Read(data)
+}
+
+// SeekはHTTP Range処理が使う読取位置を移動する。
+func (file *FinalFile) Seek(offset int64, whence int) (int64, error) {
+	if file == nil || file.file == nil {
+		return 0, errors.New("recordingfs: invalid final seek")
+	}
+	return file.file.Seek(offset, whence)
+}
+
+// ModTimeはHTTPの標準的な条件付き応答に使う更新時刻を返す。
+func (file *FinalFile) ModTime() time.Time {
+	if file == nil {
+		return time.Time{}
+	}
+	return file.modTime
+}
+
+// Closeは完成録画を閉じる。同じ値への二回目以降の呼出しは何もしない。
+func (file *FinalFile) Close() error {
+	if file == nil || file.file == nil {
+		return nil
+	}
+	err := file.file.Close()
+	file.file = nil
+	if err != nil {
+		return errors.New("recordingfs: close final file")
+	}
+	return nil
 }
 
 // Writeは受信したストリームの一部を部分ファイルへ書く。
@@ -228,6 +278,34 @@ func (root *Root) Inspect(plan recording.FilePlan) (recording.FileObservation, e
 		observation.SameFile = os.SameFile(partialInfo, finalInfo)
 	}
 	return observation, nil
+}
+
+// OpenFinalはDBの完成file計画とbyte数を、open前後の実fileへ照合して読取専用で開く。
+func (root *Root) OpenFinal(plan recording.FilePlan, expectedSize int64) (*FinalFile, error) {
+	_, final, directory, err := root.paths(plan)
+	if err != nil || expectedSize < 188 {
+		return nil, errors.New("recordingfs: invalid final open")
+	}
+	safe, exists, err := root.inspectDirectory(directory)
+	if err != nil || !safe || !exists {
+		return nil, errors.New("recordingfs: final directory unavailable")
+	}
+	before, err := os.Lstat(final)
+	if err != nil || !validRegularInfo(before, 1) || before.Size() != expectedSize {
+		return nil, errors.New("recordingfs: final file unavailable")
+	}
+	opened, err := os.Open(final)
+	if err != nil {
+		return nil, errors.New("recordingfs: open final file")
+	}
+	after, statErr := opened.Stat()
+	safe, exists, directoryErr := root.inspectDirectory(directory)
+	if statErr != nil || directoryErr != nil || !safe || !exists || !validRegularInfo(after, 1) ||
+		after.Size() != expectedSize || !os.SameFile(before, after) {
+		_ = opened.Close()
+		return nil, errors.New("recordingfs: final file changed")
+	}
+	return &FinalFile{file: opened, path: final, identity: after, modTime: after.ModTime()}, nil
 }
 
 func (root *Root) paths(plan recording.FilePlan) (string, string, string, error) {

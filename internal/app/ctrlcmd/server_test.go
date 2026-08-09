@@ -116,6 +116,18 @@ func TestRecordingConfigUsesAcceptedConnectionDeadline(t *testing.T) {
 	if err := config.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	for _, address := range []string{"10.1.1.39:4510", "192.168.1.39:4510", "[fd00::39]:4510", "0.0.0.0:4510", "[::]:4510"} {
+		config.Address = address
+		if err := config.Validate(); err != nil {
+			t.Fatalf("private address %s: %v", address, err)
+		}
+	}
+	for _, address := range []string{"169.254.1.39:4510", "203.0.113.39:4510", "localhost:4510"} {
+		config.Address = address
+		if err := config.Validate(); err == nil {
+			t.Fatalf("unsafe address accepted: %s", address)
+		}
+	}
 }
 
 func TestLoopbackEndToEndSyntheticJourney(t *testing.T) {

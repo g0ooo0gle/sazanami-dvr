@@ -595,6 +595,19 @@ func TestRecordingAttemptLifecycle(t *testing.T) {
 	if err != nil || active {
 		t.Fatalf("finished recording=%v err=%v", active, err)
 	}
+	history, err := store.RecordingHistory(context.Background(), 1, 0)
+	if err != nil || len(history) != 1 || history[0].Number != created.Number || !history[0].Playable() ||
+		history[0].Plan != plan || history[0].ByteCount != 376 {
+		t.Fatalf("history=%+v err=%v", history, err)
+	}
+	completed, err := store.CompletedRecordings(context.Background(), 1, 0)
+	if err != nil || len(completed) != 1 || completed[0].Number != created.Number {
+		t.Fatalf("completed=%+v err=%v", completed, err)
+	}
+	item, err := store.RecordingHistoryItem(context.Background(), created.Number)
+	if err != nil || item == nil || !item.Playable() {
+		t.Fatalf("item=%+v err=%v", item, err)
+	}
 	recoveryItems, err := store.RecoveryAttempts(context.Background(), recording.MaxRecoveryPage, catalogmodel.ID{})
 	if err != nil || len(recoveryItems) != 1 || recoveryItems[0].State != recording.AttemptSucceeded ||
 		recoveryItems[0].ByteCount != 376 || !recoveryItems[0].FileSynced || !recoveryItems[0].FinalPublished ||
@@ -614,6 +627,17 @@ func TestRecordingAttemptLifecycle(t *testing.T) {
 	if err := store.reader.QueryRow(`SELECT availability, integrity_reason FROM recording_segments WHERE attempt_id=?`,
 		claim.AttemptID.Bytes()).Scan(&availability, &integrity); err != nil || availability != "MISSING" || integrity != "FILE_MISSING" {
 		t.Fatalf("availability=%s integrity=%s err=%v", availability, integrity, err)
+	}
+	history, err = store.RecordingHistory(context.Background(), 1, 0)
+	if err != nil || len(history) != 1 || history[0].Playable() {
+		t.Fatalf("missing history=%+v err=%v", history, err)
+	}
+	completed, err = store.CompletedRecordings(context.Background(), 1, 0)
+	if err != nil || len(completed) != 0 {
+		t.Fatalf("missing completed=%+v err=%v", completed, err)
+	}
+	if _, err := store.writer.ExecContext(context.Background(), `UPDATE reservations SET network_id=70000 WHERE id=?`, reservation.ID.Bytes()); err == nil {
+		t.Fatal("範囲外の履歴値がDBへ保存されました")
 	}
 }
 
@@ -639,14 +663,49 @@ func TestRecordingAttemptCanFinishWithoutOpeningStream(t *testing.T) {
 	if err := store.FinishAttempt(context.Background(), finish); err != nil {
 		t.Fatal(err)
 	}
+	history, err := store.RecordingHistory(context.Background(), 1, 0)
+	if err != nil || len(history) != 1 || history[0].State != recording.AttemptMissed || history[0].Playable() {
+		t.Fatalf("history=%+v err=%v", history, err)
+	}
+	completed, err := store.CompletedRecordings(context.Background(), 1, 0)
+	if err != nil || len(completed) != 0 {
+		t.Fatalf("completed=%+v err=%v", completed, err)
+	}
 	var attemptState, reservationState, availability string
 	var recovered int
-	err := store.reader.QueryRow(`SELECT a.state, r.state, s.availability, a.recovered FROM recording_attempts a
+	err = store.reader.QueryRow(`SELECT a.state, r.state, s.availability, a.recovered FROM recording_attempts a
 		JOIN reservations r ON r.id=a.reservation_id JOIN recording_segments s ON s.attempt_id=a.id
 		WHERE a.id=?`, claim.AttemptID.Bytes()).Scan(&attemptState, &reservationState, &availability, &recovered)
 	if err != nil || attemptState != "MISSED" || reservationState != "FINISHED" || availability != "MISSING" || recovered != 1 {
 		t.Fatalf("attempt=%s reservation=%s availability=%s recovered=%d err=%v",
 			attemptState, reservationState, availability, recovered, err)
+	}
+}
+
+func TestRecordingHistoryRejectsUnboundedQueries(t *testing.T) {
+	_, store := openMigratedStore(t)
+	empty, err := store.RecordingHistory(context.Background(), 1, 0)
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("empty=%+v err=%v", empty, err)
+	}
+	for _, limit := range []int{0, recording.MaxHistoryPage + 1} {
+		if _, err := store.RecordingHistory(context.Background(), limit, 0); err == nil {
+			t.Fatalf("history limit=%d accepted", limit)
+		}
+		if _, err := store.CompletedRecordings(context.Background(), limit, 0); err == nil {
+			t.Fatalf("completed limit=%d accepted", limit)
+		}
+	}
+	if _, err := store.RecordingHistory(context.Background(), 1, -1); err == nil {
+		t.Fatal("negative cursor accepted")
+	}
+	if _, err := store.RecordingHistoryItem(context.Background(), 0); err == nil {
+		t.Fatal("zero id accepted")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := store.RecordingHistory(ctx, 1, 0); err == nil {
+		t.Fatal("cancelled query accepted")
 	}
 }
 
