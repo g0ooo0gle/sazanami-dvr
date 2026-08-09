@@ -25,7 +25,7 @@
 
 ### CRR-003: Komorebiへ公開する項目
 
-CtrlCmdとresolverへ返せるのは、録画試行が`SUCCEEDED`、終了理由が正常終了、segmentが`FINALIZED`かつ`FINAL`、完成処理の三つのflagが有効、byte数が1以上の項目だけとする。DB破損や条件不一致を成功へ丸めない。
+CtrlCmdとresolverへ返せるのは、録画試行が`SUCCEEDED`、終了理由が正常終了、segmentが`FINALIZED`かつ`FINAL`、完成処理の三つのflagが有効、byte数が188以上の項目だけとする。DB破損や条件不一致を成功へ丸めない。
 
 ### CRR-004: CtrlCmd 2017
 
@@ -59,7 +59,7 @@ resolverが返す画像URLは、完成録画の存在を確認してから製品
 
 ### CRR-010: CtrlCmdとHTTPの待受
 
-録画常駐processはCtrlCmdとHTTP接続口を同じprocess内で所有する。両方の既定はnumeric loopbackとする。利用者がそれぞれのnumeric private IPを明示した場合だけLAN待受を許可する。hostname、空host、unspecified、multicast、link-local、global IP、port 0を拒否する。単独の`ctrlcmd serve`はloopback限定を維持する。
+録画常駐processはCtrlCmdとHTTP接続口を同じprocess内で所有する。両方の既定はnumeric loopbackとする。利用者がそれぞれのnumeric private IP、`0.0.0.0`、または`::`を明示した場合だけLAN待受を許可する。hostname、空host、multicast、link-local、global IP、port 0を拒否する。単独の`ctrlcmd serve`はloopback限定を維持する。
 
 HTTPはheader 16 KiB、header期限5秒、要求読取10秒、idle 30秒、同時録画配信8件を上限とする。待ちqueueは作らず、上限到達時は503を返す。
 

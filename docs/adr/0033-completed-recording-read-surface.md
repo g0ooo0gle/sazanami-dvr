@@ -21,7 +21,7 @@ Native REST APIは成功、失敗、一部保存、中止、未開始の終了�
 
 外部へ返す録画pathはIDを含む仮想URLにする。絶対pathとDB内の相対pathは返さない。HTTP adapterはIDからDBの完成録画を解決し、録画保存先adapterが通常file、所有者、相対path、byte数を再確認してからRange対応で配信する。
 
-録画常駐process内に小さいHTTP serverを追加する。録画processのCtrlCmdとHTTPはloopbackを既定とし、具体的なprivate IPを指定した場合だけLANで待ち受ける。単独の確認用`ctrlcmd serve`はloopback限定を維持する。
+録画常駐process内に小さいHTTP serverを追加する。録画processのCtrlCmdとHTTPはloopbackを既定とし、private IPまたは全interfaceを明示した場合だけLANで待ち受ける。複数のLAN interfaceを持つ環境では`0.0.0.0`または`::`を使える。単独の確認用`ctrlcmd serve`はloopback限定を維持する。
 
 別daemonは作らない。認証を送れないクライアント向けの独自認証や外部frameworkも追加しない。
 
