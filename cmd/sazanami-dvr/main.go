@@ -33,7 +33,7 @@ import (
 )
 
 var (
-	version       = "0.0.4"
+	version       = "0.0.5"
 	productCommit = ""
 )
 
@@ -225,6 +225,9 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	refreshOperation := &recordingCatalogRefresh{
 		dataRoot: *dataRoot, channelMap: *channelMap, provider: catalogAdapter,
 		store: store, holder: snapshots, clock: clock,
+		follow: (recordingapp.FollowService{
+			Store: store, Clock: recordingClock, OnUpdated: scheduler.Notify,
+		}).Run,
 	}
 	refresher := catalogrefresh.Runner{
 		Interval: *refreshInterval, Sync: refreshOperation.sync, Observe: observeCatalogRefresh(stdout, stderr),

@@ -17,7 +17,7 @@ func TestHandlerReturnsAllowedFixedFiles(t *testing.T) {
 		data []byte
 	}{
 		{name: "Bitrate.ini", data: []byte("\xef\xbb\xbf[BITRATE]\r\n")},
-		{name: "EpgTimerSrv.ini", data: []byte("\xef\xbb\xbf[SET]\r\nStartMargin=5\r\nEndMargin=2\r\nCaption=1\r\nData=0\r\nRecEndMode=0\r\nReboot=0\r\nPresetID=\r\n\r\n[REC_DEF]\r\nSetName=デフォルト\r\nRecMode=1\r\nNoRecMode=1\r\nPriority=3\r\nTuijyuuFlag=0\r\nServiceMode=0\r\nPittariFlag=0\r\nBatFilePath=\r\nSuspendMode=0\r\nRebootFlag=0\r\nUseMargineFlag=0\r\nStartMargine=0\r\nEndMargine=0\r\nContinueRec=0\r\nPartialRec=0\r\nTunerID=0\r\n")},
+		{name: "EpgTimerSrv.ini", data: []byte("\xef\xbb\xbf[SET]\r\nStartMargin=5\r\nEndMargin=2\r\nCaption=1\r\nData=0\r\nRecEndMode=0\r\nReboot=0\r\nPresetID=\r\n\r\n[REC_DEF]\r\nSetName=デフォルト\r\nRecMode=1\r\nNoRecMode=1\r\nPriority=3\r\nTuijyuuFlag=1\r\nServiceMode=0\r\nPittariFlag=0\r\nBatFilePath=\r\nSuspendMode=0\r\nRebootFlag=0\r\nUseMargineFlag=0\r\nStartMargine=0\r\nEndMargine=0\r\nContinueRec=0\r\nPartialRec=0\r\nTunerID=0\r\n")},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

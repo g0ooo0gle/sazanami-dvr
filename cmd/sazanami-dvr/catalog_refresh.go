@@ -11,6 +11,7 @@ import (
 	sqliteadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/sqlite"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/app/catalogrefresh"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/app/catalogsync"
+	recordingapp "github.com/g0ooo0gle/sazanami-dvr/internal/app/recording"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/catalogmodel"
 )
 
@@ -22,6 +23,7 @@ type recordingCatalogRefresh struct {
 	store      *sqliteadapter.Store
 	holder     *ctrlcmdruntime.SnapshotHolder
 	clock      wallClock
+	follow     func(context.Context) (recordingapp.FollowResult, error)
 }
 
 func (operation *recordingCatalogRefresh) sync(ctx context.Context) (catalogrefresh.Result, string, error) {
@@ -63,6 +65,11 @@ func (operation *recordingCatalogRefresh) sync(ctx context.Context) (catalogrefr
 	}
 	if err := operation.holder.Store(candidate); err != nil {
 		return catalogrefresh.Result{}, "catalog-refresh-internal", err
+	}
+	if operation.follow != nil {
+		if _, err := operation.follow(ctx); err != nil {
+			return catalogrefresh.Result{}, "catalog-refresh-follow-failed", err
+		}
 	}
 	return catalogrefresh.Result{Services: result.Services, Programs: result.Programs}, "", nil
 }

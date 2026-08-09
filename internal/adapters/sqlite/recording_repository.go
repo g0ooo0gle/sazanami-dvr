@@ -82,6 +82,7 @@ func (store *Store) CreateReservation(ctx context.Context, reservation recording
 		return recording.Reservation{}, sanitize("commit-reservation", err)
 	}
 	reservation.Number = int32(number)
+	reservation.EffectiveFollow = reservation.RequestedFollow
 	return reservation, nil
 }
 
@@ -113,6 +114,92 @@ func (store *Store) ActiveReservations(ctx context.Context, limit int, after int
 		return nil, sanitize("iterate-reservations", err)
 	}
 	return result, nil
+}
+
+// CurrentFollowTargetは最新の完成済み番組表から、指定した番組instanceの現在revisionを返す。
+func (store *Store) CurrentFollowTarget(ctx context.Context, backendID, instanceID catalogmodel.ID) (*recording.FollowTarget, error) {
+	if store == nil || store.reader == nil || ctx == nil || backendID == (catalogmodel.ID{}) || instanceID == (catalogmodel.ID{}) {
+		return nil, errors.New("sqlite: invalid follow target query")
+	}
+	row := store.reader.QueryRowContext(ctx, `WITH current_sync AS (
+		SELECT id FROM catalog_syncs WHERE backend_instance_id=? AND state='COMPLETED'
+		ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1
+	)
+		SELECT po.program_instance_id, pr.id, pr.start_at_utc_ms, pr.duration_ms
+		FROM program_observations po JOIN current_sync cs ON cs.id=po.sync_id
+		JOIN program_revisions pr ON pr.id=po.program_revision_id
+		WHERE po.program_instance_id=? LIMIT 1`, backendID.Bytes(), instanceID.Bytes())
+	var target recording.FollowTarget
+	var persistedInstance, revisionID []byte
+	var startMS, durationMS int64
+	if err := row.Scan(&persistedInstance, &revisionID, &startMS, &durationMS); errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	} else if err != nil {
+		return nil, sanitize("read-follow-target", err)
+	}
+	if startMS < 0 || durationMS < 60_000 || durationMS > 12*60*60*1_000 || durationMS%1_000 != 0 {
+		return nil, nil
+	}
+	if err := copyExact(target.ProgramInstanceID[:], persistedInstance); err != nil {
+		return nil, err
+	}
+	if err := copyExact(target.ProgramRevisionID[:], revisionID); err != nil {
+		return nil, err
+	}
+	target.Start = time.UnixMilli(startMS).UTC()
+	target.Duration = time.Duration(durationMS) * time.Millisecond
+	return &target, nil
+}
+
+// ApplyReservationFollowは評価時の予約とrevisionが変わっていない場合だけ、時刻を一度で更新する。
+func (store *Store) ApplyReservationFollow(ctx context.Context, request recording.ReservationFollowRequest) (bool, error) {
+	if store == nil || store.writer == nil || ctx == nil || request.Validate() != nil {
+		return false, errors.New("sqlite: invalid reservation follow")
+	}
+	tx, err := store.writer.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		return false, sanitize("begin-reservation-follow", err)
+	}
+	defer tx.Rollback()
+	var startMS, durationMS int64
+	err = tx.QueryRowContext(ctx, `SELECT start_at_utc_ms, duration_ms FROM program_revisions WHERE id=?`,
+		request.TargetRevisionID.Bytes()).Scan(&startMS, &durationMS)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, sanitize("read-reservation-follow-target", err)
+	}
+	if startMS < 0 || durationMS < 60_000 || durationMS > 12*60*60*1_000 || durationMS%1_000 != 0 {
+		return false, nil
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE reservations SET program_revision_id=?, start_at_utc_ms=?,
+		duration_seconds=?, version=version+1, updated_at_utc_ms=?
+		WHERE id=? AND version=? AND state='ACTIVE' AND requested_follow=1 AND program_revision_id=?
+		AND NOT EXISTS (SELECT 1 FROM recording_attempts WHERE reservation_id=reservations.id)
+		AND EXISTS (
+			SELECT 1 FROM program_revisions target JOIN program_revisions previous
+			  ON previous.id=? AND previous.program_instance_id=target.program_instance_id
+			JOIN program_observations po ON po.program_revision_id=target.id
+			JOIN catalog_syncs cs ON cs.id=po.sync_id
+			WHERE target.id=? AND target.program_instance_id=reservations.program_instance_id
+			  AND target.revision_number>previous.revision_number
+			  AND cs.backend_instance_id=reservations.backend_instance_id AND cs.state='COMPLETED'
+			  AND cs.id=(SELECT id FROM catalog_syncs WHERE backend_instance_id=reservations.backend_instance_id
+				AND state='COMPLETED' ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1)
+		)`, request.TargetRevisionID.Bytes(), startMS, durationMS/1_000, request.Now.UnixMilli(),
+		request.ReservationID.Bytes(), request.ExpectedVersion, request.ExpectedRevisionID.Bytes(),
+		request.ExpectedRevisionID.Bytes(), request.TargetRevisionID.Bytes())
+	if err != nil {
+		return false, sanitize("apply-reservation-follow", err)
+	}
+	if affected(result) != 1 {
+		return false, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return false, sanitize("commit-reservation-follow", err)
+	}
+	return true, nil
 }
 
 // UpdateReservationは変更不可の番組情報を照合し、録画開始前の設定だけを更新する。
@@ -507,7 +594,7 @@ func scanReservation(scanner rowScanner) (recording.Reservation, error) {
 	item.Program.Start = time.UnixMilli(startMS).UTC()
 	item.Priority = uint8(priority)
 	item.RequestedFollow = requestedFollow == 1
-	item.EffectiveFollow = false
+	item.EffectiveFollow = item.RequestedFollow
 	item.CreatedAt = time.UnixMilli(createdMS).UTC()
 	item.UpdatedAt = time.UnixMilli(updatedMS).UTC()
 	return item, nil

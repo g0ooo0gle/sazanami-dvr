@@ -104,6 +104,34 @@ type Reservation struct {
 	FinishedAt      *time.Time
 }
 
+// FollowTargetは最新の完成済み番組表から選んだ、同じ番組の追従先revisionである。
+type FollowTarget struct {
+	ProgramInstanceID catalogmodel.ID
+	ProgramRevisionID catalogmodel.ID
+	Start             time.Time
+	Duration          time.Duration
+}
+
+// ReservationFollowRequestは予約と追従先が評価後も同じことをCASで確認する入力である。
+type ReservationFollowRequest struct {
+	ReservationID      catalogmodel.ID
+	ExpectedVersion    int64
+	ExpectedRevisionID catalogmodel.ID
+	TargetRevisionID   catalogmodel.ID
+	Now                time.Time
+}
+
+// Validateは一回の録画開始前追従に必要な値が揃っているかを検証する。
+func (request ReservationFollowRequest) Validate() error {
+	zeroID := catalogmodel.ID{}
+	if request.ReservationID == zeroID || request.ExpectedRevisionID == zeroID || request.TargetRevisionID == zeroID ||
+		request.ExpectedRevisionID == request.TargetRevisionID || request.ExpectedVersion < 1 || request.Now.IsZero() ||
+		request.Now.Location() != time.UTC || request.Now.UnixMilli() < 0 {
+		return errors.New("recording: invalid reservation follow")
+	}
+	return nil
+}
+
 // ValidateNewは番号割当て前の固定番組予約を保存できるか検証する。
 func (reservation Reservation) ValidateNew() error {
 	program := reservation.Program

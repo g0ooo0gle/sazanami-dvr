@@ -81,7 +81,7 @@ func TestReservationServiceAddsAfterCatalogMatch(t *testing.T) {
 	}
 	created, err := service.Add(context.Background(), request)
 	if err != nil || created.Number != 1 || len(store.created) != 1 || !created.RequestedFollow ||
-		created.EffectiveFollow || notified != 1 || created.Program.Title != "server title" {
+		!created.EffectiveFollow || notified != 1 || created.Program.Title != "server title" {
 		t.Fatalf("created=%+v stored=%d notified=%d err=%v", created, len(store.created), notified, err)
 	}
 }
