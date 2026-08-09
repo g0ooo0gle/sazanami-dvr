@@ -26,6 +26,7 @@ import (
 	"github.com/g0ooo0gle/sazanami-dvr/internal/app/liverelay"
 	coreautoreservation "github.com/g0ooo0gle/sazanami-dvr/internal/core/autoreservation"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/catalogmodel"
+	"github.com/g0ooo0gle/sazanami-dvr/internal/core/provider"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/recording"
 )
 
@@ -48,6 +49,12 @@ type emptyAutomaticReservationOperations struct{}
 type emptyRecordedOperations struct{}
 
 type emptyLiveOperations struct{}
+
+type emptyLogoProvider struct{}
+
+func (emptyLogoProvider) Logo(context.Context, provider.TuningTarget) ([]byte, error) {
+	return nil, provider.NewFailure(provider.ReasonNotFound, "logo-not-found")
+}
 
 func (emptyLiveOperations) Select(context.Context, liverelay.Service, int32) (int32, error) {
 	return 1, nil
@@ -443,7 +450,7 @@ func TestRecordingRouterMarksOnlyLiveRelayAsLongLived(t *testing.T) {
 	}
 	router, err := NewRecordingRouterWithLive(snapshot, emptyReservationOperations{},
 		emptyAutomaticReservationOperations{}, emptyRecordedOperations{}, emptyLiveOperations{},
-		SystemClock{}, codec.DefaultLimits())
+		emptyLogoProvider{}, SystemClock{}, codec.DefaultLimits())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -472,6 +479,38 @@ func TestSnapshotResolvesOneLiveService(t *testing.T) {
 	}
 	if _, err := snapshot.ResolveLiveService(context.Background(), 1, 2, 9); err == nil {
 		t.Fatal("未知serviceを解決しました")
+	}
+}
+
+func TestSnapshotResolvesOneLogoService(t *testing.T) {
+	service := channel.Service{ProviderLocator: "1003", ServiceName: "放送局", NetworkID: 1,
+		TransportStreamID: 2, ServiceID: 3, Verified: true, Selected: true}
+	snapshot := &Snapshot{value: channel.Snapshot{Key: "logo", Services: []channel.Service{service}}}
+	target, err := snapshot.ResolveLogoService(context.Background(), 1, 3)
+	if err != nil || target.Opaque != "1003" {
+		t.Fatalf("target=%+v err=%v", target, err)
+	}
+	if _, err := snapshot.ResolveLogoService(context.Background(), 1, 9); err == nil {
+		t.Fatal("未知serviceを解決しました")
+	}
+	noncano := *snapshot
+	noncano.value.Services = []channel.Service{{ProviderLocator: "01003", ServiceName: "放送局", NetworkID: 1,
+		TransportStreamID: 2, ServiceID: 3, Verified: true, Selected: true}}
+	if _, err := noncano.ResolveLogoService(context.Background(), 1, 3); err == nil {
+		t.Fatal("非正規service locatorを解決しました")
+	}
+	duplicate := *snapshot
+	other := service
+	other.TransportStreamID = 4
+	other.ProviderLocator = "1004"
+	duplicate.value.Services = append([]channel.Service{service}, other)
+	if _, err := duplicate.ResolveLogoService(context.Background(), 1, 3); err == nil {
+		t.Fatal("TSIDだけが異なる曖昧なserviceを解決しました")
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := snapshot.ResolveLogoService(canceled, 1, 3); err == nil {
+		t.Fatal("取り消し後にserviceを解決しました")
 	}
 }
 

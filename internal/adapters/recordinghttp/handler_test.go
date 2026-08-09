@@ -14,8 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/g0ooo0gle/sazanami-dvr/internal/core/provider"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/recording"
 )
+
+var logoPNG = []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 1, 2, 3}
 
 func TestNativeHistoryResolverAndRelatedAssets(t *testing.T) {
 	item := httpHistoryItem(7)
@@ -64,6 +67,74 @@ func TestNativeHistoryResolverAndRelatedAssets(t *testing.T) {
 	response = serve(handler, http.MethodGet, "/komorebi/tiles/7.json", nil)
 	if response.Code != http.StatusOK || !bytes.Contains(response.Body.Bytes(), []byte(`"total_tiles":1`)) {
 		t.Fatalf("tiles=%d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestKomorebiLogoReturnsBoundedPNG(t *testing.T) {
+	catalog := &fakeLogoCatalog{target: "100002"}
+	logos := &fakeLogoProvider{data: logoPNG}
+	handler, err := NewHandlerWithLogos(&fakeHistory{}, &fakeFiles{}, catalog, logos)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := serve(handler, http.MethodGet, "/legacy/logo.lua?onid=1&sid=2", nil)
+	if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "image/png" ||
+		response.Header().Get("Content-Length") != "11" || !bytes.Equal(response.Body.Bytes(), logoPNG) {
+		t.Fatalf("code=%d header=%v body=%x", response.Code, response.Header(), response.Body.Bytes())
+	}
+	if catalog.calls.Load() != 1 || catalog.network != 1 || catalog.service != 2 || logos.calls.Load() != 1 || logos.target != "100002" {
+		t.Fatalf("catalog=%d/%d calls=%d logo target=%q calls=%d", catalog.network, catalog.service,
+			catalog.calls.Load(), logos.target, logos.calls.Load())
+	}
+	response = serve(handler, http.MethodHead, "/legacy/logo.lua?onid=1&sid=2", nil)
+	if response.Code != http.StatusOK || response.Body.Len() != 0 || response.Header().Get("Content-Length") != "11" {
+		t.Fatalf("head=%d header=%v body=%x", response.Code, response.Header(), response.Body.Bytes())
+	}
+}
+
+func TestKomorebiLogoRejectsInvalidOrUnavailableRequests(t *testing.T) {
+	validPath := "/legacy/logo.lua?onid=1&sid=2"
+	invalid := []string{
+		"/legacy/logo.lua", "/legacy/logo.lua?onid=1", "/legacy/logo.lua?onid=1&sid=2&x=3",
+		"/legacy/logo.lua?onid=1&onid=2&sid=2", "/legacy/logo.lua?onid=01&sid=2",
+		"/legacy/logo.lua?onid=0&sid=2", "/legacy/logo.lua?onid=65536&sid=2",
+		"/legacy/logo.lua?onid=1&sid=-1",
+	}
+	for _, path := range invalid {
+		handler, _ := NewHandlerWithLogos(&fakeHistory{}, &fakeFiles{}, &fakeLogoCatalog{target: "100002"}, &fakeLogoProvider{data: logoPNG})
+		if response := serve(handler, http.MethodGet, path, nil); response.Code != http.StatusBadRequest {
+			t.Fatalf("path=%q code=%d body=%q", path, response.Code, response.Body.String())
+		}
+	}
+
+	cases := []struct {
+		name    string
+		catalog *fakeLogoCatalog
+		logos   *fakeLogoProvider
+		status  int
+	}{
+		{name: "unknown", catalog: &fakeLogoCatalog{err: errors.New("private catalog")}, logos: &fakeLogoProvider{data: logoPNG}, status: http.StatusNotFound},
+		{name: "missing", catalog: &fakeLogoCatalog{target: "100002"}, logos: &fakeLogoProvider{err: provider.NewFailure(provider.ReasonNotFound, "private provider")}, status: http.StatusNotFound},
+		{name: "failure", catalog: &fakeLogoCatalog{target: "100002"}, logos: &fakeLogoProvider{err: errors.New("private provider")}, status: http.StatusServiceUnavailable},
+		{name: "invalid", catalog: &fakeLogoCatalog{target: "100002"}, logos: &fakeLogoProvider{data: []byte("not png")}, status: http.StatusServiceUnavailable},
+		{name: "oversize", catalog: &fakeLogoCatalog{target: "100002"}, logos: &fakeLogoProvider{data: append(append([]byte(nil), logoPNG...), make([]byte, maximumLogo)...)}, status: http.StatusServiceUnavailable},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			handler, _ := NewHandlerWithLogos(&fakeHistory{}, &fakeFiles{}, test.catalog, test.logos)
+			response := serve(handler, http.MethodGet, validPath, nil)
+			if response.Code != test.status || strings.Contains(response.Body.String(), "private") {
+				t.Fatalf("code=%d body=%q", response.Code, response.Body.String())
+			}
+		})
+	}
+	oldHandler, _ := NewHandler(&fakeHistory{}, &fakeFiles{})
+	if response := serve(oldHandler, http.MethodGet, validPath, nil); response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("dependency code=%d", response.Code)
+	}
+	handler, _ := NewHandlerWithLogos(&fakeHistory{}, &fakeFiles{}, &fakeLogoCatalog{target: "100002"}, &fakeLogoProvider{data: logoPNG})
+	if response := serve(handler, http.MethodPost, validPath, nil); response.Code != http.StatusMethodNotAllowed || response.Header().Get("Allow") != "GET, HEAD" {
+		t.Fatalf("method code=%d header=%v", response.Code, response.Header())
 	}
 }
 
@@ -249,6 +320,37 @@ func TestValidateListenAddressAllowsOnlyExplicitLocalIP(t *testing.T) {
 type fakeHistory struct {
 	items []recording.HistoryItem
 	err   error
+}
+
+type fakeLogoCatalog struct {
+	target  string
+	err     error
+	network uint16
+	service uint16
+	calls   atomic.Int32
+}
+
+func (catalog *fakeLogoCatalog) ResolveLogoService(_ context.Context, networkID, serviceID uint16) (provider.TuningTarget, error) {
+	catalog.calls.Add(1)
+	catalog.network = networkID
+	catalog.service = serviceID
+	if catalog.err != nil {
+		return provider.TuningTarget{}, catalog.err
+	}
+	return provider.NewTuningTarget(catalog.target)
+}
+
+type fakeLogoProvider struct {
+	data   []byte
+	err    error
+	target string
+	calls  atomic.Int32
+}
+
+func (logos *fakeLogoProvider) Logo(_ context.Context, target provider.TuningTarget) ([]byte, error) {
+	logos.calls.Add(1)
+	logos.target = target.Opaque
+	return logos.data, logos.err
 }
 
 func (history *fakeHistory) RecordingHistory(_ context.Context, limit int, before int32) ([]recording.HistoryItem, error) {

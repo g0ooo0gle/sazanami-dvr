@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/g0ooo0gle/sazanami-dvr/internal/core/provider"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/recording"
 )
 
@@ -24,6 +25,7 @@ const (
 	defaultLimit   = 50
 	maximumLimit   = 100
 	maximumStreams = 8
+	maximumLogo    = 2 * 1024 * 1024
 )
 
 // Historyは録画結果のpage読出しと一件取得を提供する。
@@ -44,16 +46,40 @@ type Files interface {
 	OpenFinal(recording.FilePlan, int64) (FinalFile, error)
 }
 
+// LogoCatalogは完成済み番組表で放送IDを一つのMirakurunサービスへ解決する。
+type LogoCatalog interface {
+	ResolveLogoService(context.Context, uint16, uint16) (provider.TuningTarget, error)
+}
+
+// LogoProviderは検証済みサービスのPNG局ロゴだけを返す。
+type LogoProvider interface {
+	Logo(context.Context, provider.TuningTarget) ([]byte, error)
+}
+
 // HandlerはNative REST、Komorebi resolver、完成録画配信を固定pathへ振り分ける。
 type Handler struct {
 	history     History
 	files       Files
 	streams     chan struct{}
 	placeholder []byte
+	logoCatalog LogoCatalog
+	logos       LogoProvider
 }
 
 // NewHandlerは必須依存と同時配信上限を固定し、socketを作らずにhandlerを返す。
 func NewHandler(history History, files Files) (*Handler, error) {
+	return newHandler(history, files, nil, nil)
+}
+
+// NewHandlerWithLogosは録画配信にKomorebi向けの局ロゴ取得を加える。
+func NewHandlerWithLogos(history History, files Files, catalog LogoCatalog, logos LogoProvider) (*Handler, error) {
+	if catalog == nil || logos == nil {
+		return nil, errors.New("recordinghttp: missing logo dependency")
+	}
+	return newHandler(history, files, catalog, logos)
+}
+
+func newHandler(history History, files Files, catalog LogoCatalog, logos LogoProvider) (*Handler, error) {
 	if history == nil || files == nil {
 		return nil, errors.New("recordinghttp: missing dependency")
 	}
@@ -61,7 +87,8 @@ func NewHandler(history History, files Files) (*Handler, error) {
 	if err != nil {
 		return nil, errors.New("recordinghttp: placeholder generation failed")
 	}
-	return &Handler{history: history, files: files, streams: make(chan struct{}, maximumStreams), placeholder: placeholder}, nil
+	return &Handler{history: history, files: files, streams: make(chan struct{}, maximumStreams), placeholder: placeholder,
+		logoCatalog: catalog, logos: logos}, nil
 }
 
 // ServeHTTPは未知pathと変更methodを閉じ、内部errorの詳細を応答へ含めない。
@@ -82,6 +109,8 @@ func (handler *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 		handler.detail(writer, request)
 	case request.URL.Path == "/komorebi/resolver.lua":
 		handler.resolver(writer, request)
+	case request.URL.Path == "/legacy/logo.lua":
+		handler.logo(writer, request)
 	case strings.HasPrefix(request.URL.Path, "/recordings/"):
 		handler.stream(writer, request)
 	case request.URL.Path == "/api/Thumbnail":
@@ -92,6 +121,44 @@ func (handler *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 		handler.tiles(writer, request)
 	default:
 		writeError(writer, http.StatusNotFound, "not-found")
+	}
+}
+
+func (handler *Handler) logo(writer http.ResponseWriter, request *http.Request) {
+	if !readMethod(writer, request) {
+		return
+	}
+	networkID, serviceID, ok := logoQuery(request.URL.Query())
+	if !ok {
+		writeError(writer, http.StatusBadRequest, "invalid-query")
+		return
+	}
+	if handler.logoCatalog == nil || handler.logos == nil {
+		writeError(writer, http.StatusServiceUnavailable, "logo-unavailable")
+		return
+	}
+	target, err := handler.logoCatalog.ResolveLogoService(request.Context(), networkID, serviceID)
+	if err != nil {
+		writeError(writer, http.StatusNotFound, "not-found")
+		return
+	}
+	data, err := handler.logos.Logo(request.Context(), target)
+	if err != nil {
+		if provider.IsReason(err, provider.ReasonNotFound) {
+			writeError(writer, http.StatusNotFound, "not-found")
+		} else {
+			writeError(writer, http.StatusServiceUnavailable, "logo-unavailable")
+		}
+		return
+	}
+	if len(data) < 8 || len(data) > maximumLogo || !bytes.HasPrefix(data, []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}) {
+		writeError(writer, http.StatusServiceUnavailable, "logo-unavailable")
+		return
+	}
+	writer.Header().Set("Content-Type", "image/png")
+	writer.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	if request.Method != http.MethodHead {
+		_, _ = writer.Write(data)
 	}
 }
 
@@ -358,6 +425,23 @@ func oneID(values url.Values) (int32, bool) {
 	}
 	value, err := strconv.ParseInt(entries[0], 10, 32)
 	return int32(value), err == nil && value > 0
+}
+
+func logoQuery(values url.Values) (uint16, uint16, bool) {
+	if len(values) != 2 {
+		return 0, 0, false
+	}
+	parse := func(key string) (uint16, bool) {
+		entries, ok := values[key]
+		if !ok || len(entries) != 1 || entries[0] == "" {
+			return 0, false
+		}
+		value, err := strconv.ParseUint(entries[0], 10, 16)
+		return uint16(value), err == nil && value > 0 && strconv.FormatUint(value, 10) == entries[0]
+	}
+	networkID, networkOK := parse("onid")
+	serviceID, serviceOK := parse("sid")
+	return networkID, serviceID, networkOK && serviceOK
 }
 
 func pathID(path, prefix, suffix string) (int32, bool) {
