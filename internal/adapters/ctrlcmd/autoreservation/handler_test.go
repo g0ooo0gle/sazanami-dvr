@@ -3,6 +3,9 @@ package autoreservation
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/codec"
@@ -129,6 +132,130 @@ func TestAutomaticRuleRejectsTwoItems(t *testing.T) {
 	response := handleRequest(t, Handler{Operations: operations, Limits: limits}, request)
 	if response.Code != resultFailure || len(operations.rules) != 0 {
 		t.Fatalf("response=%+v rules=%+v", response, operations.rules)
+	}
+}
+
+func TestAutomaticRuleEmptyListUsesDefaultLimits(t *testing.T) {
+	request := versionRequest(t, CommandList, codec.DefaultLimits())
+	response := handleRequest(t, Handler{Operations: &fakeOperations{}}, request)
+	if response.Code != resultSuccess || len(response.Body) != 10 {
+		t.Fatalf("response=%+v", response)
+	}
+}
+
+func TestAutomaticRuleRejectsMalformedValues(t *testing.T) {
+	limits := codec.DefaultLimits()
+	base := core.Rule{Search: core.SearchCondition{Enabled: true},
+		Recording: core.RecordingSettings{Mode: 1, Priority: 3}}
+	cases := map[string]core.Rule{
+		"oversize-string": base,
+		"unknown-free":    base,
+		"invalid-date":    base,
+		"unknown-mode":    base,
+		"invalid-number":  base,
+	}
+	oversize := cases["oversize-string"]
+	oversize.Search.Keyword = strings.Repeat("a", 4_097)
+	cases["oversize-string"] = oversize
+	unknownFree := cases["unknown-free"]
+	unknownFree.Search.FreeAccess = 3
+	cases["unknown-free"] = unknownFree
+	invalidDate := cases["invalid-date"]
+	invalidDate.Search.Dates = []core.DateRange{{StartDay: 7}}
+	cases["invalid-date"] = invalidDate
+	unknownMode := cases["unknown-mode"]
+	unknownMode.Recording.Mode = 10
+	cases["unknown-mode"] = unknownMode
+	invalidNumber := cases["invalid-number"]
+	invalidNumber.Number = -1
+	cases["invalid-number"] = invalidNumber
+
+	for name, rule := range cases {
+		t.Run(name, func(t *testing.T) {
+			command := CommandAdd
+			if name == "invalid-number" {
+				command = CommandChange
+			}
+			response := handleRequest(t, Handler{Operations: &fakeOperations{}, Limits: limits},
+				requestForRule(t, command, rule, limits))
+			if response.Code != resultFailure {
+				t.Fatalf("response=%+v", response)
+			}
+		})
+	}
+}
+
+func TestAutomaticRuleRejectsMalformedStructures(t *testing.T) {
+	limits := codec.DefaultLimits()
+	base := core.Rule{Recording: core.RecordingSettings{Mode: 1, Priority: 3}}
+	valid := requestForRule(t, CommandAdd, base, limits)
+	cases := map[string][]byte{}
+	wrongVersion := append([]byte(nil), valid...)
+	binary.LittleEndian.PutUint16(wrongVersion[8:10], Version-1)
+	cases["version"] = wrongVersion
+	wrongVector := append([]byte(nil), valid...)
+	binary.LittleEndian.PutUint32(wrongVector[14:18], 2)
+	cases["vector"] = wrongVector
+	wrongStructure := append([]byte(nil), valid...)
+	binary.LittleEndian.PutUint32(wrongStructure[18:22], 4)
+	cases["structure"] = wrongStructure
+	trailingBody := append(append([]byte(nil), valid[8:]...), 0)
+	cases["trailing"] = frameWithBody(t, CommandAdd, trailingBody, limits)
+
+	for name, request := range cases {
+		t.Run(name, func(t *testing.T) {
+			response := handleRequest(t, Handler{Operations: &fakeOperations{}, Limits: limits}, request)
+			if response.Code != resultFailure {
+				t.Fatalf("response=%+v", response)
+			}
+		})
+	}
+
+	wrongBody := append([]byte(nil), valid...)
+	binary.LittleEndian.PutUint32(wrongBody[4:8], uint32(len(wrongBody)))
+	var response bytes.Buffer
+	if err := (Handler{Operations: &fakeOperations{}, Limits: limits}).Handle(context.Background(), wrongBody, &response); err == nil || response.Len() != 0 {
+		t.Fatalf("body err=%v response=%d", err, response.Len())
+	}
+}
+
+func TestAutomaticRuleHonorsResponseLimitAndCancellation(t *testing.T) {
+	rule := core.Rule{ID: catalogmodel.ID{1}, Number: 1, Version: 1,
+		Recording: core.RecordingSettings{Mode: 1, Priority: 3}, CreatedAtUTCMS: 1, UpdatedAtUTCMS: 1}
+	limits := codec.DefaultLimits()
+	limits.ResponseBody = 16
+	request := versionRequest(t, CommandList, limits)
+	var response bytes.Buffer
+	err := (Handler{Operations: &fakeOperations{rules: []core.Rule{rule}}, Limits: limits}).Handle(
+		context.Background(), request, &response)
+	var codecErr *codec.Error
+	if !errors.As(err, &codecErr) || codecErr.Category != codec.OverLimit || response.Len() != 0 {
+		t.Fatalf("limit err=%v response=%d", err, response.Len())
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	response.Reset()
+	err = (Handler{Operations: &fakeOperations{}, Limits: codec.DefaultLimits()}).Handle(
+		ctx, versionRequest(t, CommandList, codec.DefaultLimits()), &response)
+	if !errors.As(err, &codecErr) || codecErr.Category != codec.Timeout || response.Len() != 0 {
+		t.Fatalf("cancel err=%v response=%d", err, response.Len())
+	}
+}
+
+func TestKeywordPrefixesRoundTrip(t *testing.T) {
+	cases := []core.SearchCondition{
+		{Enabled: true, Keyword: "通常"},
+		{Enabled: false, CaseSensitive: true, Keyword: "停止"},
+		{Enabled: true, MinimumMinutes: 10, MaximumMinutes: 90, Keyword: "時間"},
+	}
+	for _, want := range cases {
+		var got core.SearchCondition
+		if err := decodeKeyword(wireKeyword(want), &got); err != nil || got.Enabled != want.Enabled ||
+			got.CaseSensitive != want.CaseSensitive || got.MinimumMinutes != want.MinimumMinutes ||
+			got.MaximumMinutes != want.MaximumMinutes || got.Keyword != want.Keyword {
+			t.Fatalf("want=%+v got=%+v err=%v", want, got, err)
+		}
 	}
 }
 

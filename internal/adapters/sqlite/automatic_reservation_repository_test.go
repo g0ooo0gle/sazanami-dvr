@@ -2,8 +2,10 @@ package sqlite
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/autoreservation"
 )
@@ -99,5 +101,89 @@ func TestAutomaticReservationIsAtomicAndNeverDuplicatesHistory(t *testing.T) {
 	}
 	if matches != 1 || reservations != 1 {
 		t.Fatalf("matches=%d reservations=%d", matches, reservations)
+	}
+	if err := store.CancelReservation(context.Background(), created.Number, created.CreatedAt.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteAutomaticRule(context.Background(), rule.Number); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := store.CreateAutomaticRule(context.Background(), autoreservation.Rule{
+		ID: testID(t, 154), Version: 1, CreatedAtUTCMS: 2, UpdatedAtUTCMS: 2,
+		Search:    autoreservation.SearchCondition{Enabled: true},
+		Recording: autoreservation.RecordingSettings{Mode: 1, Priority: 3},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicate.ID = testID(t, 155)
+	if _, err := store.CreateAutomaticReservation(context.Background(), replacement.Number, duplicate); !errors.Is(err, ErrAutomaticReservationDuplicate) {
+		t.Fatalf("finished history err=%v", err)
+	}
+}
+
+func TestAutomaticRuleLimitAndNumbersAreNotReused(t *testing.T) {
+	_, store := openMigratedStore(t)
+	for index := 0; index < autoreservation.MaxRules; index++ {
+		created, err := store.CreateAutomaticRule(context.Background(), autoreservation.Rule{
+			ID: testID(t, byte(index+1)), Version: 1, CreatedAtUTCMS: int64(index), UpdatedAtUTCMS: int64(index),
+			Search:    autoreservation.SearchCondition{Enabled: true},
+			Recording: autoreservation.RecordingSettings{Mode: 1, Priority: 3},
+		})
+		if err != nil || created.Number != int32(index+1) {
+			t.Fatalf("index=%d number=%d err=%v", index, created.Number, err)
+		}
+	}
+	over := autoreservation.Rule{
+		ID: testID(t, 200), Version: 1, CreatedAtUTCMS: 200, UpdatedAtUTCMS: 200,
+		Search: autoreservation.SearchCondition{Enabled: true}, Recording: autoreservation.RecordingSettings{Mode: 1, Priority: 3},
+	}
+	if _, err := store.CreateAutomaticRule(context.Background(), over); !errors.Is(err, ErrAutomaticRuleLimit) {
+		t.Fatalf("limit err=%v", err)
+	}
+	if err := store.DeleteAutomaticRule(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	over.ID = testID(t, 201)
+	created, err := store.CreateAutomaticRule(context.Background(), over)
+	if err != nil || created.Number != autoreservation.MaxRules+1 {
+		t.Fatalf("number=%d err=%v", created.Number, err)
+	}
+}
+
+func TestAutomaticRuleRejectsCorruptPersistentJSON(t *testing.T) {
+	_, store := openMigratedStore(t)
+	rule := autoreservation.Rule{
+		ID: testID(t, 202), Version: 1, CreatedAtUTCMS: 1, UpdatedAtUTCMS: 1,
+		Search: autoreservation.SearchCondition{Enabled: true}, Recording: autoreservation.RecordingSettings{Mode: 1, Priority: 3},
+	}
+	created, err := store.CreateAutomaticRule(context.Background(), rule)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid, err := json.Marshal(rule.Search)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := map[string]string{
+		"unknown":   `{"Enabled":true,"Unknown":1}`,
+		"duplicate": `{"Enabled":true,"Enabled":false}`,
+		"overflow":  `{"CheckRecordedDays":65536}`,
+		"trailing":  `{}{}`,
+	}
+	for name, document := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := store.writer.Exec(`UPDATE automatic_reservation_rules SET search_json=? WHERE number=?`,
+				document, created.Number); err != nil {
+				t.Fatal(err)
+			}
+			if items, err := store.AutomaticRules(context.Background(), 1, 0); err == nil || len(items) != 0 {
+				t.Fatalf("items=%+v err=%v", items, err)
+			}
+			if _, err := store.writer.Exec(`UPDATE automatic_reservation_rules SET search_json=? WHERE number=?`,
+				string(valid), created.Number); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }

@@ -74,10 +74,14 @@ func (handler Handler) list(ctx context.Context, body []byte, destination io.Wri
 	if err != nil {
 		return err
 	}
+	responseLimit := handler.Limits.ResponseBody
+	if responseLimit == 0 {
+		responseLimit = codec.DefaultLimits().ResponseBody
+	}
 	vectorSize := int64(8)
 	for _, rule := range rules {
 		size, sizeErr := autoAddSize(rule, handler.Limits)
-		if sizeErr != nil || size > int64(handler.Limits.ResponseBody)-vectorSize {
+		if sizeErr != nil || size > int64(responseLimit)-vectorSize {
 			return failure(codec.OverLimit, "automatic-rule-response", size)
 		}
 		vectorSize += size
