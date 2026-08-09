@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,16 +19,21 @@ type mutableClock struct{ now time.Time }
 func (clock *mutableClock) Now() time.Time { return clock.now }
 
 type attemptMemory struct {
-	start       time.Time
-	end         time.Time
-	startEnd    time.Time
-	claim       core.ClaimRequest
-	finish      core.FinishRequest
-	progress    []int64
-	progressEnd time.Time
-	operations  []string
-	finishErr   error
-	progressErr error
+	start        time.Time
+	end          time.Time
+	startEnd     time.Time
+	claim        core.ClaimRequest
+	finish       core.FinishRequest
+	finalize     core.FinalizeRequest
+	progress     []int64
+	progressEnd  time.Time
+	operations   []string
+	finishErr    error
+	progressErr  error
+	finalizeErr  error
+	publishErr   error
+	directoryErr error
+	stop         atomic.Bool
 }
 
 func (store *attemptMemory) ClaimRecording(_ context.Context, request core.ClaimRequest) (core.Attempt, error) {
@@ -42,6 +48,10 @@ func (store *attemptMemory) ClaimRecording(_ context.Context, request core.Claim
 func (store *attemptMemory) StartAttempt(context.Context, catalogmodel.ID, time.Time) error {
 	store.operations = append(store.operations, "starting")
 	return nil
+}
+
+func (store *attemptMemory) AttemptStopRequested(context.Context, catalogmodel.ID) (bool, error) {
+	return store.stop.Load(), nil
 }
 
 func (store *attemptMemory) RecordingStarted(context.Context, catalogmodel.ID, time.Time) (time.Time, error) {
@@ -61,19 +71,20 @@ func (store *attemptMemory) UpdateRecordingProgress(_ context.Context, _ catalog
 	return store.progressEnd, store.progressErr
 }
 
-func (store *attemptMemory) BeginFinalization(context.Context, core.FinalizeRequest) error {
+func (store *attemptMemory) BeginFinalization(_ context.Context, request core.FinalizeRequest) error {
+	store.finalize = request
 	store.operations = append(store.operations, "finalizing")
-	return nil
+	return store.finalizeErr
 }
 
 func (store *attemptMemory) MarkFinalPublished(context.Context, catalogmodel.ID, time.Time) error {
 	store.operations = append(store.operations, "published")
-	return nil
+	return store.publishErr
 }
 
 func (store *attemptMemory) MarkDirectorySynced(context.Context, catalogmodel.ID, time.Time) error {
 	store.operations = append(store.operations, "directory-recorded")
-	return nil
+	return store.directoryErr
 }
 
 func (store *attemptMemory) FinishAttempt(_ context.Context, request core.FinishRequest) error {
@@ -85,6 +96,8 @@ func (store *attemptMemory) FinishAttempt(_ context.Context, request core.Finish
 type fakePartial struct {
 	operations *[]string
 	short      bool
+	syncErr    error
+	closeErr   error
 }
 
 func (file *fakePartial) Write(data []byte) (int, error) {
@@ -97,12 +110,12 @@ func (file *fakePartial) Write(data []byte) (int, error) {
 
 func (file *fakePartial) Sync() error {
 	*file.operations = append(*file.operations, "file-sync")
-	return nil
+	return file.syncErr
 }
 
 func (file *fakePartial) Close() error {
 	*file.operations = append(*file.operations, "file-close")
-	return nil
+	return file.closeErr
 }
 
 type fakeProvider struct {
@@ -472,6 +485,25 @@ func TestExecutorCancelsReconnectWaitWithParent(t *testing.T) {
 	}
 }
 
+func TestUserStopDuringReconnectWaitDoesNotOpenAnotherStream(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	clock := &mutableClock{now: start}
+	store := &attemptMemory{start: start, end: start.Add(2 * time.Minute)}
+	stream := &fakeProvider{err: provider.NewFailure(provider.ReasonUnavailable, "test")}
+	executor := executorForTest(t, store, stream, clock, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	executor.Wait = func(waitCtx context.Context, _ time.Duration) error {
+		store.stop.Store(true)
+		cancel()
+		return waitCtx.Err()
+	}
+	result, err := executor.Execute(ctx, reservationForExecutor(t, start, 2*time.Minute))
+	if err != nil || result.State != core.AttemptCancelled || result.Reason != core.ReasonUserRequestedStop ||
+		stream.opens != 1 || countString(store.operations, "finalizing") != 0 {
+		t.Fatalf("result=%+v opens=%d operations=%v err=%v", result, stream.opens, store.operations, err)
+	}
+}
+
 func TestExecutorDoesNotReconnectNonTransientFailures(t *testing.T) {
 	tests := []struct {
 		reason provider.Reason
@@ -586,6 +618,128 @@ func TestExecutorSettlesShutdownWithoutPublishingFinalFile(t *testing.T) {
 	}
 }
 
+func TestExecutorPublishesUsefulUserStoppedRecordingAsPartial(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	clock := &mutableClock{now: start}
+	store := &attemptMemory{start: start, end: start.Add(time.Hour)}
+	lease := &userStopLease{started: make(chan struct{}), clock: clock, count: minimumUsefulTS}
+	executor := executorForTest(t, store, &fakeProvider{lease: lease}, clock, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct {
+		result Result
+		err    error
+	}, 1)
+	go func() {
+		result, err := executor.Execute(ctx, reservationForExecutor(t, start, time.Hour))
+		done <- struct {
+			result Result
+			err    error
+		}{result: result, err: err}
+	}()
+	select {
+	case <-lease.started:
+	case <-time.After(time.Second):
+		t.Fatal("停止対象のstream readが始まりませんでした")
+	}
+	store.stop.Store(true)
+	cancel()
+	select {
+	case outcome := <-done:
+		if outcome.err != nil || outcome.result.State != core.AttemptPartial ||
+			outcome.result.Reason != core.ReasonUserRequestedStop || store.finish.Availability != core.AvailabilityFinal ||
+			store.finalize.State != core.AttemptPartial || store.finalize.Reason != core.ReasonUserRequestedStop {
+			t.Fatalf("result=%+v finalize=%+v finish=%+v err=%v", outcome.result, store.finalize, store.finish, outcome.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("利用者停止後に録画処理が終了しませんでした")
+	}
+	for _, operation := range []string{"finalizing", "link", "published", "directory-recorded", "finished"} {
+		if countString(store.operations, operation) != 1 {
+			t.Fatalf("operation=%s operations=%v", operation, store.operations)
+		}
+	}
+}
+
+func TestExecutorDoesNotPublishTooShortUserStoppedRecording(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	clock := &mutableClock{now: start}
+	store := &attemptMemory{start: start, end: start.Add(time.Hour)}
+	lease := &userStopLease{started: make(chan struct{}), clock: clock, count: minimumUsefulTS - 1}
+	executor := executorForTest(t, store, &fakeProvider{lease: lease}, clock, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan Result, 1)
+	go func() {
+		result, _ := executor.Execute(ctx, reservationForExecutor(t, start, time.Hour))
+		done <- result
+	}()
+	select {
+	case <-lease.started:
+	case <-time.After(time.Second):
+		t.Fatal("停止対象のstream readが始まりませんでした")
+	}
+	store.stop.Store(true)
+	cancel()
+	select {
+	case result := <-done:
+		if result.State != core.AttemptCancelled || result.Reason != core.ReasonUserRequestedStop ||
+			store.finish.ByteCount != minimumUsefulTS-1 || store.finish.Availability != core.AvailabilityPartial {
+			t.Fatalf("result=%+v finish=%+v", result, store.finish)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("利用者停止後に録画処理が終了しませんでした")
+	}
+	if countString(store.operations, "link") != 0 || countString(store.operations, "finalizing") != 0 {
+		t.Fatalf("短すぎる録画を公開しました: %v", store.operations)
+	}
+}
+
+func TestExecutorPublishesMultiChunkUserStoppedRecording(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	clock := &mutableClock{now: start}
+	store := &attemptMemory{start: start, end: start.Add(time.Hour)}
+	const chunks = 32
+	lease := &userStopLease{started: make(chan struct{}), clock: clock, count: provider.MaxStreamChunk, chunks: chunks}
+	executor := executorForTest(t, store, &fakeProvider{lease: lease}, clock, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan Result, 1)
+	go func() {
+		result, _ := executor.Execute(ctx, reservationForExecutor(t, start, time.Hour))
+		done <- result
+	}()
+	select {
+	case <-lease.started:
+	case <-time.After(time.Second):
+		t.Fatal("複数chunkの書込みが終わりませんでした")
+	}
+	store.stop.Store(true)
+	cancel()
+	select {
+	case result := <-done:
+		wantBytes := int64(chunks * provider.MaxStreamChunk)
+		if result.State != core.AttemptPartial || result.Reason != core.ReasonUserRequestedStop ||
+			store.finish.ByteCount != wantBytes || store.finish.Availability != core.AvailabilityFinal {
+			t.Fatalf("result=%+v finish=%+v want_bytes=%d", result, store.finish, wantBytes)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("利用者停止後に録画処理が終了しませんでした")
+	}
+}
+
+func TestExecutorStopsBeforeCreatingFileWhenRequestAlreadyExists(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	clock := &mutableClock{now: start}
+	store := &attemptMemory{start: start, end: start.Add(time.Hour)}
+	store.stop.Store(true)
+	stream := &fakeProvider{}
+	result, err := executorForTest(t, store, stream, clock, false).Execute(
+		context.Background(), reservationForExecutor(t, start, time.Hour))
+	if err != nil || result.State != core.AttemptCancelled || result.Reason != core.ReasonUserRequestedStop ||
+		store.finish.Availability != core.AvailabilityMissing || stream.opens != 0 || countString(store.operations, "create") != 0 {
+		t.Fatalf("result=%+v finish=%+v opens=%d operations=%v err=%v",
+			result, store.finish, stream.opens, store.operations, err)
+	}
+}
+
 func TestExecutorDoesNotReportSuccessWhenFinalDatabaseCommitFails(t *testing.T) {
 	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
 	clock := &mutableClock{now: start}
@@ -603,6 +757,107 @@ func TestExecutorDoesNotReportSuccessWhenFinalDatabaseCommitFails(t *testing.T) 
 	}
 }
 
+func TestUserStoppedPublicationFailsAtEachDurabilityBoundary(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	attempt := core.Attempt{ID: appID(t, 80), Plan: core.FilePlan{
+		PartialPath: "2026/08/stopped.ts.partial", FinalPath: "2026/08/stopped.ts",
+	}}
+	tests := []struct {
+		name       string
+		fail       string
+		wantReason core.TerminalReason
+	}{
+		{name: "finalization database", fail: "finalize"},
+		{name: "final name conflict", fail: "conflict", wantReason: core.ReasonFinalNameConflict},
+		{name: "link", fail: "link", wantReason: core.ReasonFinalPublicationFailed},
+		{name: "publication database", fail: "published", wantReason: core.ReasonFinalDatabaseFailed},
+		{name: "publication directory sync", fail: "sync-1", wantReason: core.ReasonFileSyncFailed},
+		{name: "partial name removal", fail: "remove", wantReason: core.ReasonFinalPublicationFailed},
+		{name: "removal directory sync", fail: "sync-2", wantReason: core.ReasonFileSyncFailed},
+		{name: "directory database", fail: "directory", wantReason: core.ReasonFinalDatabaseFailed},
+		{name: "terminal database", fail: "finish", wantReason: core.ReasonFinalDatabaseFailed},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			failure := errors.New("injected failure")
+			store := &attemptMemory{start: start, end: start.Add(time.Hour)}
+			switch test.fail {
+			case "finalize":
+				store.finalizeErr = failure
+			case "published":
+				store.publishErr = failure
+			case "directory":
+				store.directoryErr = failure
+			case "finish":
+				store.finishErr = failure
+			}
+			syncCalls := 0
+			executor := Executor{
+				Store: store, Clock: &mutableClock{now: start}, NewID: func() (catalogmodel.ID, error) { return appID(t, 81), nil },
+				Files: FileOperations{
+					CreatePartial: func(core.FilePlan) (PartialFile, error) { return nil, failure },
+					LinkFinal: func(core.FilePlan) error {
+						if test.fail == "conflict" {
+							return core.ErrFinalExists
+						}
+						if test.fail == "link" {
+							return failure
+						}
+						return nil
+					},
+					SyncDirectory: func(core.FilePlan) error {
+						syncCalls++
+						if test.fail == "sync-1" && syncCalls == 1 || test.fail == "sync-2" && syncCalls == 2 {
+							return failure
+						}
+						return nil
+					},
+					RemovePartial: func(core.FilePlan) error {
+						if test.fail == "remove" {
+							return failure
+						}
+						return nil
+					},
+				},
+			}
+			result, err := executor.publishFinal(context.Background(), attempt, 188,
+				core.AttemptPartial, core.ReasonUserRequestedStop)
+			if err == nil {
+				t.Fatal("失敗を成功として返しました")
+			}
+			if test.wantReason == "" {
+				if result != (Result{}) {
+					t.Fatalf("result=%+v", result)
+				}
+			} else if result.State != core.AttemptFinalizing || result.Reason != test.wantReason {
+				t.Fatalf("result=%+v", result)
+			}
+		})
+	}
+}
+
+func TestUserStopDoesNotPublishWhenFileSyncOrCloseFails(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	for _, failureAt := range []string{"sync", "close"} {
+		t.Run(failureAt, func(t *testing.T) {
+			store := &attemptMemory{start: start, end: start.Add(time.Hour)}
+			file := &fakePartial{operations: &store.operations}
+			if failureAt == "sync" {
+				file.syncErr = errors.New("sync failed")
+			} else {
+				file.closeErr = errors.New("close failed")
+			}
+			executor := Executor{Store: store, Clock: &mutableClock{now: start}}
+			result, err := executor.finishUserStop(context.Background(), file,
+				core.Attempt{ID: appID(t, 82)}, minimumUsefulTS)
+			if err != nil || result.State != core.AttemptPartial || result.Reason != core.ReasonFileSyncFailed ||
+				store.finish.Availability != core.AvailabilityPartial || countString(store.operations, "finalizing") != 0 {
+				t.Fatalf("result=%+v finish=%+v operations=%v err=%v", result, store.finish, store.operations, err)
+			}
+		})
+	}
+}
+
 type contextLease struct{ started chan struct{} }
 
 func (lease *contextLease) Read(ctx context.Context, _ []byte) (int, providerstream.Terminal, error) {
@@ -614,6 +869,34 @@ func (lease *contextLease) Read(ctx context.Context, _ []byte) (int, providerstr
 
 func (*contextLease) Cancel() error { return nil }
 func (*contextLease) Close() error  { return nil }
+
+type userStopLease struct {
+	started chan struct{}
+	clock   *mutableClock
+	reads   int
+	count   int
+	chunks  int
+}
+
+func (lease *userStopLease) Read(ctx context.Context, destination []byte) (int, providerstream.Terminal, error) {
+	lease.reads++
+	chunks := lease.chunks
+	if chunks == 0 {
+		chunks = 1
+	}
+	if lease.reads <= chunks {
+		copy(destination, bytesOf(0x47, lease.count))
+		lease.clock.now = lease.clock.now.Add(2 * time.Second)
+		return lease.count, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
+	}
+	close(lease.started)
+	<-ctx.Done()
+	return 0, providerstream.Terminal{Done: true, Reason: providerstream.TerminalCancelled},
+		provider.NewFailure(provider.ReasonCancelled, "test")
+}
+
+func (*userStopLease) Cancel() error { return nil }
+func (*userStopLease) Close() error  { return nil }
 
 func bytesOf(value byte, count int) []byte {
 	result := make([]byte, count)

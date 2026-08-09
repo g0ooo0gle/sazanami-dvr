@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/g0ooo0gle/sazanami-dvr/internal/core/catalogmodel"
 	core "github.com/g0ooo0gle/sazanami-dvr/internal/core/recording"
 )
 
@@ -65,6 +66,7 @@ type Scheduler struct {
 	clock             ScheduleClock
 	maximumConcurrent int
 	wake              chan struct{}
+	stops             *stopRegistry
 }
 
 type executionCompletion struct{ err error }
@@ -77,8 +79,16 @@ func NewScheduler(store ScheduleStore, executor ReservationExecutor, clock Sched
 	}
 	return &Scheduler{
 		store: store, executor: executor, clock: clock, maximumConcurrent: maximumConcurrent,
-		wake: make(chan struct{}, maximumWakeSize),
+		wake: make(chan struct{}, maximumWakeSize), stops: newStopRegistry(maximumConcurrent),
 	}, nil
+}
+
+// NotifyStopはDBへ確定済みの利用者停止を、対象の実行中録画だけへ通知する。
+// 未登録でもDB確認で停止するため、通知の取りこぼしは失敗にしない。
+func (scheduler *Scheduler) NotifyStop(id catalogmodel.ID) {
+	if scheduler != nil {
+		scheduler.stops.notify(id)
+	}
 }
 
 // Notifyは予約追加後に待機中のschedulerへ再照合を依頼する。
@@ -200,9 +210,17 @@ func (scheduler *Scheduler) Run(ctx context.Context) error {
 		if err != nil {
 			return scheduler.stopExecutions(cancelExecutions, completed, active, err)
 		}
+		recordingContext, cancelRecording := context.WithCancel(executionContext)
+		unregister, err := scheduler.stops.register(reservation.ID, cancelRecording)
+		if err != nil {
+			cancelRecording()
+			return scheduler.stopExecutions(cancelExecutions, completed, active, err)
+		}
 		active++
 		go func(item core.Reservation, claimed core.Attempt) {
-			_, executeErr := scheduler.executor.ExecuteClaimed(executionContext, item, claimed)
+			defer unregister()
+			defer cancelRecording()
+			_, executeErr := scheduler.executor.ExecuteClaimed(recordingContext, item, claimed)
 			completed <- executionCompletion{err: executeErr}
 		}(*reservation, attempt)
 	}

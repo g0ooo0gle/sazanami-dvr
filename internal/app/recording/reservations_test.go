@@ -26,6 +26,7 @@ type memoryReservations struct {
 	changed []core.ReservationChange
 	deleted []int32
 	record  bool
+	stop    core.StopResult
 }
 
 func (store *memoryReservations) CreateReservation(_ context.Context, reservation core.Reservation) (core.Reservation, error) {
@@ -49,12 +50,12 @@ func (store *memoryReservations) UpdateReservation(_ context.Context, change cor
 	return nil
 }
 
-func (store *memoryReservations) CancelReservation(_ context.Context, number int32, _ time.Time) error {
+func (store *memoryReservations) StopReservation(_ context.Context, number int32, _ time.Time) (core.StopResult, error) {
 	if store.err != nil {
-		return store.err
+		return core.StopResult{}, store.err
 	}
 	store.deleted = append(store.deleted, number)
-	return nil
+	return store.stop, nil
 }
 
 func (store *memoryReservations) ReservationRecording(context.Context, int32) (bool, error) {
@@ -127,6 +128,24 @@ func TestReservationServiceChangesDeletesAndReadsRecordingState(t *testing.T) {
 	active, err := service.Recording(context.Background(), 7)
 	if err != nil || !active || len(store.changed) != 1 || len(store.deleted) != 1 || notified != 2 {
 		t.Fatalf("active=%v changed=%d deleted=%d notified=%d err=%v", active, len(store.changed), len(store.deleted), notified, err)
+	}
+}
+
+func TestReservationServiceNotifiesOnlyAfterPersistedRecordingStop(t *testing.T) {
+	now := time.Date(2026, 8, 5, 2, 0, 0, 0, time.UTC)
+	reservationID := appID(t, 11)
+	store := &memoryReservations{stop: core.StopResult{ReservationID: reservationID, Notify: true}}
+	var notified catalogmodel.ID
+	service := ReservationService{
+		Store: store, Clock: fixedClock{now: now}, OnStop: func(id catalogmodel.ID) { notified = id },
+	}
+	if err := service.Delete(context.Background(), 8); err != nil || notified != reservationID {
+		t.Fatalf("notified=%s err=%v", notified.String(), err)
+	}
+	store.err = errors.New("save failed")
+	notified = catalogmodel.ID{}
+	if err := service.Delete(context.Background(), 8); err == nil || notified != (catalogmodel.ID{}) {
+		t.Fatalf("failed notification=%s err=%v", notified.String(), err)
 	}
 }
 

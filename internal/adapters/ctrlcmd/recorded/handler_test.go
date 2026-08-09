@@ -94,6 +94,19 @@ func TestHandlerRejectsMalformedAndUnavailableItems(t *testing.T) {
 	}
 }
 
+func TestHandlerReturnsUserStoppedPartialRecording(t *testing.T) {
+	item := historyItem(3)
+	item.State = recording.AttemptPartial
+	item.Reason = recording.ReasonUserRequestedStop
+	handler := Handler{Operations: &fakeOperations{items: []recording.HistoryItem{item}}, Limits: codec.DefaultLimits()}
+	body := append(versionBody(), []byte{3, 0, 0, 0}...)
+	var response bytes.Buffer
+	if err := handler.Handle(context.Background(), requestFrame(CommandGet, body), &response); err != nil {
+		t.Fatal(err)
+	}
+	responseBody(t, response.Bytes(), resultSuccess)
+}
+
 func TestHandlerHonorsResponseAndContextLimits(t *testing.T) {
 	limits := codec.DefaultLimits()
 	limits.ResponseBody = 32

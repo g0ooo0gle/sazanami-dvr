@@ -101,6 +101,32 @@ func TestRecordingStreamSupportsHeadAndSingleRange(t *testing.T) {
 	}
 }
 
+func TestUserStoppedPartialRecordingSupportsNativeDetailAndRange(t *testing.T) {
+	data := bytes.Repeat([]byte{0x47}, 188)
+	item := httpHistoryItemWithBytes(8, int64(len(data)))
+	item.State = recording.AttemptPartial
+	item.Reason = recording.ReasonUserRequestedStop
+	handler, err := NewHandler(&fakeHistory{items: []recording.HistoryItem{item}}, &fakeFiles{data: data})
+	if err != nil {
+		t.Fatal(err)
+	}
+	detail := serve(handler, http.MethodGet, "/api/recordings/8", nil)
+	if detail.Code != http.StatusOK || !bytes.Contains(detail.Body.Bytes(), []byte(`"state":"PARTIAL"`)) ||
+		!bytes.Contains(detail.Body.Bytes(), []byte(`"reason":"USER_REQUESTED_STOP"`)) ||
+		!bytes.Contains(detail.Body.Bytes(), []byte(`"playable":true`)) {
+		t.Fatalf("detail=%d body=%s", detail.Code, detail.Body.String())
+	}
+	ranged := serve(handler, http.MethodGet, "/recordings/8.ts", map[string]string{"Range": "bytes=0-187"})
+	if ranged.Code != http.StatusPartialContent || !bytes.Equal(ranged.Body.Bytes(), data) {
+		t.Fatalf("range=%d bytes=%d", ranged.Code, ranged.Body.Len())
+	}
+	item.Reason = recording.ReasonStreamEndedEarly
+	handler, _ = NewHandler(&fakeHistory{items: []recording.HistoryItem{item}}, &fakeFiles{data: data})
+	if response := serve(handler, http.MethodGet, "/recordings/8.ts", nil); response.Code != http.StatusNotFound {
+		t.Fatalf("利用者停止以外の部分録画 code=%d", response.Code)
+	}
+}
+
 func TestRecordingStreamLimitsConcurrentReadersAndClosesFiles(t *testing.T) {
 	files := &fakeFiles{data: bytes.Repeat([]byte{0x47}, 188)}
 	handler, err := NewHandler(&fakeHistory{items: []recording.HistoryItem{httpHistoryItem(7)}}, files)
