@@ -31,7 +31,7 @@ func TestVersion(t *testing.T) {
 	if code := run([]string{"--version"}, &output, &diagnostic); code != 0 {
 		t.Fatalf("code=%d err=%q", code, diagnostic.String())
 	}
-	if got, want := output.String(), "sazanami-dvr 0.0.10\n"; got != want {
+	if got, want := output.String(), "sazanami-dvr 0.0.11\n"; got != want {
 		t.Fatalf("version=%q want=%q", got, want)
 	}
 }
@@ -420,7 +420,7 @@ func TestRecordingServeRejectsUnsafeListenBeforeOpeningRoots(t *testing.T) {
 }
 
 func TestRecordingServeAcceptsLANAddressesBeforeOpeningRoots(t *testing.T) {
-	for _, addresses := range [][2]string{{"10.1.1.39:4510", "10.1.1.39:40773"}, {"0.0.0.0:4510", "0.0.0.0:40773"}} {
+	for _, addresses := range [][2]string{{"10.254.254.39:4510", "10.254.254.39:40773"}, {"0.0.0.0:4510", "0.0.0.0:40773"}} {
 		var output, diagnostic bytes.Buffer
 		private := "/private/not-for-output"
 		code := runContext(context.Background(), []string{
