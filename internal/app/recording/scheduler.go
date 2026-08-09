@@ -92,6 +92,9 @@ func (scheduler *Scheduler) Run(ctx context.Context) error {
 	for {
 		reservation, err := scheduler.store.NextActiveReservation(ctx)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
 			return errors.New("recording: read next reservation")
 		}
 		if reservation == nil {
