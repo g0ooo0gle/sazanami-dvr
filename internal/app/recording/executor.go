@@ -63,8 +63,9 @@ type TimeSource interface {
 
 // Resultは予定した一件の録画処理が到達した終了状態を返す。
 type Result struct {
-	State  recording.AttemptState
-	Reason recording.TerminalReason
+	State         recording.AttemptState
+	Reason        recording.TerminalReason
+	PostRecording recording.PostRecordingMode
 }
 
 // PostRecordingRequestは完成済み録画の後処理へ渡す、検証済みの最小情報である。
@@ -276,21 +277,26 @@ func (executor Executor) publishAndPostProcess(ctx context.Context, reservation 
 	byteCount int64, state recording.AttemptState, reason recording.TerminalReason,
 ) (Result, error) {
 	result, err := executor.publishFinal(ctx, attempt, byteCount, state, reason)
-	if err != nil || reservation.PostRecording.Script == "" {
+	if err != nil {
 		return result, err
 	}
-	postReason := "post-recording-script-invalid"
-	if executor.Files.FinalPath != nil && executor.PostRecording != nil {
-		finalPath, pathErr := executor.Files.FinalPath(attempt.Plan)
-		if pathErr == nil {
-			postReason = executor.PostRecording(ctx, PostRecordingRequest{
-				Script: reservation.PostRecording.Script, RecordingNumber: reservation.Number,
-				FinalPath: finalPath, State: state, Reason: reason,
-			})
+	if reservation.PostRecording.Script != "" {
+		postReason := "post-recording-script-invalid"
+		if executor.Files.FinalPath != nil && executor.PostRecording != nil {
+			finalPath, pathErr := executor.Files.FinalPath(attempt.Plan)
+			if pathErr == nil {
+				postReason = executor.PostRecording(ctx, PostRecordingRequest{
+					Script: reservation.PostRecording.Script, RecordingNumber: reservation.Number,
+					FinalPath: finalPath, State: state, Reason: reason,
+				})
+			}
+		}
+		if postReason != "" && executor.ObservePostRecording != nil {
+			executor.ObservePostRecording(postReason)
 		}
 	}
-	if postReason != "" && executor.ObservePostRecording != nil {
-		executor.ObservePostRecording(postReason)
+	if reservation.PostRecording.Mode.ChangesPower() {
+		result.PostRecording = reservation.PostRecording.Mode
 	}
 	return result, nil
 }

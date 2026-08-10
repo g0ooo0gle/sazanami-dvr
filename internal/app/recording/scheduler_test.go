@@ -446,7 +446,8 @@ func (executor *concurrentSchedulerExecutor) ExecuteClaimed(ctx context.Context,
 		return Result{}, nil
 	case <-executor.release:
 		executor.finishConcurrent(false)
-		return Result{State: core.AttemptSucceeded, Reason: core.ReasonCompleted}, nil
+		return Result{State: core.AttemptSucceeded, Reason: core.ReasonCompleted,
+			PostRecording: reservation.PostRecording.Mode}, nil
 	}
 }
 
@@ -711,6 +712,170 @@ func TestSchedulerRejectsConcurrentBounds(t *testing.T) {
 		if _, err := NewScheduler(&queueStore{}, &schedulerExecutor{clock: clock}, clock, maximum); err == nil {
 			t.Fatalf("maximum=%dが受理されました", maximum)
 		}
+	}
+}
+
+type postPowerRecorder struct {
+	mode   core.PostRecordingMode
+	wakeAt *time.Time
+	calls  int
+	reason string
+	called chan struct{}
+}
+
+func (controller *postPowerRecorder) Execute(_ context.Context, mode core.PostRecordingMode, wakeAt *time.Time) PostRecordingPowerResult {
+	controller.calls++
+	controller.mode = mode
+	if wakeAt != nil {
+		copied := *wakeAt
+		controller.wakeAt = &copied
+	}
+	if controller.called != nil {
+		controller.called <- struct{}{}
+	}
+	return PostRecordingPowerResult{Reason: controller.reason}
+}
+
+func TestPostRecordingPowerCandidateCombinesAtMostEightRecordings(t *testing.T) {
+	for count := 1; count <= MaximumConcurrentRecordings; count++ {
+		candidate := postRecordingPowerCandidate{}
+		for range count {
+			candidate.add(core.PostRecordingStandby)
+		}
+		if !candidate.present || candidate.conflict || candidate.mode != core.PostRecordingStandby {
+			t.Fatalf("count=%d candidate=%+v", count, candidate)
+		}
+	}
+	candidate := postRecordingPowerCandidate{}
+	candidate.add(core.PostRecordingNothing)
+	if candidate.present {
+		t.Fatal("何もしない設定が電源候補になりました")
+	}
+	candidate.add(core.PostRecordingStandby)
+	candidate.add(core.PostRecordingShutdown)
+	if !candidate.conflict {
+		t.Fatal("異なる電源候補の競合を検出できませんでした")
+	}
+}
+
+func TestSchedulerEvaluatesPostRecordingPowerBoundaries(t *testing.T) {
+	now := time.Date(2026, 8, 10, 1, 0, 0, 0, time.UTC)
+	controller := &postPowerRecorder{}
+	scheduler := &Scheduler{postPower: controller}
+	candidate := postRecordingPowerCandidate{mode: core.PostRecordingStandbyReboot, present: true}
+
+	if result := scheduler.executePostRecordingPower(context.Background(), candidate, now, nil); result != (PostRecordingPowerResult{}) ||
+		controller.calls != 1 || controller.mode != core.PostRecordingStandbyReboot || controller.wakeAt != nil {
+		t.Fatalf("result=%+v controller=%+v", result, controller)
+	}
+
+	controller.calls = 0
+	next := core.Reservation{Program: core.ProgramSnapshot{Start: now.Add(10 * time.Minute)}, Margins: &core.RecordingMargins{}}
+	if result := scheduler.executePostRecordingPower(context.Background(), candidate, now, &next); result != (PostRecordingPowerResult{}) ||
+		controller.calls != 1 || controller.wakeAt == nil || !controller.wakeAt.Equal(now.Add(5*time.Minute)) {
+		t.Fatalf("result=%+v controller=%+v", result, controller)
+	}
+
+	controller.calls = 0
+	next.Program.Start = now.Add(10*time.Minute - time.Millisecond)
+	if result := scheduler.executePostRecordingPower(context.Background(), candidate, now, &next); result.Reason != "post-recording-power-too-late" ||
+		controller.calls != 0 {
+		t.Fatalf("result=%+v calls=%d", result, controller.calls)
+	}
+
+	conflict := candidate
+	conflict.conflict = true
+	if result := scheduler.executePostRecordingPower(context.Background(), conflict, now, nil); result.Reason != "post-recording-power-conflict" {
+		t.Fatalf("result=%+v", result)
+	}
+	if result := (&Scheduler{}).executePostRecordingPower(context.Background(), candidate, now, nil); result.Reason != "post-recording-power-unavailable" {
+		t.Fatalf("result=%+v", result)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if result := scheduler.executePostRecordingPower(cancelled, candidate, now, nil); result.Reason != "post-recording-power-cancelled" {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestSchedulerPostRecordingPowerSetupAndAdapterReason(t *testing.T) {
+	scheduler := &Scheduler{}
+	if err := scheduler.SetPostRecordingPower(nil, nil); err == nil {
+		t.Fatal("nil controllerが受理されました")
+	}
+	controller := &postPowerRecorder{reason: "post-recording-power-failed"}
+	if err := scheduler.SetPostRecordingPower(controller, nil); err != nil {
+		t.Fatal(err)
+	}
+	result := scheduler.executePostRecordingPower(context.Background(), postRecordingPowerCandidate{
+		mode: core.PostRecordingShutdown, present: true,
+	}, time.Date(2026, 8, 10, 1, 0, 0, 0, time.UTC), nil)
+	if result.Reason != controller.reason || controller.calls != 1 {
+		t.Fatalf("result=%+v calls=%d", result, controller.calls)
+	}
+}
+
+func TestSchedulerWaitsForAllEightRecordingsBeforePowerAction(t *testing.T) {
+	start := time.Date(2026, 8, 10, 2, 0, 0, 0, time.UTC)
+	items := make([]core.Reservation, MaximumConcurrentRecordings)
+	for index := range items {
+		items[index] = reservationForExecutor(t, start, 10*time.Minute)
+		items[index].ID = appID(t, byte(100+index))
+		items[index].PostRecording.Mode = core.PostRecordingStandby
+	}
+	executor := &concurrentSchedulerExecutor{
+		started: make(chan core.Reservation, len(items)), release: make(chan struct{}, len(items)),
+	}
+	scheduler, err := NewScheduler(&queueStore{items: items}, executor, &manualScheduleClock{now: start}, len(items))
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := &postPowerRecorder{called: make(chan struct{}, 1)}
+	if err := scheduler.SetPostRecordingPower(controller, nil); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+	for range items {
+		waitSchedulerStart(t, executor.started)
+	}
+	for range len(items) - 1 {
+		executor.release <- struct{}{}
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		executor.mu.Lock()
+		running := executor.running
+		executor.mu.Unlock()
+		if running == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("七件の完了を確認できませんでした")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-controller.called:
+		cancel()
+		t.Fatal("録画が残る間に電源動作が実行されました")
+	default:
+	}
+	executor.release <- struct{}{}
+	select {
+	case <-controller.called:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("全録画完了後に電源動作が実行されませんでした")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if controller.calls != 1 || controller.mode != core.PostRecordingStandby {
+		t.Fatalf("controller=%+v", controller)
 	}
 }
 
