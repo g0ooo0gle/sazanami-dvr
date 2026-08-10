@@ -282,6 +282,7 @@ func decodeReservation(reader *codec.Reader, change *recording.ReservationChange
 	fileNames := 0
 	if err := reader.Vector(6, 1, func(item *codec.Reader, _ int) error {
 		fileNames++
+		// KonomiTVは2011で受け取った予定名を2015へ送り返す。値は保存先として使わない。
 		_, readErr := item.String()
 		return readErr
 	}); err != nil {
@@ -292,7 +293,7 @@ func decodeReservation(reader *codec.Reader, change *recording.ReservationChange
 		return err
 	}
 	if (!requireNumber && reserveID != 0) || (requireNumber && reserveID < 1) || unknown != 0 || overlap != 0 || unused != "" || !epgStart.Equal(start) ||
-		trailingOne != 0 || fileNames != 0 || trailingTwo != 0 || duration < 1 || duration > 86_400 {
+		trailingOne != 0 || (!requireNumber && fileNames != 0) || trailingTwo != 0 || duration < 1 || duration > 86_400 {
 		return failure(codec.Malformed, "reservation-server-field", 0)
 	}
 	change.Number = reserveID
