@@ -231,6 +231,47 @@ func TestReservationOutputSettingsRoundTrip(t *testing.T) {
 	}); err != nil || count != 1 {
 		t.Fatalf("count=%d err=%v", count, err)
 	}
+
+	response.Reset()
+	request = reservationRequestSettingsWithFileNames(t, CommandChange, Version, 42, 1, 4, true,
+		0, 0, 0, 1, 0, output, recording.PostRecordingSettings{}, []string{"/untrusted/echo.ts"})
+	if err := handler.Handle(context.Background(), request, &response); err != nil {
+		t.Fatal(err)
+	}
+	frame, err = codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
+	if err != nil || frame.Code != ResultSuccess || len(operations.changed) != 1 ||
+		operations.changed[0].Number != 42 || operations.changed[0].Request.Output != output {
+		t.Fatalf("frame=%+v changed=%+v err=%v", frame, operations.changed, err)
+	}
+
+	for _, test := range []struct {
+		name      string
+		command   int32
+		reserveID int32
+		fileNames []string
+		reason    string
+	}{
+		{name: "add rejects echoed name", command: CommandAdd, fileNames: []string{"echo.ts"}, reason: "reservation-vector"},
+		{name: "change rejects two names", command: CommandChange, reserveID: 42, fileNames: []string{"one.ts", "two.ts"}, reason: "reservation-vector"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response.Reset()
+			request := reservationRequestSettingsWithFileNames(t, test.command, Version, test.reserveID, 1, 3, true,
+				0, 0, 0, 1, 0, output, recording.PostRecordingSettings{}, test.fileNames)
+			_, decodeErr := decodeReservationRequest(request[codec.HeaderSize:], codec.DefaultLimits(), test.command == CommandChange)
+			var codecErr *codec.Error
+			if !errors.As(decodeErr, &codecErr) || codecErr.Reason != test.reason {
+				t.Fatalf("decode error=%v want reason=%s", decodeErr, test.reason)
+			}
+			if err := handler.Handle(context.Background(), request, &response); err != nil {
+				t.Fatal(err)
+			}
+			frame, err := codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
+			if err != nil || frame.Code != ResultFailure || len(operations.added) != 1 || len(operations.changed) != 1 {
+				t.Fatalf("frame=%+v added=%d changed=%d err=%v", frame, len(operations.added), len(operations.changed), err)
+			}
+		})
+	}
 }
 
 func TestReservationPostRecordingSettingsRoundTrip(t *testing.T) {
@@ -698,6 +739,14 @@ func reservationRequestSettingsWithPostRecording(t *testing.T, command int32, ve
 	recordingMode, priority uint8, follow bool, useMargins uint8, startMargin, endMargin int32, count int,
 	serviceMode uint32, output recording.OutputSettings, post recording.PostRecordingSettings,
 ) []byte {
+	return reservationRequestSettingsWithFileNames(t, command, version, reserveID, recordingMode, priority, follow,
+		useMargins, startMargin, endMargin, count, serviceMode, output, post, nil)
+}
+
+func reservationRequestSettingsWithFileNames(t *testing.T, command int32, version uint16, reserveID int32,
+	recordingMode, priority uint8, follow bool, useMargins uint8, startMargin, endMargin int32, count int,
+	serviceMode uint32, output recording.OutputSettings, post recording.PostRecordingSettings, fileNames []string,
+) []byte {
 	t.Helper()
 	var itemBody bytes.Buffer
 	item, err := codec.NewWriter(&itemBody, codec.DefaultLimits())
@@ -745,7 +794,7 @@ func reservationRequestSettingsWithPostRecording(t *testing.T, command int32, ve
 	if err := item.I32(0); err != nil {
 		t.Fatal(err)
 	}
-	writeTestVector(t, item, nil, 0)
+	writeTestStringVector(t, item, fileNames)
 	if err := item.I32(0); err != nil {
 		t.Fatal(err)
 	}
@@ -892,6 +941,29 @@ func writeTestVector(t *testing.T, writer *codec.Writer, item []byte, count int)
 		if err := writer.Bytes(item); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func writeTestStringVector(t *testing.T, writer *codec.Writer, values []string) {
+	t.Helper()
+	var body bytes.Buffer
+	bodyWriter, err := codec.NewWriter(&body, codec.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range values {
+		if err := bodyWriter.String(value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.I32(int32(8 + body.Len())); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.I32(int32(len(values))); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Bytes(body.Bytes()); err != nil {
+		t.Fatal(err)
 	}
 }
 
