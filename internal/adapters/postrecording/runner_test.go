@@ -1,0 +1,155 @@
+//go:build unix
+
+package postrecording
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/g0ooo0gle/sazanami-dvr/internal/core/recording"
+)
+
+func TestOpenCreatesOwnerOnlyDirectory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "scripts")
+	directory, err := Open(path)
+	if err != nil || directory.root != path {
+		t.Fatalf("directory=%+v err=%v", directory, err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
+		t.Fatalf("mode=%v err=%v", info.Mode(), err)
+	}
+}
+
+func TestValidateAcceptsOnlyExecutableRegularFileInsideRoot(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "scripts")
+	directory, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := filepath.Join(root, "valid.sh")
+	writeScript(t, valid, "#!/bin/sh\nexit 0\n", 0o700)
+	if err := directory.Validate(valid); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "outside.sh")
+	writeScript(t, outside, "#!/bin/sh\nexit 0\n", 0o700)
+	nonExecutable := filepath.Join(root, "plain.sh")
+	writeScript(t, nonExecutable, "#!/bin/sh\nexit 0\n", 0o600)
+	child := filepath.Join(root, "child")
+	if err := os.Mkdir(child, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	symlink := filepath.Join(child, "link.sh")
+	if err := os.Symlink(valid, symlink); err != nil {
+		t.Fatal(err)
+	}
+	for name, path := range map[string]string{
+		"empty": "", "relative": "valid.sh", "root": root, "outside": outside,
+		"common prefix": root + "-other/file.sh", "non executable": nonExecutable, "symlink": symlink,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := directory.Validate(path); err == nil {
+				t.Fatalf("path=%q を受理しました", path)
+			}
+		})
+	}
+}
+
+func TestRunUsesFixedEnvironmentAndDiscardsOutput(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "scripts")
+	directory, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordingFile := filepath.Join(root, "recording.ts")
+	script := filepath.Join(root, "inspect.sh")
+	writeScript(t, script, "#!/bin/sh\nset -eu\n[ \"$#\" -eq 0 ]\n[ \"$PATH\" = /usr/bin:/bin ]\n[ \"$SAZANAMI_RECORDING_NUMBER\" = 17 ]\n[ \"$SAZANAMI_RECORDING_STATE\" = SUCCEEDED ]\n[ \"$SAZANAMI_RECORDING_REASON\" = COMPLETED ]\n[ \"$SAZANAMI_RECORDING_FILE\" = "+strconv.Quote(recordingFile)+" ]\n[ -z \"${SHOULD_NOT_EXIST+x}\" ]\nprintf ignored\nprintf ignored >&2\n", 0o700)
+	t.Setenv("SHOULD_NOT_EXIST", "private-parent-value")
+	reason := (Runner{Directory: directory, Timeout: time.Second}).Run(context.Background(), script, Environment{
+		RecordingNumber: 17, RecordingFile: recordingFile,
+		State: recording.AttemptSucceeded, Reason: recording.ReasonCompleted,
+	})
+	if reason != "" {
+		t.Fatalf("reason=%q", reason)
+	}
+}
+
+func TestRunReportsSuccessExitTimeoutAndCancellation(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "scripts")
+	directory, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	environment := Environment{RecordingNumber: 1, RecordingFile: filepath.Join(root, "recording.ts"), State: recording.AttemptPartial,
+		Reason: recording.ReasonUserRequestedStop}
+	for _, test := range []struct {
+		name, body, want string
+		timeout          time.Duration
+		cancel           bool
+	}{
+		{name: "success", body: "#!/bin/sh\nexit 0\n"},
+		{name: "exit", body: "#!/bin/sh\nexit 7\n", want: ReasonExitFailed},
+		{name: "timeout", body: "#!/bin/sh\nexec /bin/sleep 5\n", timeout: 20 * time.Millisecond, want: ReasonTimeout},
+		{name: "cancel", body: "#!/bin/sh\nexec /bin/sleep 5\n", cancel: true, want: ReasonCancelled},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			script := filepath.Join(root, test.name+".sh")
+			writeScript(t, script, test.body, 0o700)
+			ctx := context.Background()
+			var cancel context.CancelFunc
+			if test.cancel {
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
+			timeout := test.timeout
+			if timeout == 0 {
+				timeout = time.Second
+			}
+			if got := (Runner{Directory: directory, Timeout: timeout}).Run(ctx, script, environment); got != test.want {
+				t.Fatalf("reason=%q want=%q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestRunRejectsChangedScriptAtExecution(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "scripts")
+	directory, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(root, "changed.sh")
+	writeScript(t, script, "#!/bin/sh\nexit 0\n", 0o700)
+	if err := directory.Validate(script); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(script); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(script, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	reason := (Runner{Directory: directory, Timeout: time.Second}).Run(context.Background(), script, Environment{
+		RecordingNumber: 1, RecordingFile: filepath.Join(root, "recording.ts"),
+		State: recording.AttemptSucceeded, Reason: recording.ReasonCompleted,
+	})
+	if reason != ReasonInvalid {
+		t.Fatalf("reason=%q", reason)
+	}
+}
+
+func writeScript(t *testing.T, path, body string, mode os.FileMode) {
+	t.Helper()
+	if !strings.HasPrefix(body, "#!") {
+		t.Fatal("shebangがありません")
+	}
+	if err := os.WriteFile(path, []byte(body), mode); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -2,6 +2,7 @@ package recording
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 	"time"
 
@@ -69,6 +70,29 @@ func TestReservationMarginsAndEffectiveDurationBoundaries(t *testing.T) {
 	for index, candidate := range invalid {
 		if err := candidate.Validate(); err == nil {
 			t.Fatalf("invalid %d was accepted", index)
+		}
+	}
+}
+
+func TestPostRecordingSettingsValidation(t *testing.T) {
+	for _, settings := range []PostRecordingSettings{
+		{},
+		{Mode: PostRecordingNothing},
+		{Mode: PostRecordingDefault, Script: "/data/post-recording-scripts/after.sh"},
+	} {
+		if err := settings.Validate(); err != nil {
+			t.Fatalf("settings=%+v err=%v", settings, err)
+		}
+	}
+	for _, settings := range []PostRecordingSettings{
+		{Mode: PostRecordingMode(2)},
+		{Script: strings.Repeat("a", MaxPostRecordingScriptBytes+1)},
+		{Script: "bad\x00script"},
+		{Script: "bad\nscript"},
+		{Script: string([]byte{0xff})},
+	} {
+		if err := settings.Validate(); err == nil {
+			t.Fatalf("不正な録画後設定が受理されました: %+v", settings)
 		}
 	}
 }

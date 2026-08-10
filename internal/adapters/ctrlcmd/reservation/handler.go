@@ -47,10 +47,16 @@ type Operations interface {
 	Recording(context.Context, int32) (bool, error)
 }
 
+// ScriptValidatorは予約へ保存する録画後スクリプトが専用ディレクトリ内にあるかを確認する。
+type ScriptValidator interface {
+	Validate(string) error
+}
+
 // Handlerは対応済みの予約操作だけをapplication層へ渡す。
 type Handler struct {
-	Operations Operations
-	Limits     codec.Limits
+	Operations      Operations
+	ScriptValidator ScriptValidator
+	Limits          codec.Limits
 }
 
 // Handleは対応済みの予約commandを振り分け、失敗理由を応答へ含めない。
@@ -117,7 +123,7 @@ func (handler Handler) list(ctx context.Context, body []byte, destination io.Wri
 
 func (handler Handler) add(ctx context.Context, body []byte, destination io.Writer) error {
 	change, err := decodeReservationRequest(body, handler.Limits, false)
-	if err != nil {
+	if err != nil || !handler.validScript(change.Request.PostRecording.Script) {
 		return writeFailure(ctx, destination, handler.Limits)
 	}
 	if _, err := handler.Operations.Add(ctx, change.Request); err != nil {
@@ -130,12 +136,16 @@ func (handler Handler) add(ctx context.Context, body []byte, destination io.Writ
 
 func (handler Handler) change(ctx context.Context, body []byte, destination io.Writer) error {
 	change, err := decodeReservationRequest(body, handler.Limits, true)
-	if err != nil || handler.Operations.Change(ctx, change) != nil {
+	if err != nil || !handler.validScript(change.Request.PostRecording.Script) || handler.Operations.Change(ctx, change) != nil {
 		return writeFailure(ctx, destination, handler.Limits)
 	}
 	return codec.WriteFrame(reservationDestination{ctx: ctx, destination: destination}, ResultSuccess, 2, handler.Limits, func(writer *codec.Writer) error {
 		return writer.U16(Version)
 	})
+}
+
+func (handler Handler) validScript(path string) bool {
+	return path == "" || handler.ScriptValidator != nil && handler.ScriptValidator.Validate(path) == nil
 }
 
 func (handler Handler) delete(ctx context.Context, body []byte, destination io.Writer) error {
@@ -290,7 +300,7 @@ func decodeReservation(reader *codec.Reader, change *recording.ReservationChange
 		NetworkID: networkID, TransportStreamID: transportID, ServiceID: serviceID, EventID: eventID,
 		Start: start, Duration: time.Duration(duration) * time.Second, Priority: settings.priority,
 		RequestedFollow: settings.follow, Disabled: settings.disabled, Margins: settings.margins, Output: settings.output,
-		Components: settings.components,
+		Components: settings.components, PostRecording: settings.postRecording,
 	}
 	return nil
 }
@@ -325,12 +335,13 @@ func decodeOneNumber(body []byte, limits codec.Limits, vector bool) (int32, erro
 }
 
 type decodedSettings struct {
-	priority   uint8
-	follow     bool
-	disabled   bool
-	margins    *recording.RecordingMargins
-	output     recording.OutputSettings
-	components recording.ComponentMode
+	priority      uint8
+	follow        bool
+	disabled      bool
+	margins       *recording.RecordingMargins
+	output        recording.OutputSettings
+	components    recording.ComponentMode
+	postRecording recording.PostRecordingSettings
 }
 
 func decodeSettings(reader *codec.Reader) (decodedSettings, error) {
@@ -404,9 +415,21 @@ func decodeSettings(reader *codec.Reader) (decodedSettings, error) {
 		if err != nil {
 			return err
 		}
+		switch {
+		case suspend == 0 && reboot == 0:
+			settings.postRecording.Mode = recording.PostRecordingDefault
+		case suspend == 4 && reboot == 0:
+			settings.postRecording.Mode = recording.PostRecordingNothing
+		default:
+			return failure(codec.Unsupported, "recording-setting-out-of-profile", 0)
+		}
+		settings.postRecording.Script = batch
+		if settings.postRecording.Validate() != nil {
+			return failure(codec.Unsupported, "recording-setting-out-of-profile", 0)
+		}
 		if (recordingMode != 1 && recordingMode != 5) || settings.priority < 1 || settings.priority > 5 ||
 			followValue > 1 ||
-			exact != 0 || batch != "" || suspend != 0 || reboot != 0 || useMargins > 1 ||
+			exact != 0 || useMargins > 1 ||
 			continued != 0 || partial != 0 || tuner != 0 || partialFolders != 0 {
 			return failure(codec.Unsupported, "recording-setting-out-of-profile", 0)
 		}
@@ -530,7 +553,15 @@ func reservationSize(reservation recording.Reservation, limits codec.Limits) (in
 	if err != nil {
 		return 0, err
 	}
-	return minimumReserveSize + title + station + folders - 8 + files - 8, nil
+	postScript, err := codec.StringSize(reservation.PostRecording.Script, limits)
+	if err != nil {
+		return 0, err
+	}
+	emptyScript, err := codec.StringSize("", limits)
+	if err != nil {
+		return 0, err
+	}
+	return minimumReserveSize + title + station + folders - 8 + files - 8 + postScript - emptyScript, nil
 }
 
 func writeReservations(ctx context.Context, writer *codec.Writer, operations Operations, limits codec.Limits, expected int) error {
@@ -611,7 +642,15 @@ func writeSettings(writer *codec.Writer, reservation recording.Reservation, limi
 	if err != nil {
 		return err
 	}
-	if err := writer.I32(int32(43 + folders)); err != nil {
+	postScript, err := codec.StringSize(reservation.PostRecording.Script, limits)
+	if err != nil {
+		return err
+	}
+	emptyScript, err := codec.StringSize("", limits)
+	if err != nil {
+		return err
+	}
+	if err := writer.I32(int32(43 + folders + postScript - emptyScript)); err != nil {
 		return err
 	}
 	followValue, recordingMode := uint8(0), uint8(1)
@@ -636,13 +675,19 @@ func writeSettings(writer *codec.Writer, reservation recording.Reservation, limi
 	if err := writer.U8(0); err != nil {
 		return err
 	}
-	if err := writer.String(""); err != nil {
+	if err := writer.String(reservation.PostRecording.Script); err != nil {
 		return err
 	}
 	if err := writeReservationFolders(writer, reservation, limits); err != nil {
 		return err
 	}
-	if err := writer.U8(0); err != nil {
+	suspendMode := uint8(0)
+	if reservation.PostRecording.Mode == recording.PostRecordingNothing {
+		suspendMode = 4
+	} else if reservation.PostRecording.Mode != recording.PostRecordingDefault {
+		return failure(codec.Internal, "invalid-stored-post-recording-settings", int64(reservation.Number))
+	}
+	if err := writer.U8(suspendMode); err != nil {
 		return err
 	}
 	if err := writer.U8(0); err != nil {

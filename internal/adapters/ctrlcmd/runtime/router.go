@@ -33,6 +33,15 @@ type Router struct {
 	limits       codec.Limits
 }
 
+// SetPostRecordingScriptValidatorは録画用Routerの通常予約へ、専用ディレクトリの検証を接続する。
+func (router *Router) SetPostRecordingScriptValidator(validator reservationadapter.ScriptValidator) error {
+	if router == nil || router.reservations == nil || validator == nil {
+		return stable("post-recording-script-validator-failed")
+	}
+	router.reservations.ScriptValidator = validator
+	return nil
+}
+
 // NewRecordingRouterWithLiveは完成済み録画までのcommandへ上限付きライブ中継を追加する。
 func NewRecordingRouterWithLive(snapshots SnapshotLoader, reservations reservationadapter.Operations,
 	automatic autoreservationadapter.Operations, recorded recordedadapter.Operations, live liveadapter.Operations,
