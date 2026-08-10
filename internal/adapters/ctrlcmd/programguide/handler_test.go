@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -184,6 +185,159 @@ func TestHandlerSupportsKonomiExactServiceAndTimeRange(t *testing.T) {
 	}
 }
 
+func TestHandlerSupportsKomorebiMultipleServicesAndTimeRange(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 2, 3, 0, time.UTC)
+	first := guideService("1003", 1, 2, 3)
+	second := guideService("1004", 1, 2, 4)
+	other := guideService("1005", 1, 2, 5)
+	firstProgram := guideProgram(first.ProviderLocator, "event:1", 4)
+	secondProgram := guideProgram(second.ProviderLocator, "event:2", 5)
+	otherProgram := guideProgram(other.ProviderLocator, "event:3", 6)
+	for _, program := range []*catalogmodel.CurrentProgram{&firstProgram, &secondProgram, &otherProgram} {
+		value := start.UnixMilli()
+		program.Material.StartUTCMS = &value
+	}
+	source := &memorySource{
+		snapshot: channel.Snapshot{Key: "guide", Services: []channel.Service{other, second, first}},
+		programs: []catalogmodel.CurrentProgram{otherProgram, secondProgram, firstProgram},
+	}
+	handler, err := NewHandler(source, codec.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := func(service channel.Service) int64 {
+		return int64(service.NetworkID)<<32 | int64(service.TransportStreamID)<<16 | int64(service.ServiceID)
+	}
+	selectors := []int64{0, key(second), 0, key(first), edcbFileTime(start), edcbFileTime(start.Add(time.Minute))}
+	var response bytes.Buffer
+	if err := handler.Handle(context.Background(), guideRequestValues(selectors), &response); err != nil {
+		t.Fatal(err)
+	}
+	frame, err := codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
+	if err != nil || frame.Code != ResultSuccess {
+		t.Fatalf("frame=%+v err=%v", frame, err)
+	}
+	reader, err := codec.NewReader(frame.Body, codec.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedServices := []channel.Service{first, second}
+	expectedPrograms := []catalogmodel.CurrentProgram{firstProgram, secondProgram}
+	serviceIndex, eventCount := 0, 0
+	if err := reader.Vector(1, maxServices, func(serviceReader *codec.Reader, _ int) error {
+		if serviceIndex >= len(expectedServices) {
+			return fmt.Errorf("unexpected service index %d", serviceIndex)
+		}
+		service, program := expectedServices[serviceIndex], expectedPrograms[serviceIndex]
+		serviceIndex++
+		return serviceReader.Structure(func(item *codec.Reader) error {
+			if err := readService(item); err != nil {
+				return err
+			}
+			serviceEvents := 0
+			return item.Vector(1, maxPrograms, func(eventReader *codec.Reader, _ int) error {
+				serviceEvents++
+				eventCount++
+				if serviceEvents > 1 {
+					return fmt.Errorf("service events=%d", serviceEvents)
+				}
+				return readEventForService(eventReader, service, program)
+			})
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	wantRequested := []string{"1003", "1004", "1003", "1004"}
+	if err := reader.Exact(); err != nil || serviceIndex != 2 || eventCount != 2 || source.reads != 4 ||
+		!slices.Equal(source.requested, wantRequested) {
+		t.Fatalf("services=%d events=%d reads=%d requested=%v exact=%v", serviceIndex, eventCount, source.reads, source.requested, err)
+	}
+}
+
+func TestParseProgramQueryBoundaries(t *testing.T) {
+	valid := []int64{0, 1, 0, 2, 3, 4}
+	query, accepted := parseProgramQuery(valid)
+	if !accepted || len(query.serviceKeys) != 2 || query.start != 3 || query.end != 4 {
+		t.Fatalf("query=%+v accepted=%v", query, accepted)
+	}
+	all, accepted := parseProgramQuery(acceptedSelectors[:])
+	if !accepted || len(all.serviceKeys) != 0 {
+		t.Fatalf("all=%+v accepted=%v", all, accepted)
+	}
+	for name, selectors := range map[string][]int64{
+		"empty":             {},
+		"no service":        {1, 2},
+		"odd element count": {0, 1, 2, 3, 4},
+		"nonzero prefix":    {1, 1, 2, 3},
+		"negative service":  {0, -1, 2, 3},
+		"service one over":  {0, 0x1000000000000, 2, 3},
+		"duplicate service": {0, 1, 0, 1, 2, 3},
+		"negative start":    {0, 1, -1, 3},
+		"equal time":        {0, 1, 3, 3},
+		"reverse time":      {0, 1, 4, 3},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, accepted := parseProgramQuery(selectors); accepted {
+				t.Fatal("不正な指定が受理されました")
+			}
+		})
+	}
+	upper := make([]int64, 0, maxSelectorElements)
+	for index := range maxServices {
+		upper = append(upper, 0, int64(index))
+	}
+	upper = append(upper, 1, 2)
+	if query, accepted := parseProgramQuery(upper); !accepted || len(query.serviceKeys) != maxServices {
+		t.Fatalf("upper services=%d accepted=%v", len(query.serviceKeys), accepted)
+	}
+	oneOver := append([]int64(nil), upper[:len(upper)-2]...)
+	oneOver = append(oneOver, 0, maxServices, 1, 2)
+	if _, accepted := parseProgramQuery(oneOver); accepted {
+		t.Fatal("上限を一件超える指定が受理されました")
+	}
+}
+
+func TestHandlerRejectsMultipleServiceRequestShapeBeforeReadingSource(t *testing.T) {
+	source := &memorySource{snapshot: channel.Snapshot{Key: "guide"}}
+	handler, _ := NewHandler(source, codec.DefaultLimits())
+	oneOver := make([]int64, 0, maxSelectorElements+2)
+	for index := range maxServices + 1 {
+		oneOver = append(oneOver, 0, int64(index))
+	}
+	oneOver = append(oneOver, 1, 2)
+	wrongCount := guideRequestValues([]int64{0, 1, 0, 2, 3, 4})
+	binary.LittleEndian.PutUint32(wrongCount[12:16], 5)
+	for name, request := range map[string][]byte{
+		"no service":         guideRequestValues([]int64{1, 2}),
+		"odd selectors":      guideRequestValues([]int64{0, 1, 2, 3, 4}),
+		"wrong vector count": wrongCount,
+		"duplicate":          guideRequestValues([]int64{0, 1, 0, 1, 2, 3}),
+		"service one over":   guideRequestValues(oneOver),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := handler.Handle(context.Background(), request, io.Discard); err == nil {
+				t.Fatal("不正な複数サービス要求が受理されました")
+			}
+		})
+	}
+	if source.reads != 0 {
+		t.Fatalf("source reads=%d", source.reads)
+	}
+}
+
+func TestHandlerAcceptsMaximumKomorebiServiceCount(t *testing.T) {
+	selectors := make([]int64, 0, maxSelectorElements)
+	for index := range maxServices {
+		selectors = append(selectors, 0, int64(index))
+	}
+	selectors = append(selectors, 1, 2)
+	source := &memorySource{snapshot: channel.Snapshot{Key: "guide"}}
+	handler, _ := NewHandler(source, codec.DefaultLimits())
+	if err := handler.Handle(context.Background(), guideRequestValues(selectors), io.Discard); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func edcbFileTime(value time.Time) int64 {
 	return value.UnixMilli()*10_000 + fileTimeUnixEpoch + fileTimeJSTOffset
 }
@@ -241,11 +395,16 @@ func guideProgram(locator, eventLocator string, eventID int64) catalogmodel.Curr
 }
 
 func guideRequest(selectors [4]int64) []byte {
-	request := make([]byte, codec.HeaderSize+40)
+	return guideRequestValues(selectors[:])
+}
+
+func guideRequestValues(selectors []int64) []byte {
+	bodySize := 8 + 8*len(selectors)
+	request := make([]byte, codec.HeaderSize+bodySize)
 	binary.LittleEndian.PutUint32(request[0:4], uint32(Command))
-	binary.LittleEndian.PutUint32(request[4:8], 40)
-	binary.LittleEndian.PutUint32(request[8:12], 40)
-	binary.LittleEndian.PutUint32(request[12:16], 4)
+	binary.LittleEndian.PutUint32(request[4:8], uint32(bodySize))
+	binary.LittleEndian.PutUint32(request[8:12], uint32(bodySize))
+	binary.LittleEndian.PutUint32(request[12:16], uint32(len(selectors)))
 	for index, selector := range selectors {
 		binary.LittleEndian.PutUint64(request[16+index*8:24+index*8], uint64(selector))
 	}
@@ -275,8 +434,12 @@ func readService(reader *codec.Reader) error {
 }
 
 func readEvent(reader *codec.Reader, want catalogmodel.CurrentProgram) error {
+	return readEventForService(reader, guideService("", 1, 2, 3), want)
+}
+
+func readEventForService(reader *codec.Reader, service channel.Service, want catalogmodel.CurrentProgram) error {
 	return reader.Structure(func(item *codec.Reader) error {
-		for _, expected := range []uint16{1, 2, 3, uint16(*want.RawEventID)} {
+		for _, expected := range []uint16{service.NetworkID, service.TransportStreamID, service.ServiceID, uint16(*want.RawEventID)} {
 			value, err := item.U16()
 			if err != nil || value != expected {
 				return fmt.Errorf("id=%d want=%d err=%w", value, expected, err)

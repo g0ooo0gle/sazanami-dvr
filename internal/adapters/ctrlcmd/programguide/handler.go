@@ -24,6 +24,10 @@ const (
 	pageSize    = 256
 	responseCap = 256 * 1024 * 1024
 
+	minRequestBody      = 40
+	maxRequestBody      = 24 + 16*maxServices
+	maxSelectorElements = 2*maxServices + 2
+
 	fileTimeUnixEpoch = int64(116_444_736_000_000_000)
 	fileTimeJSTOffset = int64(9 * time.Hour / (100 * time.Nanosecond))
 )
@@ -31,11 +35,12 @@ const (
 var acceptedSelectors = [...]int64{0xffffffffffff, 0xffffffffffff, 1, 0x7fffffffffffffff}
 var japanStandardTime = time.FixedZone("Asia/Tokyo", 9*60*60)
 
+// programQueryは1029で選ぶサービスと共通時刻範囲を保持する。
+// serviceKeysが空ならKonomiTVの全件指定を表し、時刻範囲を適用しない。
 type programQuery struct {
-	exactService bool
-	serviceKey   uint64
-	start        int64
-	end          int64
+	serviceKeys map[uint64]struct{}
+	start       int64
+	end         int64
 }
 
 // Sourceは起動時に固定したチャンネルと完成済み番組表だけを返す。
@@ -68,17 +73,20 @@ func (handler *Handler) Handle(ctx context.Context, request []byte, destination 
 	if err != nil {
 		return err
 	}
-	if frame.Code != Command || len(frame.Body) != 40 {
+	if frame.Code != Command || len(frame.Body) < minRequestBody || (len(frame.Body)-24)%16 != 0 {
 		return failure(codec.Malformed, "program-request-shape", int64(len(frame.Body)))
+	}
+	if len(frame.Body) > maxRequestBody {
+		return failure(codec.OverLimit, "program-request-services", int64(len(frame.Body)))
 	}
 	reader, err := codec.NewReader(frame.Body, handler.Limits)
 	if err != nil {
 		return err
 	}
-	selectors := [4]int64{}
-	if err := reader.Vector(8, len(selectors), func(item *codec.Reader, index int) error {
+	selectors := make([]int64, 0, 4)
+	if err := reader.Vector(8, maxSelectorElements, func(item *codec.Reader, _ int) error {
 		value, readErr := item.I64()
-		selectors[index] = value
+		selectors = append(selectors, value)
 		return readErr
 	}); err != nil {
 		return err
@@ -129,31 +137,52 @@ func (handler *Handler) Handle(ctx context.Context, request []byte, destination 
 	})
 }
 
-// parseProgramQueryは、KonomiTVが使う全件取得と単一サービス・開始時刻範囲の二形式だけを受理する。
-func parseProgramQuery(selectors [4]int64) (programQuery, bool) {
-	if selectors == acceptedSelectors {
+// parseProgramQueryは、KonomiTVの全件指定とKomorebiの上限付きサービス指定だけを受理する。
+func parseProgramQuery(selectors []int64) (programQuery, bool) {
+	if len(selectors) == len(acceptedSelectors) && selectors[0] == acceptedSelectors[0] &&
+		selectors[1] == acceptedSelectors[1] && selectors[2] == acceptedSelectors[2] &&
+		selectors[3] == acceptedSelectors[3] {
 		return programQuery{}, true
 	}
-	if selectors[0] != 0 || selectors[1] < 0 || selectors[1] > 0xffffffffffff ||
-		selectors[2] < 0 || selectors[2] >= selectors[3] {
+	if len(selectors) < 4 || len(selectors)%2 != 0 {
 		return programQuery{}, false
 	}
+	serviceCount := (len(selectors) - 2) / 2
+	if serviceCount < 1 || serviceCount > maxServices {
+		return programQuery{}, false
+	}
+	start, end := selectors[len(selectors)-2], selectors[len(selectors)-1]
+	if start < 0 || start >= end {
+		return programQuery{}, false
+	}
+	serviceKeys := make(map[uint64]struct{}, serviceCount)
+	for index := 0; index < len(selectors)-2; index += 2 {
+		value := selectors[index+1]
+		if selectors[index] != 0 || value < 0 || value > 0xffffffffffff {
+			return programQuery{}, false
+		}
+		key := uint64(value)
+		if _, duplicate := serviceKeys[key]; duplicate {
+			return programQuery{}, false
+		}
+		serviceKeys[key] = struct{}{}
+	}
 	return programQuery{
-		exactService: true,
-		serviceKey:   uint64(selectors[1]),
-		start:        selectors[2],
-		end:          selectors[3],
+		serviceKeys: serviceKeys,
+		start:       start,
+		end:         end,
 	}, true
 }
 
+// selectServicesは共有スナップショットを変更せず、要求されたサービスだけを新しいsliceへ集める。
 func selectServices(services []channel.Service, query programQuery) []channel.Service {
-	if !query.exactService {
+	if len(query.serviceKeys) == 0 {
 		return services
 	}
-	selected := services[:0]
+	selected := make([]channel.Service, 0, min(len(services), len(query.serviceKeys)))
 	for _, service := range services {
 		key := uint64(service.NetworkID)<<32 | uint64(service.TransportStreamID)<<16 | uint64(service.ServiceID)
-		if key == query.serviceKey {
+		if _, wanted := query.serviceKeys[key]; wanted {
 			selected = append(selected, service)
 		}
 	}
@@ -215,7 +244,7 @@ func measure(ctx context.Context, source Source, services []channel.Service, que
 }
 
 func programMatchesQuery(program catalogmodel.CurrentProgram, query programQuery) bool {
-	if !query.exactService {
+	if len(query.serviceKeys) == 0 {
 		return true
 	}
 	start := program.Material.StartUTCMS
