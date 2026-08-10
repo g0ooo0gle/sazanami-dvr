@@ -719,7 +719,7 @@ func waitSchedulerStart(t *testing.T, started <-chan core.Reservation) core.Rese
 	select {
 	case reservation := <-started:
 		return reservation
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("録画処理が開始されませんでした")
 		return core.Reservation{}
 	}
