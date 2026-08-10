@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"time"
 
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/autoreservation"
+	"github.com/g0ooo0gle/sazanami-dvr/internal/core/catalogmodel"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/recording"
 )
 
@@ -186,6 +188,27 @@ func (store *Store) CreateAutomaticReservation(ctx context.Context, ruleNumber i
 		return recording.Reservation{}, sanitize("commit-automatic-reservation", err)
 	}
 	return created, nil
+}
+
+// DisableAutomaticReservationは同じ番組へ自動予約が作られている場合だけ、録画開始前に無効へ変える。
+// 手動予約、終了予約、録画処理を開始した予約は変更しない。
+func (store *Store) DisableAutomaticReservation(ctx context.Context, programID catalogmodel.ID,
+	now time.Time,
+) (bool, error) {
+	if store == nil || store.writer == nil || ctx == nil || programID == (catalogmodel.ID{}) ||
+		now.IsZero() || now.Location() != time.UTC || now.UnixMilli() < 0 {
+		return false, errors.New("sqlite: invalid automatic reservation disable")
+	}
+	result, err := store.writer.ExecContext(ctx, `UPDATE reservations SET enabled=0,
+		version=version+1, updated_at_utc_ms=? WHERE id=(
+			SELECT reservation_id FROM automatic_reservation_matches WHERE program_instance_id=?
+		) AND state='ACTIVE' AND enabled=1 AND NOT EXISTS (
+			SELECT 1 FROM recording_attempts WHERE recording_attempts.reservation_id=reservations.id
+		)`, now.UnixMilli(), programID.Bytes())
+	if err != nil {
+		return false, sanitize("disable-automatic-reservation", err)
+	}
+	return affected(result) == 1, nil
 }
 
 func encodeAutomaticRule(rule autoreservation.Rule) (string, string, error) {
