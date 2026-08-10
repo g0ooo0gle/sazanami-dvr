@@ -104,8 +104,8 @@ func observeAutomaticReservation(stdout, stderr io.Writer) func(autoreservationa
 			fmt.Fprintf(stderr, "automatic_reservation result=failed reason=evaluation-failed duration_ms=%d\n", duration.Milliseconds())
 			return
 		}
-		fmt.Fprintf(stdout, "automatic_reservation result=completed rules=%d programs=%d matched=%d created=%d duplicates=%d unavailable_rules=%d limit_reached=%t duration_ms=%d\n",
-			result.Rules, result.Programs, result.Matched, result.Created, result.Duplicates,
+		fmt.Fprintf(stdout, "automatic_reservation result=completed rules=%d programs=%d matched=%d created=%d duplicates=%d recorded_title_matches=%d unavailable_rules=%d limit_reached=%t duration_ms=%d\n",
+			result.Rules, result.Programs, result.Matched, result.Created, result.Duplicates, result.RecordedTitleMatches,
 			result.UnavailableRules, result.LimitReached, duration.Milliseconds())
 	}
 }

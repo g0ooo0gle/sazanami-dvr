@@ -24,7 +24,9 @@ type Catalog interface {
 // EvaluationStoreは規則読出しと規則に結び付く予約のtransaction保存を提供する。
 type EvaluationStore interface {
 	AutomaticRules(context.Context, int, int32) ([]autoreservation.Rule, error)
+	RecordingHistory(context.Context, int, int32) ([]recording.HistoryItem, error)
 	CreateAutomaticReservation(context.Context, int32, recording.Reservation) (recording.Reservation, error)
+	DisableAutomaticReservation(context.Context, catalogmodel.ID, time.Time) (bool, error)
 }
 
 // DuplicateErrorはDBが同じ番組の予約履歴を検出したかを判定する。
@@ -34,6 +36,7 @@ type DuplicateError func(error) bool
 type Result struct {
 	Rules, Programs, Comparisons int
 	Matched, Created, Duplicates int
+	RecordedTitleMatches         int
 	UnavailableRules             int
 	LimitReached                 bool
 }
@@ -46,7 +49,7 @@ type Evaluator struct {
 	NewID                       func() (catalogmodel.ID, error)
 	IsDuplicate                 DuplicateError
 	ValidatePostRecordingScript func(string) error
-	OnCreated                   func()
+	OnChanged                   func()
 }
 
 type preparedRule struct {
@@ -82,6 +85,10 @@ func (evaluator Evaluator) Run(ctx context.Context) (Result, error) {
 		if prepared[index].unavailable {
 			result.UnavailableRules++
 		}
+	}
+	recordedTitles, err := loadRecordedTitleIndex(ctx, evaluator.Store, prepared)
+	if err != nil {
+		return result, err
 	}
 	programs, err := countPrograms(ctx, evaluator.Catalog, now, now.Add(evaluationWindow))
 	if err != nil {
@@ -126,6 +133,11 @@ func (evaluator Evaluator) Run(ctx context.Context) (Result, error) {
 			if request.Validate() != nil || !matchService(candidate.rule.Search.Services, request) {
 				continue
 			}
+			recordedTitleMatch := recordedTitles.matches(candidate.rule.Search, request, program)
+			if recordedTitleMatch {
+				request.Disabled = true
+				result.RecordedTitleMatches++
+			}
 			result.Matched++
 			if result.Created == autoreservation.MaxReservationsPerRun {
 				result.LimitReached = true
@@ -149,13 +161,24 @@ func (evaluator Evaluator) Run(ctx context.Context) (Result, error) {
 			if err != nil {
 				if evaluator.IsDuplicate(err) {
 					result.Duplicates++
+					if recordedTitleMatch {
+						changed, disableErr := evaluator.Store.DisableAutomaticReservation(
+							ctx, snapshot.ProgramInstanceID, now,
+						)
+						if disableErr != nil {
+							return errors.New("autoreservation: disable reservation failed")
+						}
+						if changed && evaluator.OnChanged != nil {
+							evaluator.OnChanged()
+						}
+					}
 					return nil
 				}
 				return errors.New("autoreservation: create reservation failed")
 			}
 			result.Created++
-			if evaluator.OnCreated != nil {
-				evaluator.OnCreated()
+			if evaluator.OnChanged != nil {
+				evaluator.OnChanged()
 			}
 			return nil
 		}
@@ -248,7 +271,7 @@ func prepareRule(rule autoreservation.Rule, validateScript func(string) error) p
 		prepared.skip = true
 		return prepared
 	}
-	if search.CheckRecordedTitle || (settings.Mode != 1 && settings.Mode != 5) || settings.Exact ||
+	if (settings.Mode != 1 && settings.Mode != 5) || settings.Exact ||
 		(settings.Suspend != 0 && settings.Suspend != 4) || settings.Reboot ||
 		settings.Continue || settings.PartialMode != 0 || settings.TunerID != 0 || len(settings.PartialFolders) != 0 {
 		prepared.unavailable = true

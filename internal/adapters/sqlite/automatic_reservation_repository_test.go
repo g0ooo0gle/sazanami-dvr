@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/autoreservation"
+	"github.com/g0ooo0gle/sazanami-dvr/internal/core/recording"
 )
 
 func TestAutomaticRuleRoundTripAndDelete(t *testing.T) {
@@ -120,6 +121,95 @@ func TestAutomaticReservationIsAtomicAndNeverDuplicatesHistory(t *testing.T) {
 	if _, err := store.CreateAutomaticReservation(context.Background(), replacement.Number, duplicate); !errors.Is(err, ErrAutomaticReservationDuplicate) {
 		t.Fatalf("finished history err=%v", err)
 	}
+}
+
+func TestDisableAutomaticReservationOnlyBeforeRecordingStarts(t *testing.T) {
+	createAutomatic := func(t *testing.T, store *Store) recording.Reservation {
+		t.Helper()
+		rule, err := store.CreateAutomaticRule(context.Background(), autoreservation.Rule{
+			ID: testID(t, 210), Version: 1, CreatedAtUTCMS: 1, UpdatedAtUTCMS: 1,
+			Search:    autoreservation.SearchCondition{Enabled: true},
+			Recording: autoreservation.RecordingSettings{Mode: 1, Priority: 3},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		created, err := store.CreateAutomaticReservation(context.Background(), rule.Number, reservationForTest(t, store))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return created
+	}
+
+	t.Run("before recording", func(t *testing.T) {
+		_, store := openMigratedStore(t)
+		created := createAutomatic(t, store)
+		now := created.CreatedAt.Add(time.Second)
+		changed, err := store.DisableAutomaticReservation(context.Background(), created.Program.ProgramInstanceID, now)
+		if err != nil || !changed {
+			t.Fatalf("changed=%t err=%v", changed, err)
+		}
+		changed, err = store.DisableAutomaticReservation(context.Background(), created.Program.ProgramInstanceID, now.Add(time.Second))
+		if err != nil || changed {
+			t.Fatalf("second changed=%t err=%v", changed, err)
+		}
+		items, err := store.ActiveReservations(context.Background(), 1, 0)
+		if err != nil || len(items) != 1 || !items[0].Disabled {
+			t.Fatalf("items=%+v err=%v", items, err)
+		}
+	})
+
+	t.Run("recording started", func(t *testing.T) {
+		_, store := openMigratedStore(t)
+		created := createAutomatic(t, store)
+		now := created.CreatedAt.Add(time.Minute)
+		if _, err := store.ClaimRecording(context.Background(), recording.ClaimRequest{
+			ReservationID: created.ID, AttemptID: testID(t, 211), SegmentID: testID(t, 212),
+			OwnerID: testID(t, 213), OwnerGeneration: 1, Now: now,
+			Plan: recording.FilePlan{PartialPath: "automatic/started.ts.partial", FinalPath: "automatic/started.ts"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		changed, err := store.DisableAutomaticReservation(context.Background(), created.Program.ProgramInstanceID, now.Add(time.Second))
+		if err != nil || changed {
+			t.Fatalf("changed=%t err=%v", changed, err)
+		}
+		items, err := store.ActiveReservations(context.Background(), 1, 0)
+		if err != nil || len(items) != 1 || items[0].Disabled {
+			t.Fatalf("items=%+v err=%v", items, err)
+		}
+	})
+
+	t.Run("finished reservation", func(t *testing.T) {
+		_, store := openMigratedStore(t)
+		created := createAutomatic(t, store)
+		now := created.CreatedAt.Add(time.Minute)
+		if err := store.CancelReservation(context.Background(), created.Number, now); err != nil {
+			t.Fatal(err)
+		}
+		changed, err := store.DisableAutomaticReservation(context.Background(), created.Program.ProgramInstanceID,
+			now.Add(time.Second))
+		if err != nil || changed {
+			t.Fatalf("changed=%t err=%v", changed, err)
+		}
+	})
+
+	t.Run("manual reservation", func(t *testing.T) {
+		_, store := openMigratedStore(t)
+		created, err := store.CreateReservation(context.Background(), reservationForTest(t, store))
+		if err != nil {
+			t.Fatal(err)
+		}
+		changed, err := store.DisableAutomaticReservation(context.Background(), created.Program.ProgramInstanceID,
+			created.CreatedAt.Add(time.Second))
+		if err != nil || changed {
+			t.Fatalf("changed=%t err=%v", changed, err)
+		}
+		items, err := store.ActiveReservations(context.Background(), 1, 0)
+		if err != nil || len(items) != 1 || items[0].Disabled {
+			t.Fatalf("items=%+v err=%v", items, err)
+		}
+	})
 }
 
 func TestAutomaticRuleLimitAndNumbersAreNotReused(t *testing.T) {

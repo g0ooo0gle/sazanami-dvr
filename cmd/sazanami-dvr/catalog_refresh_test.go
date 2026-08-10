@@ -223,10 +223,11 @@ func TestAutomaticReservationOutputIsBoundedAndRedacted(t *testing.T) {
 	var output, diagnostic bytes.Buffer
 	observe := observeAutomaticReservation(&output, &diagnostic)
 	observe(autoreservationapp.Result{
-		Rules: 2, Programs: 3, Matched: 4, Created: 5, Duplicates: 6, UnavailableRules: 7, LimitReached: true,
+		Rules: 2, Programs: 3, Matched: 4, Created: 5, Duplicates: 6, RecordedTitleMatches: 7,
+		UnavailableRules: 8, LimitReached: true,
 	}, nil, 8*time.Millisecond)
 	observe(autoreservationapp.Result{}, errors.New("private program and path"), 9*time.Millisecond)
-	wantOutput := "automatic_reservation result=completed rules=2 programs=3 matched=4 created=5 duplicates=6 unavailable_rules=7 limit_reached=true duration_ms=8\n"
+	wantOutput := "automatic_reservation result=completed rules=2 programs=3 matched=4 created=5 duplicates=6 recorded_title_matches=7 unavailable_rules=8 limit_reached=true duration_ms=8\n"
 	wantDiagnostic := "automatic_reservation result=failed reason=evaluation-failed duration_ms=9\n"
 	if output.String() != wantOutput || diagnostic.String() != wantDiagnostic {
 		t.Fatalf("output=%q diagnostic=%q", output.String(), diagnostic.String())

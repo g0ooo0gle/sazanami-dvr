@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,10 +16,16 @@ import (
 var errDuplicateForTest = errors.New("duplicate")
 
 type evaluationStore struct {
-	rules       []autoreservation.Rule
-	created     []recording.Reservation
-	ruleNumbers []int32
-	seen        map[catalogmodel.ID]struct{}
+	rules                      []autoreservation.Rule
+	created                    []recording.Reservation
+	ruleNumbers                []int32
+	seen                       map[catalogmodel.ID]struct{}
+	history                    []recording.HistoryItem
+	historyRead                func(context.Context, int, int32) ([]recording.HistoryItem, error)
+	historyCalls, disableCalls int
+	disableResult              bool
+	disableErr                 error
+	disabledPrograms           []catalogmodel.ID
 }
 
 func (store *evaluationStore) AutomaticRules(_ context.Context, limit int, after int32) ([]autoreservation.Rule, error) {
@@ -39,6 +46,31 @@ func (store *evaluationStore) CreateAutomaticReservation(_ context.Context, rule
 	store.created = append(store.created, value)
 	store.ruleNumbers = append(store.ruleNumbers, ruleNumber)
 	return value, nil
+}
+
+func (store *evaluationStore) RecordingHistory(ctx context.Context, limit int, before int32) ([]recording.HistoryItem, error) {
+	store.historyCalls++
+	if store.historyRead != nil {
+		return store.historyRead(ctx, limit, before)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	result := make([]recording.HistoryItem, 0, limit)
+	for _, item := range store.history {
+		if (before == 0 || item.Number < before) && len(result) < limit {
+			result = append(result, item)
+		}
+	}
+	return result, nil
+}
+
+func (store *evaluationStore) DisableAutomaticReservation(_ context.Context, programID catalogmodel.ID,
+	_ time.Time,
+) (bool, error) {
+	store.disableCalls++
+	store.disabledPrograms = append(store.disabledPrograms, programID)
+	return store.disableResult, store.disableErr
 }
 
 type evaluationCatalog struct{ programs []catalogmodel.CurrentProgram }
@@ -86,7 +118,7 @@ func TestEvaluatorCreatesOnceAndSkipsUnavailableRule(t *testing.T) {
 		storedRule(1, autoreservation.SearchCondition{Enabled: true, Keyword: "morning news", Exclude: "sports",
 			Services:   []autoreservation.ServiceRange{{NetworkID: 1, TransportStreamID: 2, ServiceID: 3}},
 			FreeAccess: 1}),
-		storedRule(2, autoreservation.SearchCondition{Enabled: true, Keyword: "news", CheckRecordedTitle: true}),
+		storedRule(2, autoreservation.SearchCondition{Enabled: true, Keyword: "[", Regex: true}),
 	}
 	programs := []catalogmodel.CurrentProgram{
 		currentProgram(1, now.Add(time.Hour), "Morning News", "headlines", catalogmodel.FreeYes),
@@ -212,7 +244,9 @@ func TestUnsupportedRulesAreUnavailable(t *testing.T) {
 	cases["invalid-regexp"] = invalidRegex
 	recorded := base
 	recorded.Search.CheckRecordedTitle = true
-	cases["recorded-title"] = recorded
+	if prepared := prepareRule(recorded, nil); prepared.unavailable {
+		t.Fatal("録画済み番組名の条件が判定不能です")
+	}
 	unsafeRecording := base
 	unsafeRecording.Recording.Folders = []autoreservation.Folder{{Path: "custom"}}
 	cases["recording-setting"] = unsafeRecording
@@ -228,6 +262,88 @@ func TestUnsupportedRulesAreUnavailable(t *testing.T) {
 				t.Fatalf("rule=%+v", rule)
 			}
 		})
+	}
+}
+
+func TestEvaluatorCreatesDisabledReservationForRecordedTitle(t *testing.T) {
+	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+	programStart := now.Add(time.Hour)
+	rule := storedRule(1, autoreservation.SearchCondition{
+		Enabled: true, CheckRecordedTitle: true, CheckRecordedDays: 6,
+	})
+	store := &evaluationStore{
+		rules: []autoreservation.Rule{rule}, seen: make(map[catalogmodel.ID]struct{}),
+		history: []recording.HistoryItem{historyItemForEvaluation(1, "番組", programStart.Add(-24*time.Hour), 1, 2, 3)},
+	}
+	result, err := (Evaluator{
+		Store: store, Catalog: evaluationCatalog{programs: []catalogmodel.CurrentProgram{
+			currentProgram(1, programStart, "番組", "", catalogmodel.FreeYes),
+		}}, Clock: fixedClock{now},
+		NewID:       func() (catalogmodel.ID, error) { return catalogmodel.ID{10}, nil },
+		IsDuplicate: func(error) bool { return false },
+	}).Run(context.Background())
+	if err != nil || result.Created != 1 || result.RecordedTitleMatches != 1 || store.historyCalls != 1 ||
+		len(store.created) != 1 || !store.created[0].Disabled {
+		t.Fatalf("result=%+v history_calls=%d created=%+v err=%v", result, store.historyCalls, store.created, err)
+	}
+}
+
+func TestEvaluatorDisablesExistingAutomaticReservationForRecordedTitle(t *testing.T) {
+	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+	programStart := now.Add(time.Hour)
+	programID := catalogmodel.ID{1}
+	store := &evaluationStore{
+		rules: []autoreservation.Rule{storedRule(1, autoreservation.SearchCondition{
+			Enabled: true, CheckRecordedTitle: true, CheckRecordedDays: 6,
+		})},
+		seen: map[catalogmodel.ID]struct{}{programID: {}}, disableResult: true,
+		history: []recording.HistoryItem{historyItemForEvaluation(1, "番組", programStart.Add(-time.Hour), 1, 2, 3)},
+	}
+	changedNotifications := 0
+	evaluator := Evaluator{
+		Store: store, Catalog: evaluationCatalog{programs: []catalogmodel.CurrentProgram{
+			currentProgram(1, programStart, "番組", "", catalogmodel.FreeYes),
+		}}, Clock: fixedClock{now},
+		NewID:       func() (catalogmodel.ID, error) { return catalogmodel.ID{10}, nil },
+		IsDuplicate: func(err error) bool { return errors.Is(err, errDuplicateForTest) },
+		OnChanged:   func() { changedNotifications++ },
+	}
+	result, err := evaluator.Run(context.Background())
+	if err != nil || result.Created != 0 || result.Duplicates != 1 || result.RecordedTitleMatches != 1 ||
+		store.disableCalls != 1 || changedNotifications != 1 || len(store.disabledPrograms) != 1 ||
+		store.disabledPrograms[0] != programID {
+		t.Fatalf("result=%+v disable_calls=%d programs=%v err=%v", result, store.disableCalls, store.disabledPrograms, err)
+	}
+	store.disableErr = errors.New("private database error")
+	if _, err := evaluator.Run(context.Background()); err == nil || strings.Contains(err.Error(), "private") {
+		t.Fatalf("disable err=%v", err)
+	}
+}
+
+func TestEvaluatorReadsRecordedTitlesBeforeWritingReservations(t *testing.T) {
+	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+	idCalls := 0
+	store := &evaluationStore{
+		rules: []autoreservation.Rule{storedRule(1, autoreservation.SearchCondition{
+			Enabled: true, CheckRecordedTitle: true, CheckRecordedDays: 6,
+		})}, seen: make(map[catalogmodel.ID]struct{}),
+		historyRead: func(context.Context, int, int32) ([]recording.HistoryItem, error) {
+			return nil, errors.New("private database error")
+		},
+	}
+	result, err := (Evaluator{
+		Store: store, Catalog: evaluationCatalog{programs: []catalogmodel.CurrentProgram{
+			currentProgram(1, now.Add(time.Hour), "番組", "", catalogmodel.FreeYes),
+		}}, Clock: fixedClock{now},
+		NewID: func() (catalogmodel.ID, error) {
+			idCalls++
+			return catalogmodel.ID{10}, nil
+		},
+		IsDuplicate: func(error) bool { return false },
+	}).Run(context.Background())
+	if err == nil || strings.Contains(err.Error(), "private") || result.Created != 0 || idCalls != 0 ||
+		len(store.created) != 0 {
+		t.Fatalf("result=%+v id_calls=%d created=%d err=%v", result, idCalls, len(store.created), err)
 	}
 }
 
@@ -325,5 +441,20 @@ func currentProgram(event int, start time.Time, title, description string,
 		ServiceLocator: "1", EventLocator: fmt.Sprintf("%06d", event), RawEventID: &rawEvent,
 		Material: catalogmodel.RevisionMaterial{StartUTCMS: &startMS, DurationMS: &durationMS,
 			Title: &title, Description: &description, FreeAccess: free, Validation: catalogmodel.ValidationValid},
+	}
+}
+
+func historyItemForEvaluation(number int32, title string, start time.Time,
+	networkID, transportStreamID, serviceID uint16,
+) recording.HistoryItem {
+	return recording.HistoryItem{
+		Number: number, State: recording.AttemptSucceeded, Reason: recording.ReasonCompleted,
+		Title: title, StationName: "局", NetworkID: networkID, TransportStreamID: transportStreamID,
+		ServiceID: serviceID, EventID: uint16(number), PlannedStart: start, PlannedEnd: start.Add(time.Hour),
+		ByteCount: 188, Plan: recording.FilePlan{
+			PartialPath: fmt.Sprintf("history/%d.ts.partial", number),
+			FinalPath:   fmt.Sprintf("history/%d.ts", number),
+		}, SegmentState: recording.SegmentFinalized, Availability: recording.AvailabilityFinal,
+		FileSynced: true, FinalPublished: true, DirectorySynced: true,
 	}
 }

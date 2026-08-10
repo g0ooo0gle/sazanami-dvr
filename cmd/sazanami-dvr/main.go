@@ -38,7 +38,7 @@ import (
 )
 
 var (
-	version       = "0.0.26"
+	version       = "0.0.27"
 	productCommit = ""
 )
 
@@ -312,7 +312,7 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 				Store: store, Catalog: snapshots.Load(), Clock: recordingClock, NewID: catalogmodel.NewID,
 				IsDuplicate:                 func(err error) bool { return errors.Is(err, sqliteadapter.ErrAutomaticReservationDuplicate) },
 				ValidatePostRecordingScript: postRecordingDirectory.Validate,
-				OnCreated:                   scheduler.Notify,
+				OnChanged:                   scheduler.Notify,
 			}).Run(evaluationContext)
 		},
 		observeAutomatic: observeAutomaticReservation(stdout, stderr),
