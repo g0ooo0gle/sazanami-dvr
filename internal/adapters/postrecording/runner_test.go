@@ -152,8 +152,12 @@ func TestCancellationStopsChildProcessGroup(t *testing.T) {
 		})
 	}()
 	startDeadline := time.Now().Add(10 * time.Second)
+	pid := 0
 	for {
-		if _, err := os.Stat(pidFile); err == nil {
+		data, readErr := os.ReadFile(pidFile)
+		value, parseErr := strconv.Atoi(string(data))
+		if readErr == nil && parseErr == nil && value > 0 {
+			pid = value
 			break
 		}
 		if time.Now().After(startDeadline) {
@@ -165,14 +169,6 @@ func TestCancellationStopsChildProcessGroup(t *testing.T) {
 	cancel()
 	if reason := <-reasonResult; reason != ReasonCancelled {
 		t.Fatalf("reason=%q", reason)
-	}
-	data, err := os.ReadFile(pidFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pid, err := strconv.Atoi(string(data))
-	if err != nil || pid < 1 {
-		t.Fatalf("pid=%q err=%v", data, err)
 	}
 	deadline := time.Now().Add(time.Second)
 	for syscall.Kill(pid, 0) == nil && time.Now().Before(deadline) {
