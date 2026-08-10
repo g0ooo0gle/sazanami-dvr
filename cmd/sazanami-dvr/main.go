@@ -181,6 +181,7 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 		return errorsStable("post-recording-script-root-unavailable")
 	}
 	postRecordingRunner := postrecordingadapter.Runner{Directory: postRecordingDirectory, Timeout: postrecordingadapter.DefaultTimeout}
+	postRecordingPower := postrecordingadapter.NewPowerController()
 	snapshot, err := ctrlcmdruntime.BuildSnapshot(startupContext, *dataRoot, *channelMap, store)
 	if err != nil {
 		return err
@@ -244,6 +245,11 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	scheduler, err := recordingapp.NewScheduler(store, executor, recordingClock, *maximumRecordings)
 	if err != nil {
 		return errorsStable("recording-scheduler-invalid")
+	}
+	if err := scheduler.SetPostRecordingPower(postRecordingPower, func(reason string) {
+		fmt.Fprintf(stderr, "録画後の電源動作を完了できませんでした: %s\n", reason)
+	}); err != nil {
+		return errorsStable("post-recording-power-controller-invalid")
 	}
 	reservations := recordingapp.ReservationService{
 		Catalog: snapshots, Store: store, Clock: recordingClock, NewID: catalogmodel.NewID,

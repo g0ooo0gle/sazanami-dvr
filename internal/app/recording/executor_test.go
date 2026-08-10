@@ -882,7 +882,9 @@ func TestPostRecordingRunsOnlyAfterSuccessfulFinalization(t *testing.T) {
 	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
 	store := &attemptMemory{start: start, end: start.Add(time.Hour)}
 	attempt := core.Attempt{ID: appID(t, 83), Plan: core.FilePlan{PartialPath: "2026/08/test.part", FinalPath: "2026/08/test.ts"}}
-	reservation := core.Reservation{Number: 17, PostRecording: core.PostRecordingSettings{Script: "/allowed/finish.sh"}}
+	reservation := core.Reservation{Number: 17, PostRecording: core.PostRecordingSettings{
+		Mode: core.PostRecordingStandby, Script: "/allowed/finish.sh",
+	}}
 	called := 0
 	observed := ""
 	executor := Executor{
@@ -906,7 +908,8 @@ func TestPostRecordingRunsOnlyAfterSuccessfulFinalization(t *testing.T) {
 	}
 	result, err := executor.publishAndPostProcess(context.Background(), reservation, attempt, 188,
 		core.AttemptSucceeded, core.ReasonCompleted)
-	if err != nil || result.State != core.AttemptSucceeded || called != 1 || observed != "post-recording-script-exit-failed" {
+	if err != nil || result.State != core.AttemptSucceeded || result.PostRecording != core.PostRecordingStandby ||
+		called != 1 || observed != "post-recording-script-exit-failed" {
 		t.Fatalf("result=%+v called=%d observed=%q err=%v", result, called, observed, err)
 	}
 }
@@ -930,11 +933,17 @@ func TestPostRecordingIsSkippedWithoutScriptOrWhenPublicationFails(t *testing.T)
 					FinalPath: func(core.FilePlan) (string, error) { return "/recordings/test.ts", nil }},
 				PostRecording: func(context.Context, PostRecordingRequest) string { called++; return "" },
 			}
-			_, _ = executor.publishAndPostProcess(context.Background(), core.Reservation{
-				Number: 1, PostRecording: core.PostRecordingSettings{Script: test.script},
+			result, resultErr := executor.publishAndPostProcess(context.Background(), core.Reservation{
+				Number: 1, PostRecording: core.PostRecordingSettings{Mode: core.PostRecordingShutdown, Script: test.script},
 			}, core.Attempt{ID: appID(t, 86)}, 188, core.AttemptSucceeded, core.ReasonCompleted)
 			if called != 0 {
 				t.Fatalf("post recording calls=%d", called)
+			}
+			if test.linkErr == nil && (resultErr != nil || result.PostRecording != core.PostRecordingShutdown) {
+				t.Fatalf("result=%+v err=%v", result, resultErr)
+			}
+			if test.linkErr != nil && result.PostRecording.ChangesPower() {
+				t.Fatalf("publication failure returned power candidate: %+v", result)
 			}
 		})
 	}

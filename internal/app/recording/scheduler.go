@@ -15,6 +15,8 @@ const (
 	maximumWakeSize                    = 1
 	DefaultMaximumConcurrentRecordings = 1
 	MaximumConcurrentRecordings        = 8
+	postRecordingMinimumIdle           = 10 * time.Minute
+	postRecordingWakeMargin            = 5 * time.Minute
 )
 
 // ScheduleStoreは無効予約の期限処理と、まだ録画処理を持たない次の有効予約を提供する。
@@ -43,6 +45,18 @@ type ScheduleClock interface {
 	NewTimer(time.Duration) Timer
 }
 
+// PostRecordingPowerは検証済みの電源動作を、任意のRTC復帰時刻とともに一度実行する。
+// 結果には利用者へ示せる固定診断だけを含める。
+type PostRecordingPower interface {
+	Execute(context.Context, core.PostRecordingMode, *time.Time) PostRecordingPowerResult
+}
+
+// PostRecordingPowerResultは主処理とRTC alarm解除の固定診断を分けて返す。
+type PostRecordingPowerResult struct {
+	Reason        string
+	CleanupReason string
+}
+
 // SystemClockはOSの現在時刻と、単調時刻を含むタイマーを使う実行時時計である。
 type SystemClock struct{}
 
@@ -68,9 +82,20 @@ type Scheduler struct {
 	maximumConcurrent int
 	wake              chan struct{}
 	stops             *stopRegistry
+	postPower         PostRecordingPower
+	observePostPower  func(string)
 }
 
-type executionCompletion struct{ err error }
+type executionCompletion struct {
+	result Result
+	err    error
+}
+
+type postRecordingPowerCandidate struct {
+	mode     core.PostRecordingMode
+	present  bool
+	conflict bool
+}
 
 // NewSchedulerは既定一件、最大八件の範囲で録画を実行するschedulerを作る。
 func NewScheduler(store ScheduleStore, executor ReservationExecutor, clock ScheduleClock, maximumConcurrent int) (*Scheduler, error) {
@@ -82,6 +107,16 @@ func NewScheduler(store ScheduleStore, executor ReservationExecutor, clock Sched
 		store: store, executor: executor, clock: clock, maximumConcurrent: maximumConcurrent,
 		wake: make(chan struct{}, maximumWakeSize), stops: newStopRegistry(maximumConcurrent),
 	}, nil
+}
+
+// SetPostRecordingPowerはscheduler開始前にLinux電源adapterと固定診断の通知先を接続する。
+func (scheduler *Scheduler) SetPostRecordingPower(controller PostRecordingPower, observer func(string)) error {
+	if scheduler == nil || controller == nil {
+		return errors.New("recording: invalid post-recording power controller")
+	}
+	scheduler.postPower = controller
+	scheduler.observePostPower = observer
+	return nil
 }
 
 // NotifyStopはDBへ確定済みの利用者停止を、対象の実行中録画だけへ通知する。
@@ -114,6 +149,7 @@ func (scheduler *Scheduler) Run(ctx context.Context) error {
 	defer cancelExecutions()
 	completed := make(chan executionCompletion, scheduler.maximumConcurrent)
 	active := 0
+	pendingPower := postRecordingPowerCandidate{}
 	for {
 		select {
 		case completion := <-completed:
@@ -121,6 +157,7 @@ func (scheduler *Scheduler) Run(ctx context.Context) error {
 			if completion.err != nil {
 				return scheduler.stopExecutions(cancelExecutions, completed, active, completion.err)
 			}
+			pendingPower.add(completion.result.PostRecording)
 			continue
 		default:
 		}
@@ -152,6 +189,19 @@ func (scheduler *Scheduler) Run(ctx context.Context) error {
 			}
 			return scheduler.stopExecutions(cancelExecutions, completed, active, errors.New("recording: read next reservation"))
 		}
+		if active == 0 && pendingPower.present {
+			result := scheduler.executePostRecordingPower(ctx, pendingPower, now, reservation)
+			pendingPower = postRecordingPowerCandidate{}
+			if scheduler.observePostPower != nil {
+				if result.Reason != "" {
+					scheduler.observePostPower(result.Reason)
+				}
+				if result.CleanupReason != "" {
+					scheduler.observePostPower(result.CleanupReason)
+				}
+			}
+			continue
+		}
 		if reservation == nil {
 			var timer Timer
 			if disabledDeadline != nil {
@@ -172,6 +222,7 @@ func (scheduler *Scheduler) Run(ctx context.Context) error {
 				if completion.err != nil {
 					return scheduler.stopExecutions(cancelExecutions, completed, active, completion.err)
 				}
+				pendingPower.add(completion.result.PostRecording)
 			}
 			continue
 		}
@@ -196,6 +247,7 @@ func (scheduler *Scheduler) Run(ctx context.Context) error {
 				if completion.err != nil {
 					return scheduler.stopExecutions(cancelExecutions, completed, active, completion.err)
 				}
+				pendingPower.add(completion.result.PostRecording)
 			}
 			continue
 		}
@@ -216,6 +268,7 @@ func (scheduler *Scheduler) Run(ctx context.Context) error {
 				if completion.err != nil {
 					return scheduler.stopExecutions(cancelExecutions, completed, active, completion.err)
 				}
+				pendingPower.add(completion.result.PostRecording)
 			default:
 				if _, err := scheduler.executor.Miss(ctx, *reservation, core.ReasonRecordingSlotUnavailable); err != nil {
 					return scheduler.stopExecutions(cancelExecutions, completed, active, err)
@@ -237,10 +290,51 @@ func (scheduler *Scheduler) Run(ctx context.Context) error {
 		go func(item core.Reservation, claimed core.Attempt) {
 			defer unregister()
 			defer cancelRecording()
-			_, executeErr := scheduler.executor.ExecuteClaimed(recordingContext, item, claimed)
-			completed <- executionCompletion{err: executeErr}
+			result, executeErr := scheduler.executor.ExecuteClaimed(recordingContext, item, claimed)
+			completed <- executionCompletion{result: result, err: executeErr}
 		}(*reservation, attempt)
 	}
+}
+
+func (candidate *postRecordingPowerCandidate) add(mode core.PostRecordingMode) {
+	if candidate == nil || !mode.ChangesPower() {
+		return
+	}
+	if candidate.present && candidate.mode != mode {
+		candidate.conflict = true
+		return
+	}
+	candidate.mode = mode
+	candidate.present = true
+}
+
+// executePostRecordingPowerは録画が0件になった時点の次予約だけを使い、候補を一度評価する。
+func (scheduler *Scheduler) executePostRecordingPower(ctx context.Context, candidate postRecordingPowerCandidate,
+	now time.Time, next *core.Reservation,
+) PostRecordingPowerResult {
+	if ctx.Err() != nil {
+		return PostRecordingPowerResult{Reason: "post-recording-power-cancelled"}
+	}
+	if candidate.conflict {
+		return PostRecordingPowerResult{Reason: "post-recording-power-conflict"}
+	}
+	if scheduler.postPower == nil {
+		return PostRecordingPowerResult{Reason: "post-recording-power-unavailable"}
+	}
+	var wakeAt *time.Time
+	if next != nil {
+		start := next.PlannedStart().UTC()
+		if start.Sub(now) < postRecordingMinimumIdle {
+			return PostRecordingPowerResult{Reason: "post-recording-power-too-late"}
+		}
+		wake := start.Add(-postRecordingWakeMargin)
+		minimumWake := now.Add(postRecordingWakeMargin)
+		if wake.Before(minimumWake) {
+			return PostRecordingPowerResult{Reason: "post-recording-power-too-late"}
+		}
+		wakeAt = &wake
+	}
+	return scheduler.postPower.Execute(ctx, candidate.mode, wakeAt)
 }
 
 func (scheduler *Scheduler) wait(ctx context.Context, timer Timer, completed <-chan executionCompletion) (*executionCompletion, bool) {
