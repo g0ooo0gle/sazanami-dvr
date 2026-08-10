@@ -334,15 +334,16 @@ func TestReservationPostRecordingSettingsRoundTrip(t *testing.T) {
 }
 
 func TestPostRecordingWireModeMatrixAndPathBoundaries(t *testing.T) {
-	for suspend := uint8(0); suspend <= 5; suspend++ {
+	for rawSuspend := 0; rawSuspend <= 255; rawSuspend++ {
+		suspend := uint8(rawSuspend)
 		for _, reboot := range []bool{false, true} {
 			var body bytes.Buffer
 			writer, _ := codec.NewWriter(&body, codec.DefaultLimits())
 			writeInputSettingsWire(t, writer, 1, 3, true, 0, 0, 0, 0, recording.OutputSettings{}, "", suspend, reboot)
 			reader, _ := codec.NewReader(body.Bytes(), codec.DefaultLimits())
 			settings, err := decodeSettings(reader)
-			wantOK := !reboot && (suspend == 0 || suspend == 4)
-			if wantOK && (err != nil || reader.Exact() != nil || settings.postRecording.Mode != recording.PostRecordingMode(suspend/4)) {
+			wantMode, wantOK := decodePostRecordingMode(suspend, reboot)
+			if wantOK && (err != nil || reader.Exact() != nil || settings.postRecording.Mode != wantMode) {
 				t.Fatalf("suspend=%d reboot=%v settings=%+v err=%v", suspend, reboot, settings, err)
 			}
 			if !wantOK && err == nil {
@@ -368,6 +369,36 @@ func TestPostRecordingWireModeMatrixAndPathBoundaries(t *testing.T) {
 				t.Fatalf("len=%d err=%v", len(test.path), err)
 			}
 		})
+	}
+}
+
+func TestPostRecordingListReturnsAllSevenModes(t *testing.T) {
+	operations := &fakeOperations{}
+	for mode := recording.PostRecordingDefault; mode <= recording.PostRecordingShutdown; mode++ {
+		item := listedReservation(int32(mode + 1))
+		item.PostRecording.Mode = mode
+		operations.reservations = append(operations.reservations, item)
+	}
+	handler := Handler{Operations: operations, Limits: codec.DefaultLimits()}
+	var response bytes.Buffer
+	if err := handler.Handle(context.Background(), listRequest(Version), &response); err != nil {
+		t.Fatal(err)
+	}
+	frame, err := codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
+	reader, readerErr := codec.NewReader(frame.Body, codec.DefaultLimits())
+	if err != nil || readerErr != nil || frame.Code != ResultSuccess {
+		t.Fatalf("frame=%+v parse=%v reader=%v", frame, err, readerErr)
+	}
+	if _, err := reader.U16(); err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.Vector(4, len(operations.reservations), func(item *codec.Reader, index int) error {
+		return readListedReservation(item, operations.reservations[index])
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.Exact(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -959,12 +990,12 @@ func writeInputSettingsWithPostRecording(t *testing.T, writer *codec.Writer, mod
 	useMargins uint8, startMargin, endMargin int32, serviceMode uint32, output recording.OutputSettings,
 	post recording.PostRecordingSettings,
 ) {
-	suspend := uint8(0)
-	if post.Mode == recording.PostRecordingNothing {
-		suspend = 4
+	suspend, reboot, ok := encodePostRecordingMode(post.Mode)
+	if !ok {
+		t.Fatalf("invalid post recording mode: %d", post.Mode)
 	}
 	writeInputSettingsWire(t, writer, mode, priority, follow, useMargins, startMargin, endMargin, serviceMode,
-		output, post.Script, suspend, false)
+		output, post.Script, suspend, reboot)
 }
 
 func writeInputSettingsWire(t *testing.T, writer *codec.Writer, mode, priority uint8, follow bool,

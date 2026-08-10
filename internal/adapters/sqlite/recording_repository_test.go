@@ -52,6 +52,37 @@ func TestReservationCreateReadbackAndDuplicate(t *testing.T) {
 	}
 }
 
+func TestPostRecordingModesRoundTripAndSurviveRestart(t *testing.T) {
+	root, store := openMigratedStore(t)
+	base := reservationForTest(t, store)
+	for mode := recording.PostRecordingDefault; mode <= recording.PostRecordingShutdown; mode++ {
+		reservation := base
+		reservation.ID = testID(t, byte(230+mode))
+		reservation.Program.EventID = uint16(100 + mode)
+		reservation.PostRecording = recording.PostRecordingSettings{Mode: mode}
+		if _, err := store.CreateReservation(context.Background(), reservation); err != nil {
+			t.Fatalf("mode=%d err=%v", mode, err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenStore(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	items, err := reopened.ActiveReservations(context.Background(), 256, 0)
+	if err != nil || len(items) != 7 {
+		t.Fatalf("items=%d err=%v", len(items), err)
+	}
+	for index, item := range items {
+		if item.PostRecording.Mode != recording.PostRecordingMode(index) {
+			t.Fatalf("index=%d mode=%d", index, item.PostRecording.Mode)
+		}
+	}
+}
+
 func TestBasicRecordingSettingsRoundTripAndDisabledExpiration(t *testing.T) {
 	_, store := openMigratedStore(t)
 	base := reservationForTest(t, store)
@@ -165,6 +196,8 @@ func TestReservationSettingsSchemaRejectsInvalidAndScannerRejectsCorruption(t *t
 		`UPDATE reservations SET output_template=replace(hex(zeroblob(513)), '00', 'a') WHERE id=?`,
 		`UPDATE reservations SET component_mode=5 WHERE id=?`,
 		`UPDATE reservations SET post_action_mode=2 WHERE id=?`,
+		`UPDATE reservations SET post_power_mode=6 WHERE id=?`,
+		`UPDATE reservations SET post_action_mode=1, post_power_mode=1 WHERE id=?`,
 		`UPDATE reservations SET post_script_path=replace(hex(zeroblob(1025)), '00', 'a') WHERE id=?`,
 	} {
 		if _, err := store.writer.Exec(statement, created.ID.Bytes()); err == nil {
