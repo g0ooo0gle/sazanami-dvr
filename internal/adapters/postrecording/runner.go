@@ -36,7 +36,8 @@ const (
 
 // Directoryは起動時に固定した、所有者だけが変更できるスクリプト保存先である。
 type Directory struct {
-	root string
+	root     string
+	identity os.FileInfo
 }
 
 // Openは絶対pathの専用ディレクトリを0700で用意し、symlinkと他利用者の書込みを拒否する。
@@ -51,16 +52,21 @@ func Open(path string) (*Directory, error) {
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
 		return nil, errors.New("postrecording: unsafe directory")
 	}
-	return &Directory{root: path}, nil
+	return &Directory{root: path, identity: info}, nil
 }
 
 // Validateはpathが専用ディレクトリ内の実行可能な通常ファイルを指すことを確認する。
 // 予約保存時と実行直前の両方で呼び、途中のsymlinkも許可しない。
 func (directory *Directory) Validate(path string) error {
 	settings := recording.PostRecordingSettings{Script: path}
-	if directory == nil || directory.root == "" || path == "" || settings.Validate() != nil ||
+	if directory == nil || directory.root == "" || directory.identity == nil || path == "" || settings.Validate() != nil ||
 		!filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return errors.New("postrecording: invalid script path")
+	}
+	rootInfo, err := os.Lstat(directory.root)
+	if err != nil || !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 || rootInfo.Mode().Perm()&0o077 != 0 ||
+		!os.SameFile(directory.identity, rootInfo) {
+		return errors.New("postrecording: directory changed")
 	}
 	relative, err := filepath.Rel(directory.root, path)
 	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
