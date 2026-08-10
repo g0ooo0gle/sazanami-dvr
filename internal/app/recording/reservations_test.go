@@ -71,6 +71,7 @@ func TestReservationServiceAddsAfterCatalogMatch(t *testing.T) {
 	request := core.ReservationRequest{
 		NetworkID: 1, TransportStreamID: 2, ServiceID: 3, EventID: 4,
 		Start: now.Add(time.Hour), Duration: 30 * time.Minute, Priority: 4, RequestedFollow: true,
+		PostRecording: core.PostRecordingSettings{Mode: core.PostRecordingNothing, Script: "/allowed/finish.sh"},
 	}
 	program := appProgram(t, request)
 	store := &memoryReservations{}
@@ -82,7 +83,8 @@ func TestReservationServiceAddsAfterCatalogMatch(t *testing.T) {
 	}
 	created, err := service.Add(context.Background(), request)
 	if err != nil || created.Number != 1 || len(store.created) != 1 || !created.RequestedFollow ||
-		!created.EffectiveFollow || notified != 1 || created.Program.Title != "server title" {
+		!created.EffectiveFollow || notified != 1 || created.Program.Title != "server title" ||
+		created.PostRecording != request.PostRecording {
 		t.Fatalf("created=%+v stored=%d notified=%d err=%v", created, len(store.created), notified, err)
 	}
 }

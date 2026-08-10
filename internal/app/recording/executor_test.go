@@ -869,10 +869,72 @@ func TestUserStopDoesNotPublishWhenFileSyncOrCloseFails(t *testing.T) {
 			}
 			executor := Executor{Store: store, Clock: &mutableClock{now: start}}
 			result, err := executor.finishUserStop(context.Background(), file,
-				core.Attempt{ID: appID(t, 82)}, minimumUsefulTS)
+				core.Reservation{}, core.Attempt{ID: appID(t, 82)}, minimumUsefulTS)
 			if err != nil || result.State != core.AttemptPartial || result.Reason != core.ReasonFileSyncFailed ||
 				store.finish.Availability != core.AvailabilityPartial || countString(store.operations, "finalizing") != 0 {
 				t.Fatalf("result=%+v finish=%+v operations=%v err=%v", result, store.finish, store.operations, err)
+			}
+		})
+	}
+}
+
+func TestPostRecordingRunsOnlyAfterSuccessfulFinalization(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	store := &attemptMemory{start: start, end: start.Add(time.Hour)}
+	attempt := core.Attempt{ID: appID(t, 83), Plan: core.FilePlan{PartialPath: "2026/08/test.part", FinalPath: "2026/08/test.ts"}}
+	reservation := core.Reservation{Number: 17, PostRecording: core.PostRecordingSettings{Script: "/allowed/finish.sh"}}
+	called := 0
+	observed := ""
+	executor := Executor{
+		Store: store, Clock: &mutableClock{now: start}, NewID: func() (catalogmodel.ID, error) { return appID(t, 84), nil },
+		Files: FileOperations{
+			LinkFinal: func(core.FilePlan) error { return nil }, SyncDirectory: func(core.FilePlan) error { return nil },
+			RemovePartial: func(core.FilePlan) error { return nil },
+			FinalPath:     func(core.FilePlan) (string, error) { return "/recordings/2026/08/test.ts", nil },
+		},
+		PostRecording: func(_ context.Context, request PostRecordingRequest) string {
+			called++
+			if store.finish.State != core.AttemptSucceeded || store.finish.Availability != core.AvailabilityFinal ||
+				request.Script != reservation.PostRecording.Script || request.RecordingNumber != reservation.Number ||
+				request.FinalPath != "/recordings/2026/08/test.ts" || request.State != core.AttemptSucceeded ||
+				request.Reason != core.ReasonCompleted {
+				t.Fatalf("finish=%+v request=%+v", store.finish, request)
+			}
+			return "post-recording-script-exit-failed"
+		},
+		ObservePostRecording: func(reason string) { observed = reason },
+	}
+	result, err := executor.publishAndPostProcess(context.Background(), reservation, attempt, 188,
+		core.AttemptSucceeded, core.ReasonCompleted)
+	if err != nil || result.State != core.AttemptSucceeded || called != 1 || observed != "post-recording-script-exit-failed" {
+		t.Fatalf("result=%+v called=%d observed=%q err=%v", result, called, observed, err)
+	}
+}
+
+func TestPostRecordingIsSkippedWithoutScriptOrWhenPublicationFails(t *testing.T) {
+	for _, test := range []struct {
+		name, script string
+		linkErr      error
+	}{
+		{name: "no script"},
+		{name: "publication failure", script: "/allowed/finish.sh", linkErr: errors.New("link failed")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+			store := &attemptMemory{start: start, end: start.Add(time.Hour)}
+			called := 0
+			executor := Executor{
+				Store: store, Clock: &mutableClock{now: start}, NewID: func() (catalogmodel.ID, error) { return appID(t, 85), nil },
+				Files: FileOperations{LinkFinal: func(core.FilePlan) error { return test.linkErr },
+					SyncDirectory: func(core.FilePlan) error { return nil }, RemovePartial: func(core.FilePlan) error { return nil },
+					FinalPath: func(core.FilePlan) (string, error) { return "/recordings/test.ts", nil }},
+				PostRecording: func(context.Context, PostRecordingRequest) string { called++; return "" },
+			}
+			_, _ = executor.publishAndPostProcess(context.Background(), core.Reservation{
+				Number: 1, PostRecording: core.PostRecordingSettings{Script: test.script},
+			}, core.Attempt{ID: appID(t, 86)}, 188, core.AttemptSucceeded, core.ReasonCompleted)
+			if called != 0 {
+				t.Fatalf("post recording calls=%d", called)
 			}
 		})
 	}

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/codec"
 	ctrlcmdruntime "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/runtime"
+	postrecordingadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/postrecording"
 	mirakurunadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/provider/mirakurun"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/recordingfs"
 	recordinghttpadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/recordinghttp"
@@ -132,6 +134,7 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	httpListenAddress := flags.String("http-listen", recordinghttpadapter.DefaultAddress, "loopback、private IPまたは全interfaceのHTTP待受アドレス")
 	refreshInterval := flags.Duration("catalog-refresh-interval", catalogrefresh.DefaultInterval, "番組表を更新する間隔")
 	maximumRecordings := flags.Int("max-concurrent-recordings", recordingapp.DefaultMaximumConcurrentRecordings, "同時録画数（1～8）")
+	postRecordingRootPath := flags.String("post-recording-script-root", "", "owner-onlyの録画後スクリプトディレクトリ")
 	if err := flags.Parse(arguments); err != nil {
 		return errorsStable("invalid-command-arguments")
 	}
@@ -169,6 +172,15 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 		return errorsStable("recording-root-unavailable")
 	}
 	defer recordingRoot.Close()
+	postRecordingRoot := *postRecordingRootPath
+	if postRecordingRoot == "" {
+		postRecordingRoot = filepath.Join(*dataRoot, "post-recording-scripts")
+	}
+	postRecordingDirectory, err := postrecordingadapter.Open(postRecordingRoot)
+	if err != nil {
+		return errorsStable("post-recording-script-root-unavailable")
+	}
+	postRecordingRunner := postrecordingadapter.Runner{Directory: postRecordingDirectory, Timeout: postrecordingadapter.DefaultTimeout}
 	snapshot, err := ctrlcmdruntime.BuildSnapshot(startupContext, *dataRoot, *channelMap, store)
 	if err != nil {
 		return err
@@ -207,11 +219,20 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 			return recordingRoot.CreatePartial(plan)
 		},
 		LinkFinal: recordingRoot.LinkFinal, SyncDirectory: recordingRoot.SyncDirectory,
-		RemovePartial: recordingRoot.RemovePartial,
+		RemovePartial: recordingRoot.RemovePartial, FinalPath: recordingRoot.FinalPath,
 	}
 	executor := recordingapp.Executor{
 		Store: store, Stream: streamAdapter, Files: files, Clock: recordingClock,
 		NewID: catalogmodel.NewID, OwnerID: ownerID, Generation: 1,
+		PostRecording: func(runContext context.Context, request recordingapp.PostRecordingRequest) string {
+			return postRecordingRunner.Run(runContext, request.Script, postrecordingadapter.Environment{
+				RecordingNumber: request.RecordingNumber, RecordingFile: request.FinalPath,
+				State: request.State, Reason: request.Reason,
+			})
+		},
+		ObservePostRecording: func(reason string) {
+			fmt.Fprintf(stderr, "録画後スクリプトを完了できませんでした: %s\n", reason)
+		},
 	}
 	recovery := recordingapp.Recovery{
 		Store: store, Clock: recordingClock,
@@ -238,6 +259,9 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 		logoAdapter, ctrlcmdruntime.SystemClock{}, codec.DefaultLimits())
 	if err != nil {
 		return errorsStable("recording-router-failed")
+	}
+	if err := router.SetPostRecordingScriptValidator(postRecordingDirectory); err != nil {
+		return errorsStable("post-recording-script-validator-failed")
 	}
 	server, err := ctrlcmdapp.NewServer(config, router)
 	if err != nil {
@@ -286,8 +310,9 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 		automatic: func(evaluationContext context.Context) (autoreservationapp.Result, error) {
 			return (autoreservationapp.Evaluator{
 				Store: store, Catalog: snapshots.Load(), Clock: recordingClock, NewID: catalogmodel.NewID,
-				IsDuplicate: func(err error) bool { return errors.Is(err, sqliteadapter.ErrAutomaticReservationDuplicate) },
-				OnCreated:   scheduler.Notify,
+				IsDuplicate:                 func(err error) bool { return errors.Is(err, sqliteadapter.ErrAutomaticReservationDuplicate) },
+				ValidatePostRecordingScript: postRecordingDirectory.Validate,
+				OnCreated:                   scheduler.Notify,
 			}).Run(evaluationContext)
 		},
 		observeAutomatic: observeAutomaticReservation(stdout, stderr),

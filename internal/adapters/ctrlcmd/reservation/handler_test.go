@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -246,6 +247,16 @@ func TestReservationPostRecordingSettingsRoundTrip(t *testing.T) {
 	if err != nil || frame.Code != ResultSuccess || len(operations.added) != 1 || operations.added[0].PostRecording != post {
 		t.Fatalf("frame=%+v added=%+v err=%v", frame, operations.added, err)
 	}
+	response.Reset()
+	request = reservationRequestSettingsWithPostRecording(t, CommandChange, Version, 42, 1, 3, true,
+		0, 0, 0, 1, 0, recording.OutputSettings{}, post)
+	if err := handler.Handle(context.Background(), request, &response); err != nil {
+		t.Fatal(err)
+	}
+	frame, err = codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
+	if err != nil || frame.Code != ResultSuccess || len(operations.changed) != 1 || operations.changed[0].Request.PostRecording != post {
+		t.Fatalf("frame=%+v changed=%+v err=%v", frame, operations.changed, err)
+	}
 
 	listed := listedReservation(42)
 	listed.PostRecording = post
@@ -277,6 +288,44 @@ func TestReservationPostRecordingSettingsRoundTrip(t *testing.T) {
 	frame, _ = codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
 	if frame.Code != ResultFailure || len(operations.added) != 1 {
 		t.Fatalf("frame=%+v calls=%d", frame, len(operations.added))
+	}
+}
+
+func TestPostRecordingWireModeMatrixAndPathBoundaries(t *testing.T) {
+	for suspend := uint8(0); suspend <= 5; suspend++ {
+		for _, reboot := range []bool{false, true} {
+			var body bytes.Buffer
+			writer, _ := codec.NewWriter(&body, codec.DefaultLimits())
+			writeInputSettingsWire(t, writer, 1, 3, true, 0, 0, 0, 0, recording.OutputSettings{}, "", suspend, reboot)
+			reader, _ := codec.NewReader(body.Bytes(), codec.DefaultLimits())
+			settings, err := decodeSettings(reader)
+			wantOK := !reboot && (suspend == 0 || suspend == 4)
+			if wantOK && (err != nil || reader.Exact() != nil || settings.postRecording.Mode != recording.PostRecordingMode(suspend/4)) {
+				t.Fatalf("suspend=%d reboot=%v settings=%+v err=%v", suspend, reboot, settings, err)
+			}
+			if !wantOK && err == nil {
+				t.Fatalf("suspend=%d reboot=%v を受理しました", suspend, reboot)
+			}
+		}
+	}
+	for _, test := range []struct {
+		name, path string
+		wantOK     bool
+	}{
+		{name: "1024 bytes", path: strings.Repeat("a", recording.MaxPostRecordingScriptBytes), wantOK: true},
+		{name: "1025 bytes", path: strings.Repeat("a", recording.MaxPostRecordingScriptBytes+1)},
+		{name: "control", path: "bad\npath"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var body bytes.Buffer
+			writer, _ := codec.NewWriter(&body, codec.DefaultLimits())
+			writeInputSettingsWire(t, writer, 1, 3, true, 0, 0, 0, 0, recording.OutputSettings{}, test.path, 0, false)
+			reader, _ := codec.NewReader(body.Bytes(), codec.DefaultLimits())
+			_, err := decodeSettings(reader)
+			if (err == nil) != test.wantOK {
+				t.Fatalf("len=%d err=%v", len(test.path), err)
+			}
+		})
 	}
 }
 
@@ -740,6 +789,18 @@ func writeInputSettingsWithPostRecording(t *testing.T, writer *codec.Writer, mod
 	useMargins uint8, startMargin, endMargin int32, serviceMode uint32, output recording.OutputSettings,
 	post recording.PostRecordingSettings,
 ) {
+	suspend := uint8(0)
+	if post.Mode == recording.PostRecordingNothing {
+		suspend = 4
+	}
+	writeInputSettingsWire(t, writer, mode, priority, follow, useMargins, startMargin, endMargin, serviceMode,
+		output, post.Script, suspend, false)
+}
+
+func writeInputSettingsWire(t *testing.T, writer *codec.Writer, mode, priority uint8, follow bool,
+	useMargins uint8, startMargin, endMargin int32, serviceMode uint32, output recording.OutputSettings,
+	batch string, suspend uint8, reboot bool,
+) {
 	t.Helper()
 	var folder bytes.Buffer
 	if output != (recording.OutputSettings{}) {
@@ -773,18 +834,14 @@ func writeInputSettingsWithPostRecording(t *testing.T, writer *codec.Writer, mod
 	}
 	_ = settingsWriter.U32(serviceMode)
 	_ = settingsWriter.U8(0)
-	_ = settingsWriter.String(post.Script)
+	_ = settingsWriter.String(batch)
 	if output == (recording.OutputSettings{}) {
 		writeTestVector(t, settingsWriter, nil, 0)
 	} else {
 		writeTestVector(t, settingsWriter, folder.Bytes(), 1)
 	}
-	suspend := uint8(0)
-	if post.Mode == recording.PostRecordingNothing {
-		suspend = 4
-	}
 	_ = settingsWriter.U8(suspend)
-	_ = settingsWriter.U8(0)
+	_ = settingsWriter.U8(boolByte(reboot))
 	_ = settingsWriter.U8(useMargins)
 	_ = settingsWriter.I32(startMargin)
 	_ = settingsWriter.I32(endMargin)
