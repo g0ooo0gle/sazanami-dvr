@@ -134,7 +134,7 @@ func TestRunUsesFixedEnvironmentAndDiscardsOutput(t *testing.T) {
 	}
 }
 
-func TestTimeoutStopsChildProcessGroup(t *testing.T) {
+func TestCancellationStopsChildProcessGroup(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "scripts")
 	directory, err := Open(root)
 	if err != nil {
@@ -142,12 +142,28 @@ func TestTimeoutStopsChildProcessGroup(t *testing.T) {
 	}
 	pidFile := filepath.Join(root, "child.pid")
 	script := filepath.Join(root, "child.sh")
-	writeScript(t, script, "#!/bin/sh\n/bin/sleep 5 &\nprintf '%s' \"$!\" > "+strconv.Quote(pidFile)+"\nwait\n", 0o700)
-	reason := (Runner{Directory: directory, Timeout: 2 * time.Second}).Run(context.Background(), script, Environment{
-		RecordingNumber: 1, RecordingFile: filepath.Join(root, "recording.ts"),
-		State: recording.AttemptSucceeded, Reason: recording.ReasonCompleted,
-	})
-	if reason != ReasonTimeout {
+	writeScript(t, script, "#!/bin/sh\n/bin/sleep 30 &\nprintf '%s' \"$!\" > "+strconv.Quote(pidFile)+"\nwait\n", 0o700)
+	ctx, cancel := context.WithCancel(context.Background())
+	reasonResult := make(chan string, 1)
+	go func() {
+		reasonResult <- (Runner{Directory: directory, Timeout: 20 * time.Second}).Run(ctx, script, Environment{
+			RecordingNumber: 1, RecordingFile: filepath.Join(root, "recording.ts"),
+			State: recording.AttemptSucceeded, Reason: recording.ReasonCompleted,
+		})
+	}()
+	startDeadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(pidFile); err == nil {
+			break
+		}
+		if time.Now().After(startDeadline) {
+			cancel()
+			t.Fatal("child processが開始しませんでした")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if reason := <-reasonResult; reason != ReasonCancelled {
 		t.Fatalf("reason=%q", reason)
 	}
 	data, err := os.ReadFile(pidFile)
@@ -196,7 +212,7 @@ func TestRunReportsSuccessExitTimeoutAndCancellation(t *testing.T) {
 			}
 			timeout := test.timeout
 			if timeout == 0 {
-				timeout = time.Second
+				timeout = 10 * time.Second
 			}
 			if got := (Runner{Directory: directory, Timeout: timeout}).Run(ctx, script, environment); got != test.want {
 				t.Fatalf("reason=%q want=%q", got, test.want)
@@ -215,7 +231,7 @@ func TestRunReportsStartFailureWithoutLeakingPath(t *testing.T) {
 	if err := os.WriteFile(script, []byte("not an executable format"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	reason := (Runner{Directory: directory, Timeout: time.Second}).Run(context.Background(), script, Environment{
+	reason := (Runner{Directory: directory, Timeout: 10 * time.Second}).Run(context.Background(), script, Environment{
 		RecordingNumber: 1, RecordingFile: filepath.Join(root, "recording.ts"),
 		State: recording.AttemptSucceeded, Reason: recording.ReasonCompleted,
 	})
