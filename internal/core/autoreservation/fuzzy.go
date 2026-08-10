@@ -1,4 +1,4 @@
-package programsearch
+package autoreservation
 
 import (
 	"strings"
@@ -7,7 +7,6 @@ import (
 
 var halfwidthKatakana = []rune("。「」、・ヲァィゥェォャュョッーアイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワン")
 
-// normalizeFuzzyTextはKonomiTVのあいまい検索で同一視する表記を標準ライブラリだけで揃える。
 func normalizeFuzzyText(value string, caseSensitive bool) string {
 	result := make([]rune, 0, len(value))
 	for _, original := range value {

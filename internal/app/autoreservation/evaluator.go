@@ -3,7 +3,6 @@ package autoreservation
 import (
 	"context"
 	"errors"
-	"regexp"
 	"strings"
 	"time"
 
@@ -52,8 +51,7 @@ type Evaluator struct {
 
 type preparedRule struct {
 	rule        autoreservation.Rule
-	keyword     *regexp.Regexp
-	exclude     *regexp.Regexp
+	matcher     autoreservation.ProgramMatcher
 	skip        bool
 	unavailable bool
 	post        recording.PostRecordingSettings
@@ -99,11 +97,14 @@ func (evaluator Evaluator) Run(ctx context.Context) (Result, error) {
 		}
 		for _, candidate := range prepared {
 			result.Comparisons++
-			if candidate.skip || candidate.unavailable || !matchProgram(candidate, program) {
+			if candidate.skip || candidate.unavailable || !candidate.matcher.Matches(program) {
 				continue
 			}
 			request, err := evaluator.Catalog.ReservationRequestForProgram(program, candidate.rule.Recording.Priority,
 				candidate.rule.Recording.Follow)
+			if err != nil {
+				continue
+			}
 			settings := candidate.rule.Recording
 			output, supported := automaticOutputSettings(settings)
 			if !supported {
@@ -122,8 +123,7 @@ func (evaluator Evaluator) Run(ctx context.Context) (Result, error) {
 					End:   time.Duration(*settings.EndMargin) * time.Second,
 				}
 			}
-			if err != nil || request.Validate() != nil || !matchService(candidate.rule.Search.Services, request) || !matchDate(candidate.rule.Search.Dates,
-				candidate.rule.Search.ExcludeDates, request.Start) || !matchDuration(candidate.rule.Search, request.Duration) {
+			if request.Validate() != nil || !matchService(candidate.rule.Search.Services, request) {
 				continue
 			}
 			result.Matched++
@@ -248,8 +248,7 @@ func prepareRule(rule autoreservation.Rule, validateScript func(string) error) p
 		prepared.skip = true
 		return prepared
 	}
-	if search.Fuzzy || len(search.Contents) != 0 || search.ExcludeContents || len(search.Video) != 0 || len(search.Audio) != 0 ||
-		search.CheckRecordedTitle || (settings.Mode != 1 && settings.Mode != 5) || settings.Exact ||
+	if search.CheckRecordedTitle || (settings.Mode != 1 && settings.Mode != 5) || settings.Exact ||
 		(settings.Suspend != 0 && settings.Suspend != 4) || settings.Reboot ||
 		settings.Continue || settings.PartialMode != 0 || settings.TunerID != 0 || len(settings.PartialFolders) != 0 {
 		prepared.unavailable = true
@@ -276,19 +275,12 @@ func prepareRule(rule autoreservation.Rule, validateScript func(string) error) p
 		prepared.unavailable = true
 		return prepared
 	}
-	if search.Regex {
-		keyword, err := compilePattern(search.Keyword, search.CaseSensitive)
-		if err != nil {
-			prepared.unavailable = true
-			return prepared
-		}
-		exclude, err := compilePattern(search.Exclude, search.CaseSensitive)
-		if err != nil {
-			prepared.unavailable = true
-			return prepared
-		}
-		prepared.keyword, prepared.exclude = keyword, exclude
+	matcher, err := autoreservation.PrepareProgramMatcher(search)
+	if err != nil {
+		prepared.unavailable = true
+		return prepared
 	}
+	prepared.matcher = matcher
 	return prepared
 }
 
@@ -327,60 +319,6 @@ func automaticOutputSettings(settings autoreservation.RecordingSettings) (record
 	return output, output.Validate() == nil
 }
 
-func compilePattern(value string, caseSensitive bool) (*regexp.Regexp, error) {
-	if value == "" {
-		return nil, nil
-	}
-	if !caseSensitive {
-		value = "(?i)" + value
-	}
-	return regexp.Compile(value)
-}
-
-func matchProgram(rule preparedRule, program catalogmodel.CurrentProgram) bool {
-	material := program.Material
-	if material.Title == nil {
-		return false
-	}
-	target := *material.Title
-	if !rule.rule.Search.TitleOnly && material.Description != nil {
-		target += "\n" + *material.Description
-	}
-	if !matchText(rule, target) {
-		return false
-	}
-	if rule.rule.Search.FreeAccess != 0 {
-		if material.FreeAccess == catalogmodel.FreeUnknown ||
-			rule.rule.Search.FreeAccess == 1 && material.FreeAccess != catalogmodel.FreeYes ||
-			rule.rule.Search.FreeAccess == 2 && material.FreeAccess != catalogmodel.FreeNo {
-			return false
-		}
-	}
-	return true
-}
-
-func matchText(rule preparedRule, target string) bool {
-	search := rule.rule.Search
-	if search.Regex {
-		return (rule.keyword == nil || rule.keyword.MatchString(target)) && (rule.exclude == nil || !rule.exclude.MatchString(target))
-	}
-	keyword, exclude := search.Keyword, search.Exclude
-	if !search.CaseSensitive {
-		target, keyword, exclude = strings.ToLower(target), strings.ToLower(keyword), strings.ToLower(exclude)
-	}
-	for _, word := range strings.Fields(keyword) {
-		if !strings.Contains(target, word) {
-			return false
-		}
-	}
-	for _, word := range strings.Fields(exclude) {
-		if strings.Contains(target, word) {
-			return false
-		}
-	}
-	return true
-}
-
 func matchService(services []autoreservation.ServiceRange, request recording.ReservationRequest) bool {
 	if len(services) == 0 {
 		return true
@@ -392,28 +330,4 @@ func matchService(services []autoreservation.ServiceRange, request recording.Res
 		}
 	}
 	return false
-}
-
-func matchDate(ranges []autoreservation.DateRange, exclude bool, start time.Time) bool {
-	if len(ranges) == 0 {
-		return true
-	}
-	local := start.In(time.FixedZone("Asia/Tokyo", 9*60*60))
-	minute := int(local.Weekday())*24*60 + local.Hour()*60 + local.Minute()
-	matched := false
-	for _, value := range ranges {
-		from := int(value.StartDay)*24*60 + int(value.StartHour)*60 + int(value.StartMinute)
-		to := int(value.EndDay)*24*60 + int(value.EndHour)*60 + int(value.EndMinute)
-		if from == to || from < to && minute >= from && minute < to || from > to && (minute >= from || minute < to) {
-			matched = true
-			break
-		}
-	}
-	return matched != exclude
-}
-
-func matchDuration(search autoreservation.SearchCondition, duration time.Duration) bool {
-	minutes := uint64(duration / time.Minute)
-	return (search.MinimumMinutes == 0 || minutes >= uint64(search.MinimumMinutes)) &&
-		(search.MaximumMinutes == 0 || minutes <= uint64(search.MaximumMinutes))
 }

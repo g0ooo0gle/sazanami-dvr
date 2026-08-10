@@ -86,7 +86,7 @@ func TestEvaluatorCreatesOnceAndSkipsUnavailableRule(t *testing.T) {
 		storedRule(1, autoreservation.SearchCondition{Enabled: true, Keyword: "morning news", Exclude: "sports",
 			Services:   []autoreservation.ServiceRange{{NetworkID: 1, TransportStreamID: 2, ServiceID: 3}},
 			FreeAccess: 1}),
-		storedRule(2, autoreservation.SearchCondition{Enabled: true, Keyword: "news", Fuzzy: true}),
+		storedRule(2, autoreservation.SearchCondition{Enabled: true, Keyword: "news", CheckRecordedTitle: true}),
 	}
 	programs := []catalogmodel.CurrentProgram{
 		currentProgram(1, now.Add(time.Hour), "Morning News", "headlines", catalogmodel.FreeYes),
@@ -164,44 +164,38 @@ func TestEvaluatorPreflightsProgramLimit(t *testing.T) {
 	}
 }
 
-func TestDateRangeWrapAndExclusion(t *testing.T) {
-	// 2026-08-09は日曜日。土曜23時から日曜2時の週またぎ範囲へ含まれる。
-	start := time.Date(2026, 8, 9, 1, 0, 0, 0, time.FixedZone("Asia/Tokyo", 9*60*60))
-	ranges := []autoreservation.DateRange{{StartDay: 6, StartHour: 23, EndDay: 0, EndHour: 2}}
-	if !matchDate(ranges, false, start) || matchDate(ranges, true, start) {
-		t.Fatal("週またぎ範囲の判定が一致しません")
-	}
-}
-
 func TestSupportedSearchConditions(t *testing.T) {
 	start := time.Date(2026, 8, 9, 1, 0, 0, 0, time.FixedZone("Asia/Tokyo", 9*60*60))
 	program := currentProgram(1, start, "Alpha News", "beta details", catalogmodel.FreeNo)
-	target := preparedRule{rule: storedRule(1, autoreservation.SearchCondition{
+	target := prepareRule(storedRule(1, autoreservation.SearchCondition{
 		Enabled: true, CaseSensitive: true, Keyword: "Alpha beta", TitleOnly: false, FreeAccess: 2,
-	})}
-	if !matchProgram(target, program) {
+	}), nil)
+	if target.unavailable || !target.matcher.Matches(program) {
 		t.Fatal("AND、説明、大文字小文字、有料指定が一致しません")
 	}
-	target.rule.Search.Exclude = "details"
-	if matchProgram(target, program) {
+	target = prepareRule(storedRule(1, autoreservation.SearchCondition{
+		Enabled: true, CaseSensitive: true, Keyword: "Alpha beta", Exclude: "details", FreeAccess: 2,
+	}), nil)
+	if target.matcher.Matches(program) {
 		t.Fatal("除外語を含む番組が一致しました")
 	}
 	target = prepareRule(storedRule(1, autoreservation.SearchCondition{
 		Enabled: true, Regex: true, TitleOnly: true, Keyword: `^Alpha News$`,
 	}), nil)
-	if target.unavailable || !matchProgram(target, program) {
+	if target.unavailable || !target.matcher.Matches(program) {
 		t.Fatal("正規表現と番組名限定が一致しません")
 	}
 	request := recording.ReservationRequest{
 		NetworkID: 1, TransportStreamID: 2, ServiceID: 3, Start: start, Duration: 30 * time.Minute,
 	}
 	search := autoreservation.SearchCondition{
+		Enabled:        true,
 		Services:       []autoreservation.ServiceRange{{NetworkID: 1, TransportStreamID: 2, ServiceID: 3}},
-		Dates:          []autoreservation.DateRange{{StartDay: 0, StartHour: 0, EndDay: 0, EndHour: 2}},
+		Dates:          []autoreservation.DateRange{{StartDay: 6, StartHour: 23, EndDay: 0, EndHour: 2}},
 		MinimumMinutes: 30, MaximumMinutes: 30,
 	}
-	if !matchService(search.Services, request) || !matchDate(search.Dates, false, request.Start) ||
-		!matchDuration(search, request.Duration) {
+	target = prepareRule(storedRule(1, search), nil)
+	if target.unavailable || !target.matcher.Matches(program) || !matchService(search.Services, request) {
 		t.Fatal("サービス、日時、番組時間が一致しません")
 	}
 	request.ServiceID = 4
@@ -216,18 +210,6 @@ func TestUnsupportedRulesAreUnavailable(t *testing.T) {
 	invalidRegex := base
 	invalidRegex.Search.Regex, invalidRegex.Search.Keyword = true, "["
 	cases["invalid-regexp"] = invalidRegex
-	fuzzy := base
-	fuzzy.Search.Fuzzy = true
-	cases["fuzzy"] = fuzzy
-	content := base
-	content.Search.Contents = []autoreservation.ContentRange{{Content: 1}}
-	cases["content"] = content
-	video := base
-	video.Search.Video = []uint16{1}
-	cases["video"] = video
-	audio := base
-	audio.Search.Audio = []uint16{1}
-	cases["audio"] = audio
 	recorded := base
 	recorded.Search.CheckRecordedTitle = true
 	cases["recorded-title"] = recorded
@@ -246,6 +228,31 @@ func TestUnsupportedRulesAreUnavailable(t *testing.T) {
 				t.Fatalf("rule=%+v", rule)
 			}
 		})
+	}
+}
+
+func TestEvaluatorMatchesMetadataAndFuzzyConditions(t *testing.T) {
+	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+	program := currentProgram(1, now.Add(time.Hour), "テスト本組", "", catalogmodel.FreeYes)
+	video := catalogmodel.Video{StreamContent: 1, ComponentType: 0xb3}
+	program.Material.Metadata = catalogmodel.ProgramMetadata{
+		Genres: []catalogmodel.Genre{{Level1: 1, Level2: 2}}, Video: &video,
+		Audios: []catalogmodel.Audio{{ComponentType: 3, SamplingRate: 48_000}},
+	}
+	rule := storedRule(1, autoreservation.SearchCondition{
+		Enabled: true, Fuzzy: true, Keyword: "テスト番組",
+		Services: []autoreservation.ServiceRange{{NetworkID: 1, TransportStreamID: 2, ServiceID: 3}},
+		Contents: []autoreservation.ContentRange{{Content: 0xff01}},
+		Video:    []uint16{0x01b3}, Audio: []uint16{0x0203},
+	})
+	store := &evaluationStore{rules: []autoreservation.Rule{rule}, seen: make(map[catalogmodel.ID]struct{})}
+	result, err := (Evaluator{
+		Store: store, Catalog: evaluationCatalog{programs: []catalogmodel.CurrentProgram{program}}, Clock: fixedClock{now},
+		NewID:       func() (catalogmodel.ID, error) { return catalogmodel.ID{10}, nil },
+		IsDuplicate: func(error) bool { return false },
+	}).Run(context.Background())
+	if err != nil || result.UnavailableRules != 0 || result.Matched != 1 || result.Created != 1 || len(store.created) != 1 {
+		t.Fatalf("result=%+v created=%d err=%v", result, len(store.created), err)
 	}
 }
 
