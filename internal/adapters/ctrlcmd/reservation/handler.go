@@ -129,9 +129,7 @@ func (handler Handler) add(ctx context.Context, body []byte, destination io.Writ
 	if _, err := handler.Operations.Add(ctx, change.Request); err != nil {
 		return writeFailure(ctx, destination, handler.Limits)
 	}
-	return codec.WriteFrame(reservationDestination{ctx: ctx, destination: destination}, ResultSuccess, 2, handler.Limits, func(writer *codec.Writer) error {
-		return writer.U16(Version)
-	})
+	return writeMutationSuccess(ctx, destination, handler.Limits)
 }
 
 func (handler Handler) change(ctx context.Context, body []byte, destination io.Writer) error {
@@ -139,9 +137,7 @@ func (handler Handler) change(ctx context.Context, body []byte, destination io.W
 	if err != nil || !handler.validScript(change.Request.PostRecording.Script) || handler.Operations.Change(ctx, change) != nil {
 		return writeFailure(ctx, destination, handler.Limits)
 	}
-	return codec.WriteFrame(reservationDestination{ctx: ctx, destination: destination}, ResultSuccess, 2, handler.Limits, func(writer *codec.Writer) error {
-		return writer.U16(Version)
-	})
+	return writeMutationSuccess(ctx, destination, handler.Limits)
 }
 
 func (handler Handler) validScript(path string) bool {
@@ -153,7 +149,7 @@ func (handler Handler) delete(ctx context.Context, body []byte, destination io.W
 	if err != nil || handler.Operations.Delete(ctx, number) != nil {
 		return writeFailure(ctx, destination, handler.Limits)
 	}
-	return writeEmptySuccess(ctx, destination, handler.Limits)
+	return writeMutationSuccess(ctx, destination, handler.Limits)
 }
 
 func (handler Handler) recordingOpen(ctx context.Context, body []byte, destination io.Writer) error {
@@ -895,6 +891,14 @@ func writeFailure(ctx context.Context, destination io.Writer, limits codec.Limit
 
 func writeEmptySuccess(ctx context.Context, destination io.Writer, limits codec.Limits) error {
 	return codec.WriteFrame(reservationDestination{ctx: ctx, destination: destination}, ResultSuccess, 0, limits, func(*codec.Writer) error { return nil })
+}
+
+// writeMutationSuccessは予約の追加・変更・取消しに共通する成功値を返す。
+// KonomiTVは外側の成功コードを使い、Komorebiは本文の32-bit値を使うため、両方を常に1へそろえる。
+func writeMutationSuccess(ctx context.Context, destination io.Writer, limits codec.Limits) error {
+	return codec.WriteFrame(reservationDestination{ctx: ctx, destination: destination}, ResultSuccess, 4, limits, func(writer *codec.Writer) error {
+		return writer.I32(ResultSuccess)
+	})
 }
 
 type reservationDestination struct {
