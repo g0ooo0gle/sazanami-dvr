@@ -72,7 +72,7 @@ func (source *memorySource) CurrentProgramsForService(_ context.Context, locator
 
 func TestHandlerSearchesSupportedKonomiConditions(t *testing.T) {
 	service := searchService("1003", 1, 2, 3)
-	start := time.Date(2026, 8, 9, 10, 30, 0, 0, japanStandardTime).UTC()
+	start := time.Date(2026, 8, 9, 10, 30, 0, 0, time.FixedZone("Asia/Tokyo", 9*60*60)).UTC()
 	matched := searchProgram("1003", "event:1", 10, start, "Alpha ニュース", "朝の説明", true)
 	excluded := searchProgram("1003", "event:2", 11, start.Add(time.Hour), "Alpha ニュース", "skip", true)
 	source := &memorySource{
@@ -128,7 +128,7 @@ func TestHandlerAcceptsFixedKonomiRequestBytes(t *testing.T) {
 
 func TestHandlerSupportsRegexTitleOnlyAndKonomiNote(t *testing.T) {
 	service := searchService("1003", 1, 2, 3)
-	start := time.Date(2026, 8, 9, 10, 30, 0, 0, japanStandardTime).UTC()
+	start := time.Date(2026, 8, 9, 10, 30, 0, 0, time.FixedZone("Asia/Tokyo", 9*60*60)).UTC()
 	source := &memorySource{
 		snapshot: channel.Snapshot{Key: "search", Services: []channel.Service{service}},
 		programs: []catalogmodel.CurrentProgram{
@@ -252,27 +252,37 @@ func TestHandlerRejectsBrokenAndOversizedRequests(t *testing.T) {
 }
 
 func TestPreparedConditionMatchesWeekWrapExclusionDurationAndFreeAccess(t *testing.T) {
-	sunday := time.Date(2026, 8, 9, 0, 30, 0, 0, japanStandardTime).UTC()
+	sunday := time.Date(2026, 8, 9, 0, 30, 0, 0, time.FixedZone("Asia/Tokyo", 9*60*60)).UTC()
 	free := searchProgram("1003", "event:1", 10, sunday, "番組", "", true)
 	paid := searchProgram("1003", "event:2", 11, sunday, "番組", "", false)
 	unknown := free
 	unknown.Material.FreeAccess = catalogmodel.FreeUnknown
 
-	inside := preparedCondition{search: core.SearchCondition{
+	insideSearch := core.SearchCondition{
 		Enabled: true, FreeAccess: 1, MinimumMinutes: 30, MaximumMinutes: 30,
 		Dates: []core.DateRange{{StartDay: 6, StartHour: 23, EndDay: 0, EndHour: 1}},
-	}}
+	}
+	inside, err := prepare(insideSearch)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !inside.matches(free) || inside.matches(paid) || inside.matches(unknown) {
 		t.Fatal("週またぎ、長さ、無料条件の組合せが一致しません")
 	}
 
-	excluded := inside
-	excluded.search.ExcludeDates = true
+	insideSearch.ExcludeDates = true
+	excluded, err := prepare(insideSearch)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if excluded.matches(free) {
 		t.Fatal("除外時間帯の番組が一致しました")
 	}
 
-	paidOnly := preparedCondition{search: core.SearchCondition{Enabled: true, FreeAccess: 2}}
+	paidOnly, err := prepare(core.SearchCondition{Enabled: true, FreeAccess: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if paidOnly.matches(free) || !paidOnly.matches(paid) || paidOnly.matches(unknown) {
 		t.Fatal("有料条件の三値判定が一致しません")
 	}
