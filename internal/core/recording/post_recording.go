@@ -20,11 +20,26 @@ const (
 	PostRecordingDefault PostRecordingMode = iota
 	// PostRecordingNothingは明示的に何もしない。
 	PostRecordingNothing
+	// PostRecordingStandbyは録画終了後にLinuxを待機状態へ移す。
+	PostRecordingStandby
+	// PostRecordingStandbyRebootは待機状態から復帰した後に再起動する。
+	PostRecordingStandbyReboot
+	// PostRecordingSuspendは録画終了後にLinuxを休止状態へ移す。
+	PostRecordingSuspend
+	// PostRecordingSuspendRebootは休止状態から復帰した後に再起動する。
+	PostRecordingSuspendReboot
+	// PostRecordingShutdownは録画終了後にLinuxの電源を切る。
+	PostRecordingShutdown
 )
 
 // Validは現在対応する録画後動作かを返す。
 func (mode PostRecordingMode) Valid() bool {
-	return mode == PostRecordingDefault || mode == PostRecordingNothing
+	return mode <= PostRecordingShutdown
+}
+
+// ChangesPowerは録画後にLinuxの電源状態を変える設定かを返す。
+func (mode PostRecordingMode) ChangesPower() bool {
+	return mode >= PostRecordingStandby && mode <= PostRecordingShutdown
 }
 
 // PostRecordingSettingsは予約ごとの録画後動作と任意のスクリプトpathを保持する。

@@ -149,7 +149,7 @@ func TestEvaluatorInheritsDisabledPriorityFollowAndMargins(t *testing.T) {
 	rule.Recording = autoreservation.RecordingSettings{
 		Mode: 5, Priority: 1, Follow: false, ServiceMode: 0x21, StartMargin: &startMargin, EndMargin: &endMargin,
 		Folders: []autoreservation.Folder{{Path: "ドラマ", Writer: "Write_Default.dll", Name: "RecName_Macro.dll?$Title$"}},
-		Batch:   "/allowed/finish.sh", Suspend: 4,
+		Batch:   "/allowed/finish.sh", Suspend: 2, Reboot: true,
 	}
 	store := &evaluationStore{rules: []autoreservation.Rule{rule}, seen: make(map[catalogmodel.ID]struct{})}
 	result, err := (Evaluator{
@@ -173,8 +173,21 @@ func TestEvaluatorInheritsDisabledPriorityFollowAndMargins(t *testing.T) {
 		*created.Margins != (recording.RecordingMargins{Start: -10 * time.Second, End: 20 * time.Second}) ||
 		created.Output != (recording.OutputSettings{Folder: "ドラマ", Template: "$Title$"}) ||
 		created.Components != recording.ComponentDataOnly ||
-		created.PostRecording != (recording.PostRecordingSettings{Mode: recording.PostRecordingNothing, Script: "/allowed/finish.sh"}) {
+		created.PostRecording != (recording.PostRecordingSettings{Mode: recording.PostRecordingSuspendReboot, Script: "/allowed/finish.sh"}) {
 		t.Fatalf("created=%+v", created)
+	}
+}
+
+func TestAutomaticPostRecordingModeMatrix(t *testing.T) {
+	for rawSuspend := 0; rawSuspend <= 255; rawSuspend++ {
+		for _, reboot := range []bool{false, true} {
+			mode, ok := automaticPostRecordingMode(uint8(rawSuspend), reboot)
+			wantOK := rawSuspend == 0 && !reboot || rawSuspend == 4 && !reboot ||
+				rawSuspend == 1 || rawSuspend == 2 || rawSuspend == 3 && !reboot
+			if ok != wantOK || ok && !mode.Valid() {
+				t.Fatalf("suspend=%d reboot=%v mode=%d ok=%v", rawSuspend, reboot, mode, ok)
+			}
+		}
 	}
 }
 
@@ -250,9 +263,10 @@ func TestUnsupportedRulesAreUnavailable(t *testing.T) {
 	unsafeRecording := base
 	unsafeRecording.Recording.Folders = []autoreservation.Folder{{Path: "custom"}}
 	cases["recording-setting"] = unsafeRecording
-	powerAction := base
-	powerAction.Recording.Suspend = 1
-	cases["power-action"] = powerAction
+	invalidPowerAction := base
+	invalidPowerAction.Recording.Suspend = 3
+	invalidPowerAction.Recording.Reboot = true
+	cases["invalid-power-action"] = invalidPowerAction
 	unsafeScript := base
 	unsafeScript.Recording.Batch = "/outside/finish.sh"
 	cases["script-without-validator"] = unsafeScript

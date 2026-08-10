@@ -412,14 +412,11 @@ func decodeSettings(reader *codec.Reader) (decodedSettings, error) {
 		if err != nil {
 			return err
 		}
-		switch {
-		case suspend == 0 && reboot == 0:
-			settings.postRecording.Mode = recording.PostRecordingDefault
-		case suspend == 4 && reboot == 0:
-			settings.postRecording.Mode = recording.PostRecordingNothing
-		default:
+		mode, ok := decodePostRecordingMode(suspend, reboot != 0)
+		if !ok {
 			return failure(codec.Unsupported, "recording-setting-out-of-profile", 0)
 		}
+		settings.postRecording.Mode = mode
 		settings.postRecording.Script = batch
 		if settings.postRecording.Validate() != nil {
 			return failure(codec.Unsupported, "recording-setting-out-of-profile", 0)
@@ -678,16 +675,18 @@ func writeSettings(writer *codec.Writer, reservation recording.Reservation, limi
 	if err := writeReservationFolders(writer, reservation, limits); err != nil {
 		return err
 	}
-	suspendMode := uint8(0)
-	if reservation.PostRecording.Mode == recording.PostRecordingNothing {
-		suspendMode = 4
-	} else if reservation.PostRecording.Mode != recording.PostRecordingDefault {
+	suspendMode, reboot, ok := encodePostRecordingMode(reservation.PostRecording.Mode)
+	if !ok {
 		return failure(codec.Internal, "invalid-stored-post-recording-settings", int64(reservation.Number))
 	}
 	if err := writer.U8(suspendMode); err != nil {
 		return err
 	}
-	if err := writer.U8(0); err != nil {
+	rebootValue := uint8(0)
+	if reboot {
+		rebootValue = 1
+	}
+	if err := writer.U8(rebootValue); err != nil {
 		return err
 	}
 	useMargins := uint8(0)
@@ -714,6 +713,50 @@ func writeSettings(writer *codec.Writer, reservation recording.Reservation, limi
 		return err
 	}
 	return writeEmptyVector(writer)
+}
+
+// decodePostRecordingModeはKonomiTVが使う二つの値を、意味を失わずdomain値へ変換する。
+func decodePostRecordingMode(suspend uint8, reboot bool) (recording.PostRecordingMode, bool) {
+	switch {
+	case suspend == 0 && !reboot:
+		return recording.PostRecordingDefault, true
+	case suspend == 4 && !reboot:
+		return recording.PostRecordingNothing, true
+	case suspend == 1 && !reboot:
+		return recording.PostRecordingStandby, true
+	case suspend == 1 && reboot:
+		return recording.PostRecordingStandbyReboot, true
+	case suspend == 2 && !reboot:
+		return recording.PostRecordingSuspend, true
+	case suspend == 2 && reboot:
+		return recording.PostRecordingSuspendReboot, true
+	case suspend == 3 && !reboot:
+		return recording.PostRecordingShutdown, true
+	default:
+		return recording.PostRecordingDefault, false
+	}
+}
+
+// encodePostRecordingModeはdomain値をKonomiTVへ同じ選択として返せる値へ変換する。
+func encodePostRecordingMode(mode recording.PostRecordingMode) (uint8, bool, bool) {
+	switch mode {
+	case recording.PostRecordingDefault:
+		return 0, false, true
+	case recording.PostRecordingNothing:
+		return 4, false, true
+	case recording.PostRecordingStandby:
+		return 1, false, true
+	case recording.PostRecordingStandbyReboot:
+		return 1, true, true
+	case recording.PostRecordingSuspend:
+		return 2, false, true
+	case recording.PostRecordingSuspendReboot:
+		return 2, true, true
+	case recording.PostRecordingShutdown:
+		return 3, false, true
+	default:
+		return 0, false, false
+	}
 }
 
 // componentModeFromWireはKonomiTVの個別指定bitを予約domainの固定値へ正規化する。

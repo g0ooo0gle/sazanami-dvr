@@ -272,15 +272,16 @@ func prepareRule(rule autoreservation.Rule, validateScript func(string) error) p
 		return prepared
 	}
 	if (settings.Mode != 1 && settings.Mode != 5) || settings.Exact ||
-		(settings.Suspend != 0 && settings.Suspend != 4) || settings.Reboot ||
 		settings.Continue || settings.PartialMode != 0 || settings.TunerID != 0 || len(settings.PartialFolders) != 0 {
 		prepared.unavailable = true
 		return prepared
 	}
-	prepared.post = recording.PostRecordingSettings{Script: settings.Batch}
-	if settings.Suspend == 4 {
-		prepared.post.Mode = recording.PostRecordingNothing
+	postMode, ok := automaticPostRecordingMode(settings.Suspend, settings.Reboot)
+	if !ok {
+		prepared.unavailable = true
+		return prepared
 	}
+	prepared.post = recording.PostRecordingSettings{Mode: postMode, Script: settings.Batch}
 	if prepared.post.Validate() != nil || prepared.post.Script != "" && (validateScript == nil || validateScript(prepared.post.Script) != nil) {
 		prepared.unavailable = true
 		return prepared
@@ -305,6 +306,28 @@ func prepareRule(rule autoreservation.Rule, validateScript func(string) error) p
 	}
 	prepared.matcher = matcher
 	return prepared
+}
+
+// automaticPostRecordingModeは自動予約のCtrlCmd値を通常予約と同じ選択へ変換する。
+func automaticPostRecordingMode(suspend uint8, reboot bool) (recording.PostRecordingMode, bool) {
+	switch {
+	case suspend == 0 && !reboot:
+		return recording.PostRecordingDefault, true
+	case suspend == 4 && !reboot:
+		return recording.PostRecordingNothing, true
+	case suspend == 1 && !reboot:
+		return recording.PostRecordingStandby, true
+	case suspend == 1 && reboot:
+		return recording.PostRecordingStandbyReboot, true
+	case suspend == 2 && !reboot:
+		return recording.PostRecordingSuspend, true
+	case suspend == 2 && reboot:
+		return recording.PostRecordingSuspendReboot, true
+	case suspend == 3 && !reboot:
+		return recording.PostRecordingShutdown, true
+	default:
+		return recording.PostRecordingDefault, false
+	}
 }
 
 // automaticComponentModeは自動予約に保存したCtrlCmd値を通常予約と同じ選択へ変換する。

@@ -69,20 +69,21 @@ func createReservationTx(ctx context.Context, tx *sql.Tx, reservation recording.
 	}
 	createdMS := reservation.CreatedAt.UnixMilli()
 	margins := reservation.EffectiveMargins()
+	postAction, postPower := encodePostRecordingModes(reservation.PostRecording.Mode)
 	_, err := tx.ExecContext(ctx, `INSERT INTO reservations(
 		id, version, state, program_instance_id, program_revision_id, backend_instance_id,
 		provider_service_locator, tuning_target, network_id, transport_stream_id, service_id, event_id,
 		title, station_name, start_at_utc_ms, duration_seconds, requested_priority, requested_follow,
 		effective_follow, created_at_utc_ms, updated_at_utc_ms, enabled, use_default_margins,
 		effective_start_margin_seconds, effective_end_margin_seconds, output_folder, output_template, component_mode,
-		post_action_mode, post_script_path)
-		VALUES (?, 1, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		post_action_mode, post_power_mode, post_script_path)
+		VALUES (?, 1, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		reservation.ID.Bytes(), p.ProgramInstanceID.Bytes(), p.ProgramRevisionID.Bytes(), p.BackendID.Bytes(),
 		p.ProviderServiceLocator, p.TuningTarget, p.NetworkID, p.TransportStreamID, p.ServiceID, p.EventID,
 		p.Title, p.StationName, p.Start.UnixMilli(), int64(p.Duration/time.Second), reservation.Priority,
 		reservation.RequestedFollow, createdMS, createdMS, !reservation.Disabled, reservation.Margins == nil,
 		int64(margins.Start/time.Second), int64(margins.End/time.Second), reservation.Output.Folder, reservation.Output.Template,
-		reservation.Components, reservation.PostRecording.Mode, reservation.PostRecording.Script)
+		reservation.Components, postAction, postPower, reservation.PostRecording.Script)
 	if err != nil {
 		return recording.Reservation{}, sanitize("create-reservation", err)
 	}
@@ -113,7 +114,7 @@ func (store *Store) ActiveReservations(ctx context.Context, limit int, after int
 		r.station_name, r.start_at_utc_ms, r.duration_seconds, r.requested_priority, r.requested_follow,
 		r.effective_follow, r.created_at_utc_ms, r.updated_at_utc_ms, r.enabled, r.use_default_margins,
 		r.effective_start_margin_seconds, r.effective_end_margin_seconds, r.output_folder, r.output_template, r.component_mode,
-		r.post_action_mode, r.post_script_path
+		r.post_action_mode, r.post_power_mode, r.post_script_path
 		FROM ctrlcmd_reservation_ids m JOIN reservations r ON r.id=m.reservation_id
 		WHERE r.state='ACTIVE' AND m.reserve_id>? ORDER BY m.reserve_id LIMIT ?`, after, limit)
 	if err != nil {
@@ -310,6 +311,7 @@ func (store *Store) UpdateReservation(ctx context.Context, change recording.Rese
 	}
 	request := change.Request
 	margins := recording.Reservation{Margins: request.Margins}.EffectiveMargins()
+	postAction, postPower := encodePostRecordingModes(request.PostRecording.Mode)
 	tx, err := store.writer.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
 		return sanitize("begin-reservation-update", err)
@@ -317,7 +319,7 @@ func (store *Store) UpdateReservation(ctx context.Context, change recording.Rese
 	defer tx.Rollback()
 	result, err := tx.ExecContext(ctx, `UPDATE reservations SET requested_priority=?, requested_follow=?,
 		enabled=?, use_default_margins=?, effective_start_margin_seconds=?, effective_end_margin_seconds=?,
-		output_folder=?, output_template=?, component_mode=?, post_action_mode=?, post_script_path=?,
+		output_folder=?, output_template=?, component_mode=?, post_action_mode=?, post_power_mode=?, post_script_path=?,
 		version=version+1, updated_at_utc_ms=? WHERE id=(
 			SELECT reservation_id FROM ctrlcmd_reservation_ids WHERE reserve_id=?
 		) AND state='ACTIVE' AND network_id=? AND transport_stream_id=? AND service_id=? AND event_id=?
@@ -326,7 +328,7 @@ func (store *Store) UpdateReservation(ctx context.Context, change recording.Rese
 		) AND (?=0 OR start_at_utc_ms+(duration_seconds+?)*1000>?)`,
 		request.Priority, request.RequestedFollow, !request.Disabled, request.Margins == nil,
 		int64(margins.Start/time.Second), int64(margins.End/time.Second), request.Output.Folder, request.Output.Template,
-		request.Components, request.PostRecording.Mode, request.PostRecording.Script,
+		request.Components, postAction, postPower, request.PostRecording.Script,
 		now.UnixMilli(), change.Number, request.NetworkID,
 		request.TransportStreamID, request.ServiceID, request.EventID, request.Start.UnixMilli(),
 		int64(request.Duration/time.Second), !request.Disabled, int64(margins.End/time.Second), now.UnixMilli())
@@ -517,7 +519,7 @@ func (store *Store) NextActiveReservation(ctx context.Context, now time.Time) (*
 		r.station_name, r.start_at_utc_ms, r.duration_seconds, r.requested_priority, r.requested_follow,
 		r.effective_follow, r.created_at_utc_ms, r.updated_at_utc_ms, r.enabled, r.use_default_margins,
 		r.effective_start_margin_seconds, r.effective_end_margin_seconds, r.output_folder, r.output_template, r.component_mode,
-		r.post_action_mode, r.post_script_path
+		r.post_action_mode, r.post_power_mode, r.post_script_path
 		FROM ctrlcmd_reservation_ids m JOIN reservations r ON r.id=m.reservation_id
 		WHERE r.state='ACTIVE' AND r.enabled=1 AND NOT EXISTS (
 			SELECT 1 FROM recording_attempts a WHERE a.reservation_id=r.id
@@ -848,14 +850,14 @@ func scanReservation(scanner rowScanner) (recording.Reservation, error) {
 	var id, instanceID, revisionID, backendID []byte
 	var number, networkID, transportID, serviceID, eventID, startMS, duration, priority int64
 	var requestedFollow, effectiveFollow, enabled, useDefaultMargins, startMarginSeconds, endMarginSeconds, componentMode int64
-	var postActionMode int64
+	var postActionMode, postPowerMode int64
 	var createdMS, updatedMS int64
 	if err := scanner.Scan(&id, &number, &item.Version, &item.State, &instanceID, &revisionID, &backendID,
 		&item.Program.ProviderServiceLocator, &item.Program.TuningTarget, &networkID, &transportID,
 		&serviceID, &eventID, &item.Program.Title, &item.Program.StationName, &startMS,
 		&duration, &priority, &requestedFollow, &effectiveFollow, &createdMS, &updatedMS,
 		&enabled, &useDefaultMargins, &startMarginSeconds, &endMarginSeconds, &item.Output.Folder, &item.Output.Template,
-		&componentMode, &postActionMode, &item.PostRecording.Script); err != nil {
+		&componentMode, &postActionMode, &postPowerMode, &item.PostRecording.Script); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return recording.Reservation{}, err
 		}
@@ -871,7 +873,8 @@ func scanReservation(scanner rowScanner) (recording.Reservation, error) {
 		(useDefaultMargins == 1 && (startMarginSeconds != 5 || endMarginSeconds != 2)) ||
 		duration+startMarginSeconds+endMarginSeconds < 1 || duration+startMarginSeconds+endMarginSeconds > 86_400 ||
 		item.Output.Validate() != nil || componentMode < 0 || componentMode > int64(recording.ComponentBoth) ||
-		postActionMode < 0 || postActionMode > int64(recording.PostRecordingNothing) {
+		postActionMode < 0 || postActionMode > 1 || postPowerMode < 0 || postPowerMode > 5 ||
+		(postActionMode != 0 && postPowerMode != 0) {
 		return recording.Reservation{}, errors.New("sqlite: corrupt reservation value")
 	}
 	if err := copyExact(item.ID[:], id); err != nil {
@@ -898,7 +901,7 @@ func scanReservation(scanner rowScanner) (recording.Reservation, error) {
 	item.EffectiveFollow = item.RequestedFollow
 	item.Disabled = enabled == 0
 	item.Components = recording.ComponentMode(componentMode)
-	item.PostRecording.Mode = recording.PostRecordingMode(postActionMode)
+	item.PostRecording.Mode = decodePostRecordingModes(postActionMode, postPowerMode)
 	if item.PostRecording.Validate() != nil {
 		return recording.Reservation{}, errors.New("sqlite: corrupt post-recording settings")
 	}
@@ -909,6 +912,25 @@ func scanReservation(scanner rowScanner) (recording.Reservation, error) {
 	item.CreatedAt = time.UnixMilli(createdMS).UTC()
 	item.UpdatedAt = time.UnixMilli(updatedMS).UTC()
 	return item, nil
+}
+
+// encodePostRecordingModesはdomainの一値をschema 11互換値と電源値へ分ける。
+func encodePostRecordingModes(mode recording.PostRecordingMode) (int64, int64) {
+	if mode == recording.PostRecordingNothing {
+		return 1, 0
+	}
+	if mode.ChangesPower() {
+		return 0, int64(mode - recording.PostRecordingNothing)
+	}
+	return 0, 0
+}
+
+// decodePostRecordingModesはschemaの二値をdomainの一値へ戻す。呼出し前に範囲と排他性を検証する。
+func decodePostRecordingModes(action, power int64) recording.PostRecordingMode {
+	if power > 0 {
+		return recording.PostRecordingMode(power) + recording.PostRecordingNothing
+	}
+	return recording.PostRecordingMode(action)
 }
 
 func validateRecordingUpdate(store *Store, ctx context.Context, id catalogmodel.ID, now time.Time) error {

@@ -75,18 +75,17 @@ func TestReservationMarginsAndEffectiveDurationBoundaries(t *testing.T) {
 }
 
 func TestPostRecordingSettingsValidation(t *testing.T) {
-	for _, settings := range []PostRecordingSettings{
-		{},
-		{Mode: PostRecordingNothing},
-		{Mode: PostRecordingDefault, Script: "/data/post-recording-scripts/after.sh"},
-		{Mode: PostRecordingNothing, Script: strings.Repeat("a", MaxPostRecordingScriptBytes)},
-	} {
+	for mode := PostRecordingDefault; mode <= PostRecordingShutdown; mode++ {
+		settings := PostRecordingSettings{Mode: mode, Script: "/data/post-recording-scripts/after.sh"}
 		if err := settings.Validate(); err != nil {
 			t.Fatalf("settings=%+v err=%v", settings, err)
 		}
 	}
+	if settings := (PostRecordingSettings{Mode: PostRecordingNothing, Script: strings.Repeat("a", MaxPostRecordingScriptBytes)}); settings.Validate() != nil {
+		t.Fatal("上限内の録画後スクリプトが拒否されました")
+	}
 	for _, settings := range []PostRecordingSettings{
-		{Mode: PostRecordingMode(2)},
+		{Mode: PostRecordingMode(7)},
 		{Script: strings.Repeat("a", MaxPostRecordingScriptBytes+1)},
 		{Script: "bad\x00script"},
 		{Script: "bad\nscript"},
@@ -94,6 +93,11 @@ func TestPostRecordingSettingsValidation(t *testing.T) {
 	} {
 		if err := settings.Validate(); err == nil {
 			t.Fatalf("不正な録画後設定が受理されました: %+v", settings)
+		}
+	}
+	for mode := PostRecordingDefault; mode <= PostRecordingShutdown; mode++ {
+		if mode.ChangesPower() != (mode >= PostRecordingStandby) {
+			t.Fatalf("mode=%d power=%v", mode, mode.ChangesPower())
 		}
 	}
 }
