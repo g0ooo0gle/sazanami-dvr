@@ -79,6 +79,7 @@ func TestPostRecordingSettingsValidation(t *testing.T) {
 		{},
 		{Mode: PostRecordingNothing},
 		{Mode: PostRecordingDefault, Script: "/data/post-recording-scripts/after.sh"},
+		{Mode: PostRecordingNothing, Script: strings.Repeat("a", MaxPostRecordingScriptBytes)},
 	} {
 		if err := settings.Validate(); err != nil {
 			t.Fatalf("settings=%+v err=%v", settings, err)

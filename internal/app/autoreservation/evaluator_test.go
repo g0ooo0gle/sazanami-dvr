@@ -117,6 +117,7 @@ func TestEvaluatorInheritsDisabledPriorityFollowAndMargins(t *testing.T) {
 	rule.Recording = autoreservation.RecordingSettings{
 		Mode: 5, Priority: 1, Follow: false, ServiceMode: 0x21, StartMargin: &startMargin, EndMargin: &endMargin,
 		Folders: []autoreservation.Folder{{Path: "ドラマ", Writer: "Write_Default.dll", Name: "RecName_Macro.dll?$Title$"}},
+		Batch:   "/allowed/finish.sh", Suspend: 4,
 	}
 	store := &evaluationStore{rules: []autoreservation.Rule{rule}, seen: make(map[catalogmodel.ID]struct{})}
 	result, err := (Evaluator{
@@ -125,6 +126,12 @@ func TestEvaluatorInheritsDisabledPriorityFollowAndMargins(t *testing.T) {
 		}}, Clock: fixedClock{now},
 		NewID:       func() (catalogmodel.ID, error) { return catalogmodel.ID{10}, nil },
 		IsDuplicate: func(error) bool { return false },
+		ValidatePostRecordingScript: func(path string) error {
+			if path != "/allowed/finish.sh" {
+				return errors.New("unexpected script")
+			}
+			return nil
+		},
 	}).Run(context.Background())
 	if err != nil || result.Created != 1 || len(store.created) != 1 {
 		t.Fatalf("result=%+v created=%+v err=%v", result, store.created, err)
@@ -133,7 +140,8 @@ func TestEvaluatorInheritsDisabledPriorityFollowAndMargins(t *testing.T) {
 	if !created.Disabled || created.Priority != 1 || created.RequestedFollow || created.Margins == nil ||
 		*created.Margins != (recording.RecordingMargins{Start: -10 * time.Second, End: 20 * time.Second}) ||
 		created.Output != (recording.OutputSettings{Folder: "ドラマ", Template: "$Title$"}) ||
-		created.Components != recording.ComponentDataOnly {
+		created.Components != recording.ComponentDataOnly ||
+		created.PostRecording != (recording.PostRecordingSettings{Mode: recording.PostRecordingNothing, Script: "/allowed/finish.sh"}) {
 		t.Fatalf("created=%+v", created)
 	}
 }
@@ -180,7 +188,7 @@ func TestSupportedSearchConditions(t *testing.T) {
 	}
 	target = prepareRule(storedRule(1, autoreservation.SearchCondition{
 		Enabled: true, Regex: true, TitleOnly: true, Keyword: `^Alpha News$`,
-	}))
+	}), nil)
 	if target.unavailable || !matchProgram(target, program) {
 		t.Fatal("正規表現と番組名限定が一致しません")
 	}
@@ -226,9 +234,15 @@ func TestUnsupportedRulesAreUnavailable(t *testing.T) {
 	unsafeRecording := base
 	unsafeRecording.Recording.Folders = []autoreservation.Folder{{Path: "custom"}}
 	cases["recording-setting"] = unsafeRecording
+	powerAction := base
+	powerAction.Recording.Suspend = 1
+	cases["power-action"] = powerAction
+	unsafeScript := base
+	unsafeScript.Recording.Batch = "/outside/finish.sh"
+	cases["script-without-validator"] = unsafeScript
 	for name, rule := range cases {
 		t.Run(name, func(t *testing.T) {
-			if prepared := prepareRule(rule); !prepared.unavailable {
+			if prepared := prepareRule(rule, nil); !prepared.unavailable {
 				t.Fatalf("rule=%+v", rule)
 			}
 		})

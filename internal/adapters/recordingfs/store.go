@@ -249,6 +249,15 @@ func (root *Root) RemovePartial(plan recording.FilePlan) error {
 	return nil
 }
 
+// FinalPathは録画後処理へ渡す完成ファイルの絶対pathを、保存時と同じ検証から組み立てる。
+func (root *Root) FinalPath(plan recording.FilePlan) (string, error) {
+	_, final, _, err := root.paths(plan)
+	if err != nil {
+		return "", err
+	}
+	return final, nil
+}
+
 // InspectはDBに記録した二つの相対パスだけを調べ、ファイル内容や保存先の他の名前は読まない。
 func (root *Root) Inspect(plan recording.FilePlan) (recording.FileObservation, error) {
 	partial, final, directory, err := root.paths(plan)

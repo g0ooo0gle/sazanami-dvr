@@ -41,12 +41,13 @@ type Result struct {
 
 // Evaluatorは完成済み番組表を事前に数えてから、固定上限内で予約を作る。
 type Evaluator struct {
-	Store       EvaluationStore
-	Catalog     Catalog
-	Clock       Clock
-	NewID       func() (catalogmodel.ID, error)
-	IsDuplicate DuplicateError
-	OnCreated   func()
+	Store                       EvaluationStore
+	Catalog                     Catalog
+	Clock                       Clock
+	NewID                       func() (catalogmodel.ID, error)
+	IsDuplicate                 DuplicateError
+	ValidatePostRecordingScript func(string) error
+	OnCreated                   func()
 }
 
 type preparedRule struct {
@@ -55,6 +56,7 @@ type preparedRule struct {
 	exclude     *regexp.Regexp
 	skip        bool
 	unavailable bool
+	post        recording.PostRecordingSettings
 }
 
 // Runは規則と対象番組を固定してから評価し、一件ずつtransactionで予約する。
@@ -78,7 +80,7 @@ func (evaluator Evaluator) Run(ctx context.Context) (Result, error) {
 	}
 	prepared := make([]preparedRule, len(rules))
 	for index, rule := range rules {
-		prepared[index] = prepareRule(rule)
+		prepared[index] = prepareRule(rule, evaluator.ValidatePostRecordingScript)
 		if prepared[index].unavailable {
 			result.UnavailableRules++
 		}
@@ -109,6 +111,7 @@ func (evaluator Evaluator) Run(ctx context.Context) (Result, error) {
 			}
 			request.Disabled = settings.Mode == 5
 			request.Output = output
+			request.PostRecording = candidate.post
 			request.Components, supported = automaticComponentMode(settings.ServiceMode)
 			if !supported {
 				continue
@@ -140,7 +143,8 @@ func (evaluator Evaluator) Run(ctx context.Context) (Result, error) {
 				ID: id, Version: 1, State: recording.ReservationActive, Program: snapshot,
 				Priority: request.Priority, RequestedFollow: request.RequestedFollow,
 				Disabled: request.Disabled, Margins: request.Margins, Output: request.Output, Components: request.Components,
-				CreatedAt: now, UpdatedAt: now,
+				PostRecording: request.PostRecording,
+				CreatedAt:     now, UpdatedAt: now,
 			})
 			if err != nil {
 				if evaluator.IsDuplicate(err) {
@@ -237,7 +241,7 @@ func programInWindow(program catalogmodel.CurrentProgram, from, to time.Time) bo
 		*material.DurationMS <= int64((24*time.Hour)/time.Millisecond)
 }
 
-func prepareRule(rule autoreservation.Rule) preparedRule {
+func prepareRule(rule autoreservation.Rule, validateScript func(string) error) preparedRule {
 	prepared := preparedRule{rule: rule}
 	search, settings := rule.Search, rule.Recording
 	if !search.Enabled {
@@ -245,9 +249,17 @@ func prepareRule(rule autoreservation.Rule) preparedRule {
 		return prepared
 	}
 	if search.Fuzzy || len(search.Contents) != 0 || search.ExcludeContents || len(search.Video) != 0 || len(search.Audio) != 0 ||
-		search.CheckRecordedTitle || (settings.Mode != 1 && settings.Mode != 5) || settings.Exact || settings.Batch != "" ||
-		settings.Suspend != 0 || settings.Reboot ||
+		search.CheckRecordedTitle || (settings.Mode != 1 && settings.Mode != 5) || settings.Exact ||
+		(settings.Suspend != 0 && settings.Suspend != 4) || settings.Reboot ||
 		settings.Continue || settings.PartialMode != 0 || settings.TunerID != 0 || len(settings.PartialFolders) != 0 {
+		prepared.unavailable = true
+		return prepared
+	}
+	prepared.post = recording.PostRecordingSettings{Script: settings.Batch}
+	if settings.Suspend == 4 {
+		prepared.post.Mode = recording.PostRecordingNothing
+	}
+	if prepared.post.Validate() != nil || prepared.post.Script != "" && (validateScript == nil || validateScript(prepared.post.Script) != nil) {
 		prepared.unavailable = true
 		return prepared
 	}

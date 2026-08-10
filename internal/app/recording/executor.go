@@ -48,6 +48,7 @@ type FileOperations struct {
 	LinkFinal     func(recording.FilePlan) error
 	SyncDirectory func(recording.FilePlan) error
 	RemovePartial func(recording.FilePlan) error
+	FinalPath     func(recording.FilePlan) (string, error)
 }
 
 func (operations FileOperations) valid() bool {
@@ -66,18 +67,29 @@ type Result struct {
 	Reason recording.TerminalReason
 }
 
+// PostRecordingRequestは完成済み録画の後処理へ渡す、検証済みの最小情報である。
+type PostRecordingRequest struct {
+	Script          string
+	RecordingNumber int32
+	FinalPath       string
+	State           recording.AttemptState
+	Reason          recording.TerminalReason
+}
+
 // Executorは一つの予約の実行権をDBで取得し、同じ部分ファイルへ録画ストリームを保存する。
 // 一時的な切断時は古いleaseを閉じた後だけ、固定した小さい上限内で開き直す。
 type Executor struct {
-	Store        AttemptStore
-	Stream       providerstream.Provider
-	Files        FileOperations
-	Clock        TimeSource
-	NewID        func() (catalogmodel.ID, error)
-	OwnerID      catalogmodel.ID
-	Generation   int64
-	WithDeadline func(context.Context, time.Time) (context.Context, context.CancelFunc)
-	Wait         func(context.Context, time.Duration) error
+	Store                AttemptStore
+	Stream               providerstream.Provider
+	Files                FileOperations
+	Clock                TimeSource
+	NewID                func() (catalogmodel.ID, error)
+	OwnerID              catalogmodel.ID
+	Generation           int64
+	WithDeadline         func(context.Context, time.Time) (context.Context, context.CancelFunc)
+	Wait                 func(context.Context, time.Duration) error
+	PostRecording        func(context.Context, PostRecordingRequest) string
+	ObservePostRecording func(string)
 }
 
 type streamCopyResult struct {
@@ -211,7 +223,7 @@ func (executor Executor) ExecuteClaimed(ctx context.Context, reservation recordi
 		_ = lease.Cancel()
 		_ = lease.Close()
 		if copyResult.Reason == recording.ReasonUserRequestedStop {
-			return executor.finishUserStop(ctx, partial, attempt, copyResult.ByteCount)
+			return executor.finishUserStop(ctx, partial, reservation, attempt, copyResult.ByteCount)
 		}
 		if copyResult.ReachedEnd {
 			break
@@ -223,7 +235,7 @@ func (executor Executor) ExecuteClaimed(ctx context.Context, reservation recordi
 				return Result{}, err
 			}
 			if copyResult.Reason == recording.ReasonUserRequestedStop {
-				return executor.finishUserStop(ctx, partial, attempt, copyResult.ByteCount)
+				return executor.finishUserStop(ctx, partial, reservation, attempt, copyResult.ByteCount)
 			}
 			return executor.finishPartial(ctx, partial, attempt.ID, copyResult.ByteCount, copyResult.Reason)
 		}
@@ -235,7 +247,7 @@ func (executor Executor) ExecuteClaimed(ctx context.Context, reservation recordi
 					return Result{}, err
 				}
 				if copyResult.Reason == recording.ReasonUserRequestedStop {
-					return executor.finishUserStop(ctx, partial, attempt, copyResult.ByteCount)
+					return executor.finishUserStop(ctx, partial, reservation, attempt, copyResult.ByteCount)
 				}
 			} else if copyResult.Retryable && connection == len(reconnectDelays) {
 				copyResult.Reason = recording.ReasonStreamReconnectExhausted
@@ -257,7 +269,30 @@ func (executor Executor) ExecuteClaimed(ctx context.Context, reservation recordi
 	if reconnected {
 		reason = recording.ReasonCompletedAfterReconnect
 	}
-	return executor.publishFinal(ctx, attempt, byteCount, recording.AttemptSucceeded, reason)
+	return executor.publishAndPostProcess(ctx, reservation, attempt, byteCount, recording.AttemptSucceeded, reason)
+}
+
+func (executor Executor) publishAndPostProcess(ctx context.Context, reservation recording.Reservation, attempt recording.Attempt,
+	byteCount int64, state recording.AttemptState, reason recording.TerminalReason,
+) (Result, error) {
+	result, err := executor.publishFinal(ctx, attempt, byteCount, state, reason)
+	if err != nil || reservation.PostRecording.Script == "" {
+		return result, err
+	}
+	postReason := "post-recording-script-invalid"
+	if executor.Files.FinalPath != nil && executor.PostRecording != nil {
+		finalPath, pathErr := executor.Files.FinalPath(attempt.Plan)
+		if pathErr == nil {
+			postReason = executor.PostRecording(ctx, PostRecordingRequest{
+				Script: reservation.PostRecording.Script, RecordingNumber: reservation.Number,
+				FinalPath: finalPath, State: state, Reason: reason,
+			})
+		}
+	}
+	if postReason != "" && executor.ObservePostRecording != nil {
+		executor.ObservePostRecording(postReason)
+	}
+	return result, nil
 }
 
 // publishFinalは同期して閉じた部分ファイルを、DBへ保存した予定結果どおり完成名へ公開する。
@@ -476,7 +511,9 @@ func (executor Executor) finishPartial(ctx context.Context, file PartialFile, at
 	return executor.finishPartialAfterClose(ctx, file, attemptID, byteCount, reason)
 }
 
-func (executor Executor) finishUserStop(ctx context.Context, file PartialFile, attempt recording.Attempt, byteCount int64) (Result, error) {
+func (executor Executor) finishUserStop(ctx context.Context, file PartialFile, reservation recording.Reservation,
+	attempt recording.Attempt, byteCount int64,
+) (Result, error) {
 	if _, err := executor.Store.UpdateRecordingProgress(context.WithoutCancel(ctx), attempt.ID, byteCount, executor.now()); err != nil {
 		_ = file.Sync()
 		_ = file.Close()
@@ -491,7 +528,8 @@ func (executor Executor) finishUserStop(ctx context.Context, file PartialFile, a
 	if byteCount < minimumUsefulTS {
 		return executor.finishByCount(context.WithoutCancel(ctx), attempt.ID, byteCount, recording.ReasonUserRequestedStop, true)
 	}
-	return executor.publishFinal(context.WithoutCancel(ctx), attempt, byteCount, recording.AttemptPartial, recording.ReasonUserRequestedStop)
+	return executor.publishAndPostProcess(context.WithoutCancel(ctx), reservation, attempt, byteCount,
+		recording.AttemptPartial, recording.ReasonUserRequestedStop)
 }
 
 func (executor Executor) cancelReason(ctx context.Context, attemptID catalogmodel.ID) (recording.TerminalReason, error) {

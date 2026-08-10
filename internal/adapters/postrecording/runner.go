@@ -22,11 +22,16 @@ const (
 	// DefaultTimeoutは一件の録画後スクリプトを待つ最大時間である。
 	DefaultTimeout = 5 * time.Minute
 
-	ReasonInvalid     = "post-recording-script-invalid"
+	// ReasonInvalidは実行直前のpathまたは入力検証に失敗したことを表す。
+	ReasonInvalid = "post-recording-script-invalid"
+	// ReasonStartFailedは検証済みファイルをprocessとして開始できなかったことを表す。
 	ReasonStartFailed = "post-recording-script-start-failed"
-	ReasonExitFailed  = "post-recording-script-exit-failed"
-	ReasonTimeout     = "post-recording-script-timeout"
-	ReasonCancelled   = "post-recording-script-cancelled"
+	// ReasonExitFailedは開始したprocessが非0で終了したことを表す。
+	ReasonExitFailed = "post-recording-script-exit-failed"
+	// ReasonTimeoutは最大実行時間を超えてprocess groupを終了したことを表す。
+	ReasonTimeout = "post-recording-script-timeout"
+	// ReasonCancelledはSazanamiの停止に合わせてprocess groupを終了したことを表す。
+	ReasonCancelled = "post-recording-script-cancelled"
 )
 
 // Directoryは起動時に固定した、所有者だけが変更できるスクリプト保存先である。
@@ -123,6 +128,18 @@ func (runner Runner) Run(ctx context.Context, script string, environment Environ
 	command.Stdin = nil
 	command.Stdout = io.Discard
 	command.Stderr = io.Discard
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	command.Cancel = func() error {
+		if command.Process == nil {
+			return os.ErrProcessDone
+		}
+		err := syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
+		if errors.Is(err, syscall.ESRCH) {
+			return os.ErrProcessDone
+		}
+		return err
+	}
+	command.WaitDelay = time.Second
 	if err := command.Start(); err != nil {
 		if errors.Is(runContext.Err(), context.DeadlineExceeded) {
 			return ReasonTimeout
