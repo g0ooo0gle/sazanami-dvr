@@ -38,7 +38,7 @@ import (
 )
 
 var (
-	version       = "0.0.21"
+	version       = "0.0.22"
 	productCommit = ""
 )
 
@@ -97,7 +97,7 @@ func runContext(ctx context.Context, arguments []string, stdout, stderr io.Write
 	}
 	if arguments[0] == "recording" {
 		if len(arguments) < 2 || arguments[1] != "serve" {
-			fmt.Fprintln(stderr, "使用方法: sazanami-dvr recording serve --data-root <dir> --recording-root <dir> --channel-map <file> --provider mirakurun --base-url <url> [--http-listen 127.0.0.1:40773] [--max-concurrent-recordings 1]")
+			fmt.Fprintln(stderr, "使用方法: sazanami-dvr recording serve --data-root <dir> --recording-root <dir> --channel-map <file> --provider mirakurun --base-url <url> [--http-listen 127.0.0.1:40773] [--max-concurrent-recordings 1] [--post-recording-script-root <dir>]")
 			return 2
 		}
 		if err := runRecordingCommand(ctx, arguments[2:], stdout, stderr); err != nil {

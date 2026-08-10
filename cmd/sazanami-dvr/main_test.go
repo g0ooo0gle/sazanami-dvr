@@ -32,7 +32,7 @@ func TestVersion(t *testing.T) {
 	if code := run([]string{"--version"}, &output, &diagnostic); code != 0 {
 		t.Fatalf("code=%d err=%q", code, diagnostic.String())
 	}
-	if got, want := output.String(), "sazanami-dvr 0.0.21\n"; got != want {
+	if got, want := output.String(), "sazanami-dvr 0.0.22\n"; got != want {
 		t.Fatalf("version=%q want=%q", got, want)
 	}
 }
@@ -437,6 +437,10 @@ func TestRecordingServeRefreshesCatalogWithoutOpeningStreamBeforeReservationTime
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("録画processの終了がtimeoutしました")
+	}
+	postDirectory, err := os.Lstat(filepath.Join(root, "post-recording-scripts"))
+	if err != nil || !postDirectory.IsDir() || postDirectory.Mode().Perm() != 0o700 {
+		t.Fatalf("post recording directory=%v err=%v", postDirectory, err)
 	}
 	for _, private := range []string{root, recordingRoot, channelMap, providerServer.URL, httpAddress, backendID.String(), "service:ctrlcmd"} {
 		if strings.Contains(output.String(), private) || strings.Contains(diagnostic.String(), private) {

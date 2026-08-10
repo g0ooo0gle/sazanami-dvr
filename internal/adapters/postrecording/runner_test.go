@@ -19,12 +19,33 @@ import (
 func TestOpenCreatesOwnerOnlyDirectory(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "scripts")
 	directory, err := Open(path)
-	if err != nil || directory.root != path {
+	if err != nil || directory.root != path || directory.identity == nil {
 		t.Fatalf("directory=%+v err=%v", directory, err)
 	}
 	info, err := os.Lstat(path)
 	if err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
 		t.Fatalf("mode=%v err=%v", info.Mode(), err)
+	}
+}
+
+func TestValidateRejectsReplacedRoot(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scripts")
+	directory, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldRoot := filepath.Join(parent, "old-scripts")
+	if err := os.Rename(root, oldRoot); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(root, "replacement.sh")
+	writeScript(t, script, "#!/bin/sh\nexit 0\n", 0o700)
+	if err := directory.Validate(script); err == nil {
+		t.Fatal("差し替えられた許可ディレクトリを受理しました")
 	}
 }
 
