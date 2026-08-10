@@ -18,6 +18,9 @@ func TestReservationCreateReadbackAndDuplicate(t *testing.T) {
 	reservation := reservationForTest(t, store)
 	reservation.Output = recording.OutputSettings{Folder: "ドラマ/保存", Template: "$Title$-$ReserveID$"}
 	reservation.Components = recording.ComponentDataOnly
+	reservation.PostRecording = recording.PostRecordingSettings{
+		Mode: recording.PostRecordingNothing, Script: "/data/post-recording-scripts/after.sh",
+	}
 	created, err := store.CreateReservation(context.Background(), reservation)
 	if err != nil || created.Number != 1 {
 		t.Fatalf("created=%+v err=%v", created, err)
@@ -25,7 +28,8 @@ func TestReservationCreateReadbackAndDuplicate(t *testing.T) {
 	items, err := store.ActiveReservations(context.Background(), 1, 0)
 	if err != nil || len(items) != 1 || items[0].ID != reservation.ID || items[0].Number != created.Number ||
 		!items[0].RequestedFollow || !items[0].EffectiveFollow || items[0].Program.Title != reservation.Program.Title ||
-		items[0].Output != reservation.Output || items[0].Components != recording.ComponentDataOnly {
+		items[0].Output != reservation.Output || items[0].Components != recording.ComponentDataOnly ||
+		items[0].PostRecording != reservation.PostRecording {
 		t.Fatalf("items=%+v err=%v", items, err)
 	}
 	duplicate := reservation
@@ -43,7 +47,7 @@ func TestReservationCreateReadbackAndDuplicate(t *testing.T) {
 	defer reopened.Close()
 	items, err = reopened.ActiveReservations(context.Background(), 256, 0)
 	if err != nil || len(items) != 1 || items[0].Number != 1 || items[0].Output != reservation.Output ||
-		items[0].Components != recording.ComponentDataOnly {
+		items[0].Components != recording.ComponentDataOnly || items[0].PostRecording != reservation.PostRecording {
 		t.Fatalf("restarted items=%+v err=%v", items, err)
 	}
 }
@@ -160,6 +164,8 @@ func TestReservationSettingsSchemaRejectsInvalidAndScannerRejectsCorruption(t *t
 		`UPDATE reservations SET output_folder=replace(hex(zeroblob(257)), '00', 'a') WHERE id=?`,
 		`UPDATE reservations SET output_template=replace(hex(zeroblob(513)), '00', 'a') WHERE id=?`,
 		`UPDATE reservations SET component_mode=5 WHERE id=?`,
+		`UPDATE reservations SET post_action_mode=2 WHERE id=?`,
+		`UPDATE reservations SET post_script_path=replace(hex(zeroblob(1025)), '00', 'a') WHERE id=?`,
 	} {
 		if _, err := store.writer.Exec(statement, created.ID.Bytes()); err == nil {
 			t.Fatalf("invalid SQL was accepted: %s", statement)

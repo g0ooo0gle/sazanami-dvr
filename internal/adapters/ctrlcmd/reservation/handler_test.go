@@ -25,6 +25,15 @@ type fakeOperations struct {
 	reads        int
 }
 
+type fakeScriptValidator struct{ allowed string }
+
+func (validator fakeScriptValidator) Validate(path string) error {
+	if path != validator.allowed {
+		return errors.New("script not allowed")
+	}
+	return nil
+}
+
 func (operations *fakeOperations) Add(_ context.Context, request recording.ReservationRequest) (recording.Reservation, error) {
 	operations.added = append(operations.added, request)
 	return recording.Reservation{}, operations.addErr
@@ -220,6 +229,54 @@ func TestReservationOutputSettingsRoundTrip(t *testing.T) {
 		return readListedReservation(items, listed)
 	}); err != nil || count != 1 {
 		t.Fatalf("count=%d err=%v", count, err)
+	}
+}
+
+func TestReservationPostRecordingSettingsRoundTrip(t *testing.T) {
+	post := recording.PostRecordingSettings{Mode: recording.PostRecordingNothing, Script: "/allowed/finish.sh"}
+	operations := &fakeOperations{}
+	handler := Handler{Operations: operations, ScriptValidator: fakeScriptValidator{allowed: post.Script}, Limits: codec.DefaultLimits()}
+	request := reservationRequestSettingsWithPostRecording(t, CommandAdd, Version, 0, 1, 3, true,
+		0, 0, 0, 1, 0, recording.OutputSettings{}, post)
+	var response bytes.Buffer
+	if err := handler.Handle(context.Background(), request, &response); err != nil {
+		t.Fatal(err)
+	}
+	frame, err := codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
+	if err != nil || frame.Code != ResultSuccess || len(operations.added) != 1 || operations.added[0].PostRecording != post {
+		t.Fatalf("frame=%+v added=%+v err=%v", frame, operations.added, err)
+	}
+
+	listed := listedReservation(42)
+	listed.PostRecording = post
+	operations.reservations = []recording.Reservation{listed}
+	response.Reset()
+	if err := handler.Handle(context.Background(), listRequest(Version), &response); err != nil {
+		t.Fatal(err)
+	}
+	frame, err = codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
+	reader, readerErr := codec.NewReader(frame.Body, codec.DefaultLimits())
+	if err != nil || readerErr != nil || frame.Code != ResultSuccess {
+		t.Fatalf("frame=%+v parse=%v reader=%v", frame, err, readerErr)
+	}
+	if _, err := reader.U16(); err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.Vector(4, 1, func(item *codec.Reader, _ int) error { return readListedReservation(item, listed) }); err != nil {
+		t.Fatal(err)
+	}
+
+	rejected := post
+	rejected.Script = "/outside/finish.sh"
+	response.Reset()
+	request = reservationRequestSettingsWithPostRecording(t, CommandAdd, Version, 0, 1, 3, true,
+		0, 0, 0, 1, 0, recording.OutputSettings{}, rejected)
+	if err := handler.Handle(context.Background(), request, &response); err != nil {
+		t.Fatal(err)
+	}
+	frame, _ = codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
+	if frame.Code != ResultFailure || len(operations.added) != 1 {
+		t.Fatalf("frame=%+v calls=%d", frame, len(operations.added))
 	}
 }
 
@@ -584,6 +641,14 @@ func reservationRequestSettingsWithServiceMode(t *testing.T, command int32, vers
 	recordingMode, priority uint8, follow bool, useMargins uint8, startMargin, endMargin int32, count int,
 	serviceMode uint32, output recording.OutputSettings,
 ) []byte {
+	return reservationRequestSettingsWithPostRecording(t, command, version, reserveID, recordingMode, priority, follow,
+		useMargins, startMargin, endMargin, count, serviceMode, output, recording.PostRecordingSettings{})
+}
+
+func reservationRequestSettingsWithPostRecording(t *testing.T, command int32, version uint16, reserveID int32,
+	recordingMode, priority uint8, follow bool, useMargins uint8, startMargin, endMargin int32, count int,
+	serviceMode uint32, output recording.OutputSettings, post recording.PostRecordingSettings,
+) []byte {
 	t.Helper()
 	var itemBody bytes.Buffer
 	item, err := codec.NewWriter(&itemBody, codec.DefaultLimits())
@@ -626,8 +691,8 @@ func reservationRequestSettingsWithServiceMode(t *testing.T, command int32, vers
 	if err := item.SystemTime(start); err != nil {
 		t.Fatal(err)
 	}
-	writeInputSettingsWithServiceMode(t, item, recordingMode, priority, follow, useMargins, startMargin, endMargin,
-		serviceMode, output)
+	writeInputSettingsWithPostRecording(t, item, recordingMode, priority, follow, useMargins, startMargin, endMargin,
+		serviceMode, output, post)
 	if err := item.I32(0); err != nil {
 		t.Fatal(err)
 	}
@@ -667,6 +732,14 @@ func writeInputSettingsWithOutput(t *testing.T, writer *codec.Writer, mode, prio
 func writeInputSettingsWithServiceMode(t *testing.T, writer *codec.Writer, mode, priority uint8, follow bool,
 	useMargins uint8, startMargin, endMargin int32, serviceMode uint32, output recording.OutputSettings,
 ) {
+	writeInputSettingsWithPostRecording(t, writer, mode, priority, follow, useMargins, startMargin, endMargin,
+		serviceMode, output, recording.PostRecordingSettings{})
+}
+
+func writeInputSettingsWithPostRecording(t *testing.T, writer *codec.Writer, mode, priority uint8, follow bool,
+	useMargins uint8, startMargin, endMargin int32, serviceMode uint32, output recording.OutputSettings,
+	post recording.PostRecordingSettings,
+) {
 	t.Helper()
 	var folder bytes.Buffer
 	if output != (recording.OutputSettings{}) {
@@ -688,31 +761,41 @@ func writeInputSettingsWithServiceMode(t *testing.T, writer *codec.Writer, mode,
 		_ = folderWriter.I32(int32(4 + fields.Len()))
 		_ = folderWriter.Bytes(fields.Bytes())
 	}
-	if err := writer.I32(int32(51 + folder.Len())); err != nil {
+	var body bytes.Buffer
+	settingsWriter, err := codec.NewWriter(&body, codec.DefaultLimits())
+	if err != nil {
 		t.Fatal(err)
 	}
 	for _, value := range []uint8{mode, priority, boolByte(follow)} {
-		if err := writer.U8(value); err != nil {
+		if err := settingsWriter.U8(value); err != nil {
 			t.Fatal(err)
 		}
 	}
-	_ = writer.U32(serviceMode)
-	_ = writer.U8(0)
-	_ = writer.String("")
+	_ = settingsWriter.U32(serviceMode)
+	_ = settingsWriter.U8(0)
+	_ = settingsWriter.String(post.Script)
 	if output == (recording.OutputSettings{}) {
-		writeTestVector(t, writer, nil, 0)
+		writeTestVector(t, settingsWriter, nil, 0)
 	} else {
-		writeTestVector(t, writer, folder.Bytes(), 1)
+		writeTestVector(t, settingsWriter, folder.Bytes(), 1)
 	}
-	_ = writer.U8(0)
-	_ = writer.U8(0)
-	_ = writer.U8(useMargins)
-	_ = writer.I32(startMargin)
-	_ = writer.I32(endMargin)
-	_ = writer.U8(0)
-	_ = writer.U8(0)
-	_ = writer.U32(0)
-	writeTestVector(t, writer, nil, 0)
+	suspend := uint8(0)
+	if post.Mode == recording.PostRecordingNothing {
+		suspend = 4
+	}
+	_ = settingsWriter.U8(suspend)
+	_ = settingsWriter.U8(0)
+	_ = settingsWriter.U8(useMargins)
+	_ = settingsWriter.I32(startMargin)
+	_ = settingsWriter.I32(endMargin)
+	_ = settingsWriter.U8(0)
+	_ = settingsWriter.U8(0)
+	_ = settingsWriter.U32(0)
+	writeTestVector(t, settingsWriter, nil, 0)
+	if err := writer.I32(int32(4 + body.Len())); err != nil {
+		t.Fatal(err)
+	}
+	_ = writer.Bytes(body.Bytes())
 }
 
 func numberRequest(t *testing.T, command, number int32, vector bool) []byte {
@@ -795,7 +878,8 @@ func readListedReservation(reader *codec.Reader, want recording.Reservation) err
 		}
 		settings, err := decodeSettings(item)
 		if err != nil || settings.priority != want.Priority || settings.follow != want.EffectiveFollow ||
-			settings.disabled != want.Disabled || !sameMargins(settings.margins, want.Margins) || settings.output != want.Output {
+			settings.disabled != want.Disabled || !sameMargins(settings.margins, want.Margins) || settings.output != want.Output ||
+			settings.postRecording != want.PostRecording {
 			return fmt.Errorf("settings=%+v err=%v", settings, err)
 		}
 		if settings.components != want.Components {
