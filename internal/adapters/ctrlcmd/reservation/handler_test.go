@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -125,7 +126,7 @@ func TestAddAcceptsBasicSettingsAndRejectsUnsupportedMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	frame, err := codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
-	if err != nil || frame.Code != ResultSuccess || len(frame.Body) != 2 || len(operations.added) != 1 ||
+	if err != nil || frame.Code != ResultSuccess || len(frame.Body) != 4 || len(operations.added) != 1 ||
 		!operations.added[0].RequestedFollow || operations.added[0].Priority != 3 {
 		t.Fatalf("frame=%+v added=%+v err=%v", frame, operations.added, err)
 	}
@@ -546,7 +547,7 @@ func TestChangeDeleteAndRecordingStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	frame, err := codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
-	if err != nil || frame.Code != ResultSuccess || len(frame.Body) != 2 || len(operations.changed) != 1 ||
+	if err != nil || frame.Code != ResultSuccess || len(frame.Body) != 4 || len(operations.changed) != 1 ||
 		operations.changed[0].Number != 7 || operations.changed[0].Request.Priority != 4 {
 		t.Fatalf("frame=%+v changes=%+v err=%v", frame, operations.changed, err)
 	}
@@ -556,7 +557,7 @@ func TestChangeDeleteAndRecordingStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	frame, _ = codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
-	if frame.Code != ResultSuccess || len(frame.Body) != 0 || len(operations.deleted) != 1 || operations.deleted[0] != 7 {
+	if frame.Code != ResultSuccess || len(frame.Body) != 4 || len(operations.deleted) != 1 || operations.deleted[0] != 7 {
 		t.Fatalf("delete frame=%+v deleted=%v", frame, operations.deleted)
 	}
 
@@ -610,6 +611,93 @@ func TestDeleteAcceptsFixedKonomiTVWireRequest(t *testing.T) {
 	frame, err := codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
 	if err != nil || frame.Code != ResultSuccess || len(operations.deleted) != 1 || operations.deleted[0] != 7 {
 		t.Fatalf("frame=%+v deleted=%v err=%v", frame, operations.deleted, err)
+	}
+}
+
+func TestReservationMutationsReturnSharedFixedSuccess(t *testing.T) {
+	want := []byte{
+		0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+		0x01, 0x00, 0x00, 0x00,
+	}
+	for _, test := range mutationTests(t) {
+		t.Run(test.name, func(t *testing.T) {
+			operations := &fakeOperations{}
+			var response bytes.Buffer
+			err := (Handler{Operations: operations, Limits: codec.DefaultLimits()}).Handle(
+				context.Background(), test.request, &response)
+			if err != nil || !bytes.Equal(response.Bytes(), want) || mutationCalls(operations) != 1 {
+				t.Fatalf("response=%x calls=%d err=%v", response.Bytes(), mutationCalls(operations), err)
+			}
+
+			// Komorebiは本文を32-bit整数として読み、KonomiTVは外側の成功コードを読む。
+			frame, err := codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
+			if err != nil || frame.Code != ResultSuccess || len(frame.Body) != 4 ||
+				int32(binary.LittleEndian.Uint32(frame.Body)) != ResultSuccess {
+				t.Fatalf("frame=%+v err=%v", frame, err)
+			}
+		})
+	}
+}
+
+func TestKonomiTVMutationContractUsesOuterResult(t *testing.T) {
+	for _, test := range mutationTests(t) {
+		t.Run(test.name, func(t *testing.T) {
+			var response bytes.Buffer
+			err := (Handler{Operations: &fakeOperations{}, Limits: codec.DefaultLimits()}).Handle(
+				context.Background(), test.request, &response)
+			if err != nil || response.Len() < 4 || int32(binary.LittleEndian.Uint32(response.Bytes()[:4])) != ResultSuccess {
+				t.Fatalf("response size=%d err=%v", response.Len(), err)
+			}
+		})
+	}
+}
+
+func TestReservationMutationStorageFailureKeepsEmptyFailureResponse(t *testing.T) {
+	for _, test := range mutationTests(t) {
+		t.Run(test.name, func(t *testing.T) {
+			storageErr := errors.New("private storage detail")
+			operations := &fakeOperations{addErr: storageErr, changeErr: storageErr, deleteErr: storageErr}
+			var response bytes.Buffer
+			err := (Handler{Operations: operations, Limits: codec.DefaultLimits()}).Handle(
+				context.Background(), test.request, &response)
+			frame, parseErr := codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
+			if err != nil || parseErr != nil || frame.Code != ResultFailure || len(frame.Body) != 0 ||
+				mutationCalls(operations) != 1 || bytes.Contains(response.Bytes(), []byte("private")) {
+				t.Fatalf("frame=%+v calls=%d err=%v parse=%v", frame, mutationCalls(operations), err, parseErr)
+			}
+		})
+	}
+}
+
+func TestReservationMutationWriteFailureDoesNotRepeatOperation(t *testing.T) {
+	for _, test := range mutationTests(t) {
+		for _, limit := range []int{1, 2, 3, 5, 6, 7, 9, 10, 11} {
+			t.Run(fmt.Sprintf("%s/%d", test.name, limit), func(t *testing.T) {
+				operations := &fakeOperations{}
+				err := (Handler{Operations: operations, Limits: codec.DefaultLimits()}).Handle(
+					context.Background(), test.request, &shortWriter{remaining: limit})
+				var codecErr *codec.Error
+				if !errors.As(err, &codecErr) || codecErr.Category != codec.PeerDisconnect || mutationCalls(operations) != 1 {
+					t.Fatalf("calls=%d err=%v", mutationCalls(operations), err)
+				}
+			})
+		}
+	}
+}
+
+func TestReservationMutationCanceledResponseDoesNotRepeatOperation(t *testing.T) {
+	for _, test := range mutationTests(t) {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			operations := &fakeOperations{}
+			err := (Handler{Operations: operations, Limits: codec.DefaultLimits()}).Handle(
+				ctx, test.request, &bytes.Buffer{})
+			var codecErr *codec.Error
+			if !errors.As(err, &codecErr) || codecErr.Category != codec.Timeout || mutationCalls(operations) != 1 {
+				t.Fatalf("calls=%d err=%v", mutationCalls(operations), err)
+			}
+		})
 	}
 }
 
@@ -669,6 +757,39 @@ func TestMeasureReservationCountBoundary(t *testing.T) {
 type generatedOperations struct {
 	count        int
 	maximumLimit int
+}
+
+type mutationTest struct {
+	name    string
+	request []byte
+}
+
+func mutationTests(t *testing.T) []mutationTest {
+	t.Helper()
+	return []mutationTest{
+		{name: "追加", request: addRequest(t, Version, 1, false, false, 1)},
+		{name: "変更", request: changeRequest(t, 7, 3)},
+		{name: "取消し", request: numberRequest(t, CommandDelete, 7, true)},
+	}
+}
+
+func mutationCalls(operations *fakeOperations) int {
+	return len(operations.added) + len(operations.changed) + len(operations.deleted)
+}
+
+type shortWriter struct{ remaining int }
+
+func (writer *shortWriter) Write(data []byte) (int, error) {
+	if writer.remaining <= 0 {
+		return 0, io.ErrClosedPipe
+	}
+	if len(data) > writer.remaining {
+		written := writer.remaining
+		writer.remaining = 0
+		return written, io.ErrClosedPipe
+	}
+	writer.remaining -= len(data)
+	return len(data), nil
 }
 
 func (*generatedOperations) Add(context.Context, recording.ReservationRequest) (recording.Reservation, error) {
