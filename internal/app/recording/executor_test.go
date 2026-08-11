@@ -34,6 +34,8 @@ type attemptMemory struct {
 	finishErr    error
 	progressErr  error
 	finalizeErr  error
+	finalizeFunc func(core.FinalizeRequest) (core.FinalizeRequest, error)
+	finalizeCall int
 	publishErr   error
 	directoryErr error
 	stop         atomic.Bool
@@ -106,10 +108,18 @@ func (store *attemptMemory) UpdateOneSegProgress(_ context.Context, _ catalogmod
 	return end, err
 }
 
-func (store *attemptMemory) BeginFinalization(_ context.Context, request core.FinalizeRequest) error {
+func (store *attemptMemory) BeginFinalization(_ context.Context,
+	request core.FinalizeRequest,
+) (core.FinalizeRequest, error) {
+	store.finalizeCall++
 	store.finalize = request
 	store.record("finalizing")
-	return store.finalizeErr
+	if store.finalizeFunc != nil {
+		resolved, err := store.finalizeFunc(request)
+		store.finalize = resolved
+		return resolved, err
+	}
+	return request, store.finalizeErr
 }
 
 func (store *attemptMemory) MarkFinalPublished(context.Context, catalogmodel.ID, time.Time) error {
@@ -485,6 +495,24 @@ func TestOneSegCoordinatorPublishesUsefulAuxiliaryThatObservedUserStopFirst(t *t
 				t.Fatalf("result=%+v", result)
 			}
 		})
+	}
+}
+
+func TestOneSegCoordinatorDowngradesJoinedResultWithoutJoiningAgain(t *testing.T) {
+	done := make(chan core.OneSegResult, 1)
+	done <- core.OneSegResult{
+		ByteCount: minimumUsefulTS, Availability: core.AvailabilityPartial,
+		Reason: core.ReasonCompleted, FileSynced: true, Publish: true,
+	}
+	var cancelCalls atomic.Int32
+	coordinator := &oneSegCoordinator{
+		done: done, started: true, cancel: func() { cancelCalls.Add(1) },
+	}
+	first := coordinator.join(core.ReasonCompleted, true)
+	second := coordinator.join(core.ReasonProcessShutdown, false)
+	if !first.Publish || second.Publish || second.Reason != core.ReasonProcessShutdown ||
+		second.Availability != core.AvailabilityPartial || cancelCalls.Load() != 1 {
+		t.Fatalf("first=%+v second=%+v cancel_calls=%d", first, second, cancelCalls.Load())
 	}
 }
 
@@ -1448,6 +1476,9 @@ func TestUserStoppedPublicationFailsAtEachDurabilityBoundary(t *testing.T) {
 			} else if result.State != core.AttemptFinalizing || result.Reason != test.wantReason {
 				t.Fatalf("result=%+v", result)
 			}
+			if test.fail == "finalize" && store.finalizeCall != 1 {
+				t.Fatalf("finalization calls=%d", store.finalizeCall)
+			}
 		})
 	}
 }
@@ -1483,30 +1514,110 @@ func TestPostRecordingRunsOnlyAfterSuccessfulFinalization(t *testing.T) {
 	}}
 	called := 0
 	observed := ""
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	executor := Executor{
 		Store: store, Clock: &mutableClock{now: start}, NewID: func() (catalogmodel.ID, error) { return appID(t, 84), nil },
 		Files: FileOperations{
 			LinkFinal: func(core.FilePlan) error { return nil }, SyncDirectory: func(core.FilePlan) error { return nil },
 			RemovePartial: func(core.FilePlan) error { return nil },
-			FinalPath:     func(core.FilePlan) (string, error) { return "/recordings/2026/08/test.ts", nil },
+			FinalPath: func(core.FilePlan) (string, error) {
+				cancel()
+				return "/recordings/2026/08/test.ts", nil
+			},
 		},
-		PostRecording: func(_ context.Context, request PostRecordingRequest) string {
+		PostRecording: func(postContext context.Context, request PostRecordingRequest) string {
 			called++
 			if store.finish.State != core.AttemptSucceeded || store.finish.Availability != core.AvailabilityFinal ||
 				request.Script != reservation.PostRecording.Script || request.RecordingNumber != reservation.Number ||
 				request.FinalPath != "/recordings/2026/08/test.ts" || request.State != core.AttemptSucceeded ||
-				request.Reason != core.ReasonCompleted {
-				t.Fatalf("finish=%+v request=%+v", store.finish, request)
+				request.Reason != core.ReasonCompleted || !errors.Is(postContext.Err(), context.Canceled) {
+				t.Fatalf("finish=%+v request=%+v context=%v", store.finish, request, postContext.Err())
 			}
 			return "post-recording-script-exit-failed"
 		},
 		ObservePostRecording: func(reason string) { observed = reason },
 	}
-	result, err := executor.publishAndPostProcess(context.Background(), reservation, attempt, 188,
+	result, err := executor.publishAndPostProcess(ctx, reservation, attempt, 188,
 		core.AttemptSucceeded, core.ReasonCompleted)
 	if err != nil || result.State != core.AttemptSucceeded || result.PostRecording != core.PostRecordingStandby ||
 		called != 1 || observed != "post-recording-script-exit-failed" {
 		t.Fatalf("result=%+v called=%d observed=%q err=%v", result, called, observed, err)
+	}
+}
+
+func TestPostRecordingUsesFinalizationOutcome(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	store := &attemptMemory{start: start, end: start.Add(time.Hour)}
+	store.finalizeFunc = func(request core.FinalizeRequest) (core.FinalizeRequest, error) {
+		request.State = core.AttemptPartial
+		request.Reason = core.ReasonUserRequestedStop
+		return request, nil
+	}
+	attempt := core.Attempt{ID: appID(t, 93), Plan: core.FilePlan{
+		PartialPath: "2026/08/test.part", FinalPath: "2026/08/test.ts",
+	}}
+	reservation := core.Reservation{Number: 19, PostRecording: core.PostRecordingSettings{
+		Script: "/allowed/finish.sh",
+	}}
+	postCalls := 0
+	executor := Executor{
+		Store: store, Clock: &mutableClock{now: start}, NewID: func() (catalogmodel.ID, error) { return appID(t, 94), nil },
+		Files: FileOperations{
+			LinkFinal: func(core.FilePlan) error { return nil }, SyncDirectory: func(core.FilePlan) error { return nil },
+			RemovePartial: func(core.FilePlan) error { return nil },
+			FinalPath:     func(core.FilePlan) (string, error) { return "/recordings/2026/08/test.ts", nil },
+		},
+		PostRecording: func(postContext context.Context, request PostRecordingRequest) string {
+			postCalls++
+			if request.State != core.AttemptPartial || request.Reason != core.ReasonUserRequestedStop ||
+				postContext.Err() != nil {
+				t.Fatalf("request=%+v context=%v", request, postContext.Err())
+			}
+			return ""
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result, err := executor.publishAndPostProcess(ctx, reservation, attempt, 188,
+		core.AttemptSucceeded, core.ReasonCompleted)
+	if err != nil || result.State != core.AttemptPartial || result.Reason != core.ReasonUserRequestedStop ||
+		store.finish.State != core.AttemptPartial || store.finish.Reason != core.ReasonUserRequestedStop || postCalls != 1 {
+		t.Fatalf("result=%+v finish=%+v post_calls=%d err=%v", result, store.finish, postCalls, err)
+	}
+}
+
+func TestCancelledFinalizationWithoutStopBecomesProcessShutdown(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	store := &attemptMemory{start: start, end: start.Add(time.Hour)}
+	store.finalizeFunc = func(request core.FinalizeRequest) (core.FinalizeRequest, error) {
+		if request.State != core.AttemptPartial || request.Reason != core.ReasonUserRequestedStop {
+			t.Fatalf("request=%+v", request)
+		}
+		return core.FinalizeRequest{}, core.ErrFinalizationUnavailable
+	}
+	links := 0
+	postCalls := 0
+	executor := Executor{
+		Store: store, Clock: &mutableClock{now: start}, NewID: func() (catalogmodel.ID, error) { return appID(t, 95), nil },
+		Files: FileOperations{
+			LinkFinal:     func(core.FilePlan) error { links++; return nil },
+			SyncDirectory: func(core.FilePlan) error { return nil }, RemovePartial: func(core.FilePlan) error { return nil },
+			FinalPath: func(core.FilePlan) (string, error) { return "/recordings/missing.ts", nil },
+		},
+		PostRecording: func(context.Context, PostRecordingRequest) string { postCalls++; return "" },
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result, err := executor.publishAndPostProcess(ctx, core.Reservation{PostRecording: core.PostRecordingSettings{
+		Mode: core.PostRecordingStandby, Script: "/allowed/finish.sh",
+	}}, core.Attempt{ID: appID(t, 96)}, 188, core.AttemptSucceeded, core.ReasonCompleted)
+	if err != nil || result.State != core.AttemptCancelled || result.Reason != core.ReasonProcessShutdown ||
+		store.finish.State != core.AttemptCancelled || store.finish.Reason != core.ReasonProcessShutdown ||
+		store.finish.Availability != core.AvailabilityPartial || store.finalizeCall != 1 || links != 0 ||
+		postCalls != 0 || result.PostRecording.ChangesPower() {
+		t.Fatalf("result=%+v finish=%+v calls=%d links=%d post_calls=%d err=%v",
+			result, store.finish, store.finalizeCall, links, postCalls, err)
 	}
 }
 

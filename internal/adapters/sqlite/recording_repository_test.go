@@ -545,7 +545,7 @@ func TestReservationFollowReconcilesActiveTimeUnlessExtensionOnlyOrFinalizing(t 
 				if _, err := store.UpdateRecordingProgress(context.Background(), attemptID, 188, now.Add(3*time.Second)); err != nil {
 					t.Fatal(err)
 				}
-				if err := store.BeginFinalization(context.Background(), recording.FinalizeRequest{
+				if _, err := store.BeginFinalization(context.Background(), recording.FinalizeRequest{
 					AttemptID: attemptID, Token: testID(t, byte(200+index)), ByteCount: 188,
 					State: recording.AttemptSucceeded, Reason: recording.ReasonCompleted, Now: now.Add(4 * time.Second),
 				}); err != nil {
@@ -945,7 +945,7 @@ func TestRecordingAttemptLifecycle(t *testing.T) {
 		AttemptID: claim.AttemptID, Token: testID(t, 121), ByteCount: 376,
 		State: recording.AttemptSucceeded, Reason: recording.ReasonCompleted, Now: now.Add(5 * time.Second),
 	}
-	if err := store.BeginFinalization(context.Background(), finalize); err != nil {
+	if _, err := store.BeginFinalization(context.Background(), finalize); err != nil {
 		t.Fatal(err)
 	}
 	premature := recording.FinishRequest{
@@ -1221,7 +1221,7 @@ func TestOneSegLifecycleKeepsMainByteCountAndSettlesBothSegments(t *testing.T) {
 	if _, err := store.UpdateOneSegProgress(context.Background(), request.AttemptID, 188, now.Add(5*time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.BeginFinalization(context.Background(), recording.FinalizeRequest{
+	if _, err := store.BeginFinalization(context.Background(), recording.FinalizeRequest{
 		AttemptID: request.AttemptID, Token: testID(t, 216), ByteCount: 376,
 		State: recording.AttemptSucceeded, Reason: recording.ReasonCompleted, Now: now.Add(6 * time.Second),
 		OneSeg: &recording.OneSegResult{ByteCount: 188, Availability: recording.AvailabilityPartial,
@@ -1520,15 +1520,10 @@ func TestUserStopIsPersistedIdempotentlyAndPublishesOnlyItsPartialRecording(t *t
 		AttemptID: claim.AttemptID, Token: testID(t, 134), ByteCount: 376,
 		State: recording.AttemptSucceeded, Reason: recording.ReasonCompleted, Now: now.Add(6 * time.Second),
 	}
-	if err := store.BeginFinalization(context.Background(), normal); !errors.Is(err, ErrAttemptState) {
-		t.Fatalf("停止要求後の正常完成が受理されました: %v", err)
-	}
-	stopped := normal
-	stopped.Token = testID(t, 135)
-	stopped.State = recording.AttemptPartial
-	stopped.Reason = recording.ReasonUserRequestedStop
-	if err := store.BeginFinalization(context.Background(), stopped); err != nil {
-		t.Fatal(err)
+	resolved, err := store.BeginFinalization(context.Background(), normal)
+	if err != nil || resolved.State != recording.AttemptPartial ||
+		resolved.Reason != recording.ReasonUserRequestedStop {
+		t.Fatalf("resolved=%+v err=%v", resolved, err)
 	}
 	if _, err := store.StopReservation(context.Background(), created.Number, now.Add(7*time.Second)); !errors.Is(err, ErrReservationUnavailable) {
 		t.Fatalf("完成処理中の停止が成功しました: %v", err)

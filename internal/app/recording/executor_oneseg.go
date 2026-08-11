@@ -45,10 +45,25 @@ func (store *oneSegAttemptStore) RecordingStarted(ctx context.Context, attemptID
 }
 
 // BeginFinalizationはワンセグの終了を待ち、二つの同期結果を一緒に保存する。
-func (store *oneSegAttemptStore) BeginFinalization(ctx context.Context, request core.FinalizeRequest) error {
+func (store *oneSegAttemptStore) BeginFinalization(ctx context.Context,
+	request core.FinalizeRequest,
+) (core.FinalizeRequest, error) {
 	oneSeg := store.coordinator.join(request.Reason, true)
+	if ctx.Err() != nil {
+		request.State = core.AttemptPartial
+		request.Reason = core.ReasonUserRequestedStop
+		if oneSeg.Publish {
+			oneSeg.Reason = core.ReasonUserRequestedStop
+		}
+	}
 	request.OneSeg = &oneSeg
-	return store.AttemptStore.BeginFinalization(ctx, request)
+	resolved, err := store.AttemptStore.BeginFinalization(ctx, request)
+	if err == nil && resolved.OneSeg != nil {
+		store.coordinator.mu.Lock()
+		store.coordinator.result = *resolved.OneSeg
+		store.coordinator.mu.Unlock()
+	}
+	return resolved, err
 }
 
 // MarkDirectorySyncedはメインの完成を確定してから、公開可能なワンセグを処理する。
@@ -108,6 +123,11 @@ func (coordinator *oneSegCoordinator) start(ctx context.Context, plannedEnd time
 func (coordinator *oneSegCoordinator) join(mainReason core.TerminalReason, allowPublish bool) core.OneSegResult {
 	coordinator.mu.Lock()
 	if coordinator.joined {
+		if !allowPublish && coordinator.result.Publish {
+			coordinator.result.Publish = false
+			coordinator.result.Reason = mainReason
+			coordinator.result.Availability = core.AvailabilityPartial
+		}
 		result := coordinator.result
 		coordinator.mu.Unlock()
 		return result

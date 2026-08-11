@@ -22,6 +22,8 @@ var (
 	ErrReservationUnavailable = recording.ErrReservationUnavailable
 	// ErrAttemptStateは録画処理を要求された状態へ進められないことを表す。
 	ErrAttemptState = errors.New("sqlite: recording attempt state conflict")
+	// ErrFinalizationUnavailableは録画の終了状態が先行処理によって変わり、要求どおりに確定できないことを表す。
+	ErrFinalizationUnavailable = recording.ErrFinalizationUnavailable
 )
 
 type rowScanner interface {
@@ -930,71 +932,100 @@ func (store *Store) UpdateOneSegProgress(ctx context.Context, attemptID catalogm
 	return time.UnixMilli(plannedEndMS).UTC(), nil
 }
 
-// BeginFinalizationはファイル同期済みのバイト数とトークンを保存し、完成名を公開できる状態へ進める。
-func (store *Store) BeginFinalization(ctx context.Context, request recording.FinalizeRequest) error {
+// BeginFinalizationは停止要求と競合しても終了結果を一つに確定し、完成名を公開できる状態へ進める。
+func (store *Store) BeginFinalization(ctx context.Context,
+	request recording.FinalizeRequest,
+) (recording.FinalizeRequest, error) {
 	if store == nil || store.writer == nil || ctx == nil || request.Validate() != nil {
-		return errors.New("sqlite: invalid recording finalization")
+		return recording.FinalizeRequest{}, errors.New("sqlite: invalid recording finalization")
 	}
-	tx, err := store.writer.BeginTx(ctx, &sql.TxOptions{})
+	durableCtx := context.WithoutCancel(ctx)
+	tx, err := store.writer.BeginTx(durableCtx, &sql.TxOptions{})
 	if err != nil {
-		return sanitize("begin-recording-finalization", err)
+		return recording.FinalizeRequest{}, sanitize("begin-recording-finalization", err)
 	}
 	defer tx.Rollback()
 	nowMS := request.Now.UnixMilli()
-	result, err := tx.ExecContext(ctx, `UPDATE recording_attempts SET state='FINALIZING', state_version=state_version+1,
-		byte_count=?, heartbeat_utc_ms=?, finalization_token=?, planned_final_state=?, planned_terminal_reason=?, updated_at_utc_ms=?
-		WHERE id=? AND state='RECORDING' AND byte_count<=?
-		AND ((?='PARTIAL' AND stop_requested_at_utc_ms IS NOT NULL) OR (?='SUCCEEDED' AND stop_requested_at_utc_ms IS NULL))`,
-		request.ByteCount, nowMS, request.Token.Bytes(), request.State, request.Reason, nowMS, request.AttemptID.Bytes(),
-		request.ByteCount, request.State, request.State)
+	markFinalizing := func(candidate recording.FinalizeRequest) (sql.Result, error) {
+		return tx.ExecContext(durableCtx, `UPDATE recording_attempts SET state='FINALIZING', state_version=state_version+1,
+			byte_count=?, heartbeat_utc_ms=?, finalization_token=?, planned_final_state=?, planned_terminal_reason=?, updated_at_utc_ms=?
+			WHERE id=? AND state='RECORDING' AND byte_count<=?
+			AND ((?='PARTIAL' AND stop_requested_at_utc_ms IS NOT NULL) OR (?='SUCCEEDED' AND stop_requested_at_utc_ms IS NULL))`,
+			candidate.ByteCount, nowMS, candidate.Token.Bytes(), candidate.State, candidate.Reason, nowMS,
+			candidate.AttemptID.Bytes(), candidate.ByteCount, candidate.State, candidate.State)
+	}
+	resolved := request
+	result, err := markFinalizing(resolved)
 	if err != nil {
-		return sanitize("mark-recording-finalizing", err)
+		return recording.FinalizeRequest{}, sanitize("mark-recording-finalizing", err)
 	}
-	if affected(result) != 1 {
-		return ErrAttemptState
+	count, err := result.RowsAffected()
+	if err != nil {
+		return recording.FinalizeRequest{}, sanitize("count-recording-finalizing", err)
 	}
-	result, err = tx.ExecContext(ctx, `UPDATE recording_segments SET state='PARTIAL', byte_count=?, file_synced=1,
+	if count == 0 && request.State == recording.AttemptSucceeded &&
+		(request.Reason == recording.ReasonCompleted || request.Reason == recording.ReasonCompletedAfterReconnect) {
+		resolved.State = recording.AttemptPartial
+		resolved.Reason = recording.ReasonUserRequestedStop
+		if resolved.OneSeg != nil && resolved.OneSeg.Publish {
+			oneSeg := *resolved.OneSeg
+			oneSeg.Reason = recording.ReasonUserRequestedStop
+			resolved.OneSeg = &oneSeg
+		}
+		result, err = markFinalizing(resolved)
+		if err != nil {
+			return recording.FinalizeRequest{}, sanitize("mark-stopped-recording-finalizing", err)
+		}
+		count, err = result.RowsAffected()
+		if err != nil {
+			return recording.FinalizeRequest{}, sanitize("count-stopped-recording-finalizing", err)
+		}
+	}
+	if count != 1 {
+		return recording.FinalizeRequest{}, ErrFinalizationUnavailable
+	}
+	result, err = tx.ExecContext(durableCtx, `UPDATE recording_segments SET state='PARTIAL', byte_count=?, file_synced=1,
 		availability='PARTIAL', updated_at_utc_ms=? WHERE attempt_id=? AND ordinal=0 AND state='WRITING'
-		AND byte_count<=?`, request.ByteCount, nowMS, request.AttemptID.Bytes(), request.ByteCount)
+		AND byte_count<=?`, resolved.ByteCount, nowMS, resolved.AttemptID.Bytes(), resolved.ByteCount)
 	if err != nil {
-		return sanitize("mark-recording-segment-synced", err)
+		return recording.FinalizeRequest{}, sanitize("mark-recording-segment-synced", err)
 	}
 	if affected(result) != 1 {
-		return ErrAttemptState
+		return recording.FinalizeRequest{}, ErrAttemptState
 	}
 	var oneSegCount int
-	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM recording_segments WHERE attempt_id=? AND ordinal=1`,
-		request.AttemptID.Bytes()).Scan(&oneSegCount); err != nil {
-		return sanitize("count-one-seg-finalization", err)
+	if err := tx.QueryRowContext(durableCtx, `SELECT count(*) FROM recording_segments WHERE attempt_id=? AND ordinal=1`,
+		resolved.AttemptID.Bytes()).Scan(&oneSegCount); err != nil {
+		return recording.FinalizeRequest{}, sanitize("count-one-seg-finalization", err)
 	}
-	if (request.OneSeg == nil) != (oneSegCount == 0) {
-		return ErrAttemptState
+	if (resolved.OneSeg == nil) != (oneSegCount == 0) {
+		return recording.FinalizeRequest{}, ErrAttemptState
 	}
-	if request.OneSeg != nil {
+	if resolved.OneSeg != nil {
 		fileSynced := 0
-		if request.OneSeg.FileSynced {
+		if resolved.OneSeg.FileSynced {
 			fileSynced = 1
 		}
 		var integrity any
-		if !request.OneSeg.Publish {
-			integrity = request.OneSeg.Reason
+		if !resolved.OneSeg.Publish {
+			integrity = resolved.OneSeg.Reason
 		}
-		result, err = tx.ExecContext(ctx, `UPDATE recording_segments SET state='PARTIAL', byte_count=?,
+		result, err = tx.ExecContext(durableCtx, `UPDATE recording_segments SET state='PARTIAL', byte_count=?,
 			file_synced=?, availability=?, integrity_reason=?, updated_at_utc_ms=?
 			WHERE attempt_id=? AND ordinal=1 AND state IN ('PLANNED','WRITING') AND byte_count<=?`,
-			request.OneSeg.ByteCount, fileSynced, request.OneSeg.Availability, integrity, nowMS,
-			request.AttemptID.Bytes(), request.OneSeg.ByteCount)
+			resolved.OneSeg.ByteCount, fileSynced, resolved.OneSeg.Availability, integrity, nowMS,
+			resolved.AttemptID.Bytes(), resolved.OneSeg.ByteCount)
 		if err != nil {
-			return sanitize("save-one-seg-finalization", err)
+			return recording.FinalizeRequest{}, sanitize("save-one-seg-finalization", err)
 		}
 		if affected(result) != 1 {
-			return ErrAttemptState
+			return recording.FinalizeRequest{}, ErrAttemptState
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return sanitize("commit-recording-finalization", err)
+		return recording.FinalizeRequest{}, sanitize("commit-recording-finalization", err)
 	}
-	return nil
+	return resolved, nil
 }
 
 // MarkFinalPublishedはハードリンクによる完成名の公開を記録する。

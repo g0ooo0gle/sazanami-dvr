@@ -8,6 +8,8 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -100,6 +102,145 @@ func (lease *parallelE2ELease) Read(ctx context.Context, destination []byte) (in
 
 func (*parallelE2ELease) Cancel() error { return nil }
 func (*parallelE2ELease) Close() error  { return nil }
+
+type finalizationRaceClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (clock *finalizationRaceClock) Now() time.Time {
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
+	return clock.now
+}
+
+func (clock *finalizationRaceClock) set(now time.Time) {
+	clock.mu.Lock()
+	clock.now = now
+	clock.mu.Unlock()
+}
+
+func (clock *finalizationRaceClock) NewTimer(duration time.Duration) apprecording.Timer {
+	return finalizationRaceTimer{Timer: time.NewTimer(duration)}
+}
+
+type finalizationRaceTimer struct{ *time.Timer }
+
+func (timer finalizationRaceTimer) C() <-chan time.Time { return timer.Timer.C }
+
+type finalizationRaceStream struct {
+	clock             *finalizationRaceClock
+	end               time.Time
+	mu                sync.Mutex
+	firstAttempt      string
+	requests          []string
+	firstIdentified   chan struct{}
+	identifyOnce      sync.Once
+	oneSegWritten     chan struct{}
+	secondStarted     chan struct{}
+	secondStartOnce   sync.Once
+	releaseSecond     <-chan struct{}
+	secondWasCanceled atomic.Bool
+}
+
+func (stream *finalizationRaceStream) OpenStream(_ context.Context,
+	request providerstream.Request,
+) (providerstream.Lease, error) {
+	stream.mu.Lock()
+	stream.requests = append(stream.requests, request.CorrelationID)
+	stream.mu.Unlock()
+	if strings.HasSuffix(request.CorrelationID, "-oneseg") {
+		stream.identifyOnce.Do(func() {
+			stream.mu.Lock()
+			stream.firstAttempt = strings.TrimSuffix(request.CorrelationID, "-oneseg")
+			stream.mu.Unlock()
+			close(stream.firstIdentified)
+		})
+		return &finalizationRaceLease{read: func(ctx context.Context, destination []byte) (int, providerstream.Terminal, error) {
+			select {
+			case <-stream.oneSegWritten:
+				<-ctx.Done()
+				return 0, providerstream.Terminal{Done: true, Reason: providerstream.TerminalCancelled}, ctx.Err()
+			default:
+				copy(destination, bytes.Repeat([]byte{0x47}, 188))
+				close(stream.oneSegWritten)
+				return 188, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
+			}
+		}}, nil
+	}
+	attempt := request.CorrelationID
+	return &finalizationRaceLease{read: func(ctx context.Context, destination []byte) (int, providerstream.Terminal, error) {
+		select {
+		case <-ctx.Done():
+			return 0, providerstream.Terminal{Done: true, Reason: providerstream.TerminalCancelled}, ctx.Err()
+		case <-stream.firstIdentified:
+		}
+		stream.mu.Lock()
+		first := attempt == stream.firstAttempt
+		stream.mu.Unlock()
+		if first {
+			select {
+			case <-ctx.Done():
+				return 0, providerstream.Terminal{Done: true, Reason: providerstream.TerminalCancelled}, ctx.Err()
+			case <-stream.oneSegWritten:
+			}
+			select {
+			case <-ctx.Done():
+				return 0, providerstream.Terminal{Done: true, Reason: providerstream.TerminalCancelled}, ctx.Err()
+			case <-stream.secondStarted:
+			}
+			copy(destination, bytes.Repeat([]byte{0x47}, 188))
+			stream.clock.set(stream.end)
+			return 188, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
+		}
+		stream.secondStartOnce.Do(func() { close(stream.secondStarted) })
+		select {
+		case <-ctx.Done():
+			stream.secondWasCanceled.Store(true)
+			return 0, providerstream.Terminal{Done: true, Reason: providerstream.TerminalCancelled}, ctx.Err()
+		case <-stream.releaseSecond:
+		}
+		copy(destination, bytes.Repeat([]byte{0x47}, 188))
+		stream.clock.set(stream.end)
+		return 188, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
+	}}, nil
+}
+
+type finalizationRaceLease struct {
+	read func(context.Context, []byte) (int, providerstream.Terminal, error)
+}
+
+func (lease *finalizationRaceLease) Read(ctx context.Context,
+	destination []byte,
+) (int, providerstream.Terminal, error) {
+	return lease.read(ctx, destination)
+}
+
+func (*finalizationRaceLease) Cancel() error { return nil }
+func (*finalizationRaceLease) Close() error  { return nil }
+
+type blockedSyncPartial struct {
+	apprecording.PartialFile
+	started chan<- struct{}
+	release <-chan struct{}
+	once    sync.Once
+	syncs   atomic.Int32
+	closes  atomic.Int32
+}
+
+func (file *blockedSyncPartial) Sync() error {
+	file.syncs.Add(1)
+	file.once.Do(func() {
+		file.started <- struct{}{}
+		<-file.release
+	})
+	return file.PartialFile.Sync()
+}
+
+func (file *blockedSyncPartial) Close() error {
+	file.closes.Add(1)
+	return file.PartialFile.Close()
+}
 
 func (lease *e2eLease) Read(_ context.Context, destination []byte) (int, providerstream.Terminal, error) {
 	copy(destination, bytes.Repeat([]byte{0x47}, 188))
@@ -436,6 +577,155 @@ func TestTwoRecordingsUseSeparateDatabaseRowsAndFiles(t *testing.T) {
 	items, err = store.RecoveryAttempts(context.Background(), core.MaxRecoveryPage, catalogmodel.ID{})
 	if err != nil || len(items) != 2 || items[0].State != core.AttemptSucceeded || items[1].State != core.AttemptSucceeded {
 		t.Fatalf("restart items=%+v err=%v", items, err)
+	}
+}
+
+func TestStopWhileOneSegSyncsFinalizesOnlyThatRecording(t *testing.T) {
+	_, store := openMigratedStore(t)
+	firstRequest := reservationForTest(t, store)
+	firstRequest.OneSegOutput = &core.OneSegOutput{ProviderServiceLocator: "1004"}
+	first, err := store.CreateReservation(context.Background(), firstRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRequest := secondReservationForE2E(t, store, firstRequest)
+	secondRequest.OneSegOutput = nil
+	second, err := store.CreateReservation(context.Background(), secondRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordingRoot, err := recordingfs.OpenRoot(filepath.Join(t.TempDir(), "recordings"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recordingRoot.Close()
+
+	oneSegSyncStarted := make(chan struct{}, 1)
+	releaseOneSegSync := make(chan struct{})
+	releaseSecond := make(chan struct{})
+	var releaseOneSegOnce, releaseSecondOnce sync.Once
+	releaseOneSeg := func() { releaseOneSegOnce.Do(func() { close(releaseOneSegSync) }) }
+	releaseOther := func() { releaseSecondOnce.Do(func() { close(releaseSecond) }) }
+	t.Cleanup(releaseOneSeg)
+	t.Cleanup(releaseOther)
+	clock := &finalizationRaceClock{now: first.Program.Start}
+	var oneSegFile *blockedSyncPartial
+	ids := []catalogmodel.ID{
+		testID(t, 240), testID(t, 241), testID(t, 242), testID(t, 243),
+		testID(t, 244), testID(t, 245), testID(t, 246), testID(t, 247),
+	}
+	var nextID atomic.Int64
+	stream := &finalizationRaceStream{
+		clock: clock, end: first.PlannedEnd(), firstIdentified: make(chan struct{}),
+		oneSegWritten: make(chan struct{}), secondStarted: make(chan struct{}), releaseSecond: releaseSecond,
+	}
+	executor := apprecording.Executor{
+		Store: store, Stream: stream, Clock: clock, OwnerID: testID(t, 239), Generation: 1,
+		NewID: func() (catalogmodel.ID, error) {
+			index := int(nextID.Add(1) - 1)
+			if index >= len(ids) {
+				return catalogmodel.ID{}, errors.New("too many ids")
+			}
+			return ids[index], nil
+		},
+		Files: apprecording.FileOperations{
+			CreatePartial: func(plan core.FilePlan) (apprecording.PartialFile, error) {
+				created, createErr := recordingRoot.CreatePartial(plan)
+				var file apprecording.PartialFile = created
+				if createErr == nil && strings.Contains(plan.FinalPath, ".oneseg.") {
+					oneSegFile = &blockedSyncPartial{PartialFile: file, started: oneSegSyncStarted, release: releaseOneSegSync}
+					file = oneSegFile
+				}
+				return file, createErr
+			},
+			LinkFinal: recordingRoot.LinkFinal, SyncDirectory: recordingRoot.SyncDirectory,
+			RemovePartial: recordingRoot.RemovePartial,
+		},
+		WithDeadline: func(ctx context.Context, _ time.Time) (context.Context, context.CancelFunc) {
+			return context.WithCancel(ctx)
+		},
+	}
+	scheduler, err := apprecording.NewScheduler(store, executor, clock, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+
+	select {
+	case <-stream.secondStarted:
+	case <-time.After(time.Second):
+		active, _ := store.ActiveReservations(context.Background(), 10, 0)
+		attempts, _ := store.RecoveryAttempts(context.Background(), core.MaxRecoveryPage, catalogmodel.ID{})
+		stream.mu.Lock()
+		requests := append([]string(nil), stream.requests...)
+		stream.mu.Unlock()
+		t.Fatalf("二件目の録画が同時に始まりませんでした: ids=%d requests=%v active=%+v attempts=%+v",
+			nextID.Load(), requests, active, attempts)
+	}
+	select {
+	case <-oneSegSyncStarted:
+	case <-time.After(time.Second):
+		t.Fatal("ワンセグファイルの同期処理が待機状態になりませんでした")
+	}
+	stop, err := store.StopReservation(context.Background(), first.Number, clock.Now().Add(time.Second))
+	if err != nil || !stop.Notify || stop.ReservationID != first.ID {
+		t.Fatalf("stop=%+v err=%v", stop, err)
+	}
+	scheduler.NotifyStop(first.ID)
+	releaseOneSeg()
+
+	firstHistory := waitRecordingHistory(t, store, first.Number, done)
+	if firstHistory.State != core.AttemptPartial || firstHistory.Reason != core.ReasonUserRequestedStop ||
+		!firstHistory.Playable() {
+		t.Fatalf("first=%+v", firstHistory)
+	}
+	select {
+	case runErr := <-done:
+		t.Fatalf("一件目の停止でスケジューラー全体が終了しました: %v", runErr)
+	default:
+	}
+	releaseOther()
+	secondHistory := waitRecordingHistory(t, store, second.Number, done)
+	if secondHistory.State != core.AttemptSucceeded || secondHistory.Reason != core.ReasonCompleted ||
+		!secondHistory.Playable() || stream.secondWasCanceled.Load() {
+		t.Fatalf("second=%+v canceled=%v", secondHistory, stream.secondWasCanceled.Load())
+	}
+	if oneSegFile == nil {
+		t.Fatal("ワンセグ部分ファイルが作られませんでした")
+	}
+	if oneSegFile.syncs.Load() != 1 || oneSegFile.closes.Load() != 1 {
+		t.Fatalf("one-seg syncs=%d closes=%d", oneSegFile.syncs.Load(), oneSegFile.closes.Load())
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func waitRecordingHistory(t *testing.T, store *Store, number int32, schedulerDone <-chan error) core.HistoryItem {
+	t.Helper()
+	timeout := time.NewTimer(time.Second)
+	defer timeout.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case err := <-schedulerDone:
+			t.Fatalf("録画確定前にスケジューラーが終了しました: %v", err)
+		case <-timeout.C:
+			t.Fatal("録画履歴の確定を待つ時間を超えました")
+		case <-ticker.C:
+			item, err := store.RecordingHistoryItem(context.Background(), number)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if item != nil {
+				return *item
+			}
+		}
 	}
 }
 
