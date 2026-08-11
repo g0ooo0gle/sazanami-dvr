@@ -3,6 +3,7 @@ package recordinghttp
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -112,6 +113,29 @@ func TestHLSHandlerRejectsBeforeStateAndRedactsInput(t *testing.T) {
 	response = serveHLS(handler, method)
 	if response.Code != http.StatusMethodNotAllowed || response.Header().Get("Allow") != http.MethodGet {
 		t.Fatalf("method code=%d header=%v", response.Code, response.Header())
+	}
+	for _, test := range []struct {
+		request *http.Request
+		allow   string
+	}{
+		{request: httptest.NewRequest(http.MethodPut, "/api/view?"+validHLSViewQuery, nil), allow: "GET, POST"},
+		{request: httptest.NewRequest(http.MethodHead, "/komorebi/live/A/0.ts", nil), allow: http.MethodGet},
+	} {
+		response = serveHLS(handler, test.request)
+		if response.Code != http.StatusMethodNotAllowed || response.Header().Get("Allow") != test.allow {
+			t.Fatalf("method=%s code=%d allow=%q", test.request.Method, response.Code, response.Header().Get("Allow"))
+		}
+	}
+
+	live.openErr = errors.New("private provider detail")
+	response = serveHLS(handler, httptest.NewRequest(http.MethodGet, "/api/TvCast?"+validHLSTvCastQuery, nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("select code=%d body=%q", response.Code, response.Body.String())
+	}
+	response = serveHLS(handler, newValidHLSViewRequest(http.MethodPost, validHLSViewQuery, validHLSViewBody))
+	if response.Code != http.StatusServiceUnavailable || response.Body.String() != "live-provider-unavailable\n" ||
+		strings.Contains(response.Body.String(), "private") {
+		t.Fatalf("provider failure code=%d body=%q", response.Code, response.Body.String())
 	}
 
 	oldHandler, err := NewHandler(&fakeHistory{}, &fakeFiles{})
