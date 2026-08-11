@@ -131,6 +131,11 @@ type PSICollector struct {
 	continuityKnown bool
 }
 
+// Incompleteは入力終了時に未完成のPSI sectionを保持しているかを返す。
+func (collector *PSICollector) Incomplete() bool {
+	return collector != nil && len(collector.section) != 0
+}
+
 // Feed は一件のpacketを取り込み、そのpacketまでに完成したsectionを返す。
 func (collector *PSICollector) Feed(packet []byte) ([][]byte, error) {
 	parsed, err := ParsePacket(packet)

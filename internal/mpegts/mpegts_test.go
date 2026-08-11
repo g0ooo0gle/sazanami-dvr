@@ -3,6 +3,7 @@ package mpegts
 import (
 	"bytes"
 	"errors"
+	"strconv"
 	"testing"
 )
 
@@ -86,15 +87,25 @@ func TestPSICollectorChecksSplitSectionContinuityAndLimit(t *testing.T) {
 		t.Fatalf("sections=%d", len(got))
 	}
 
-	broken := append([][]byte(nil), packets...)
-	broken[1] = append([]byte(nil), broken[1]...)
-	broken[1][3] = broken[1][3]&0xf0 | broken[0][3]&0x0f
-	collector = PSICollector{}
-	if _, err := collector.Feed(broken[0]); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := collector.Feed(broken[1]); !errors.Is(err, ErrPSI) {
-		t.Fatalf("continuity err=%v", err)
+	for _, test := range []struct {
+		name       string
+		continuity byte
+	}{
+		{name: "duplicate", continuity: packets[0][3] & 0x0f},
+		{name: "missing", continuity: (packets[0][3] + 2) & 0x0f},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			broken := append([][]byte(nil), packets...)
+			broken[1] = append([]byte(nil), broken[1]...)
+			broken[1][3] = broken[1][3]&0xf0 | test.continuity
+			collector := PSICollector{}
+			if _, err := collector.Feed(broken[0]); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := collector.Feed(broken[1]); !errors.Is(err, ErrPSI) {
+				t.Fatalf("continuity err=%v", err)
+			}
+		})
 	}
 
 	over := testPayloadPacket(0, 0)
@@ -129,6 +140,32 @@ func TestPSICollectorAcceptsFourKiBAndRejectsOneOver(t *testing.T) {
 	}
 	if _, err := PacketizeSection(0x100, 0, append(section, 0)); !errors.Is(err, ErrPSI) {
 		t.Fatalf("one over err=%v", err)
+	}
+}
+
+func TestPSICollectorAcceptsNonzeroPointerAndMultipleSections(t *testing.T) {
+	first := testPATSection(0, []uint16{1})
+	second := testPATSection(1, []uint16{1})
+
+	packet := testPayloadPacket(0, 0)
+	packet[1] |= 0x40
+	packet[4] = 3
+	copy(packet[8:], first)
+	var collector PSICollector
+	sections, err := collector.Feed(packet)
+	if err != nil || len(sections) != 1 || !bytes.Equal(sections[0], first) {
+		t.Fatalf("pointer sections=%d err=%v", len(sections), err)
+	}
+
+	packet = testPayloadPacket(0, 0)
+	packet[1] |= 0x40
+	packet[4] = 0
+	copy(packet[5:], first)
+	copy(packet[5+len(first):], second)
+	collector = PSICollector{}
+	sections, err = collector.Feed(packet)
+	if err != nil || len(sections) != 2 || !bytes.Equal(sections[0], first) || !bytes.Equal(sections[1], second) {
+		t.Fatalf("multiple sections=%d err=%v", len(sections), err)
 	}
 }
 
@@ -168,6 +205,61 @@ func TestPATPMTAndVersionTracking(t *testing.T) {
 	}
 }
 
+func TestPATPMTRejectInvalidSectionStateAndCRC(t *testing.T) {
+	tables := []struct {
+		name    string
+		section []byte
+		parse   func([]byte) error
+	}{
+		{
+			name: "PAT", section: testPATSection(0, []uint16{1}),
+			parse: func(section []byte) error { _, err := ParsePAT(section); return err },
+		},
+		{
+			name: "PMT", section: testPMTSection(0, []ElementaryStream{{Type: 0x1b, PID: 0x101}}),
+			parse: func(section []byte) error { _, err := ParsePMT(section); return err },
+		},
+	}
+	for _, table := range tables {
+		t.Run(table.name+" current next", func(t *testing.T) {
+			section := append([]byte(nil), table.section[:len(table.section)-4]...)
+			section[5] &^= 1
+			if err := table.parse(testFinishSection(section)); !errors.Is(err, ErrPSI) {
+				t.Fatalf("err=%v", err)
+			}
+		})
+		t.Run(table.name+" section number", func(t *testing.T) {
+			section := append([]byte(nil), table.section[:len(table.section)-4]...)
+			section[6] = 1
+			if err := table.parse(testFinishSection(section)); !errors.Is(err, ErrPSI) {
+				t.Fatalf("err=%v", err)
+			}
+		})
+		t.Run(table.name+" CRC", func(t *testing.T) {
+			section := append([]byte(nil), table.section...)
+			section[len(section)-1] ^= 1
+			if err := table.parse(section); !errors.Is(err, ErrPSI) {
+				t.Fatalf("err=%v", err)
+			}
+		})
+	}
+}
+
+func TestPATRequiresOneMediaProgramAndPMTRequiresPCR(t *testing.T) {
+	if _, err := ParsePAT(testPATSection(0, nil)); !errors.Is(err, ErrPSI) {
+		t.Fatalf("media program missing err=%v", err)
+	}
+	if _, err := ParsePAT(testPATSection(0, []uint16{0})); !errors.Is(err, ErrSingleProgram) {
+		t.Fatalf("program 0 only err=%v", err)
+	}
+	pmt := testPMTSection(0, []ElementaryStream{{Type: 0x1b, PID: 0x101}})
+	pmt = append([]byte(nil), pmt[:len(pmt)-4]...)
+	pmt[8], pmt[9] = 0xff, 0xff
+	if _, err := ParsePMT(testFinishSection(pmt)); !errors.Is(err, ErrProgramClock) {
+		t.Fatalf("PCR PID err=%v", err)
+	}
+}
+
 func TestParsePacketReadsPCRRandomAccessAndWrap(t *testing.T) {
 	const clock = uint64(123456789)
 	packet := testPCRPacket(0x101, 3, clock, true, true)
@@ -183,6 +275,12 @@ func TestParsePacketReadsPCRRandomAccessAndWrap(t *testing.T) {
 	packet[10] &^= 0x7e
 	if _, err := ParsePacket(packet); !errors.Is(err, ErrPacket) {
 		t.Fatalf("reserved PCR bits err=%v", err)
+	}
+	packet = testPCRPacket(0x101, 3, clock, true, true)
+	packet[10] |= 1
+	packet[11] = 0x2c
+	if _, err := ParsePacket(packet); !errors.Is(err, ErrPacket) {
+		t.Fatalf("PCR extension err=%v", err)
 	}
 }
 
@@ -212,18 +310,7 @@ func TestPSICollectorRejectsPUSIWithoutNewSection(t *testing.T) {
 }
 
 func testSizeName(size int) string {
-	const digits = "0123456789"
-	if size == 0 {
-		return "0"
-	}
-	var result [20]byte
-	position := len(result)
-	for size > 0 {
-		position--
-		result[position] = digits[size%10]
-		size /= 10
-	}
-	return string(result[position:])
+	return strconv.Itoa(size)
 }
 
 func testPayloadPacket(pid uint16, continuity byte) []byte {
