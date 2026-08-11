@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"testing"
+
+	"github.com/g0ooo0gle/sazanami-dvr/internal/mpegts"
 )
 
 type tsBufferFile struct{ bytes.Buffer }
@@ -43,7 +45,7 @@ func TestTSComponentFilterSelectsPIDsWithArbitraryReads(t *testing.T) {
 		t.Fatalf("pids=%#v", pids)
 	}
 	section := pmtSectionFromPackets(t, got, 0x100)
-	if !validMPEGCRC(section) || containsStreamPID(section, 0x103) || !containsStreamPID(section, 0x102) {
+	if !mpegts.ValidCRC(section) || containsStreamPID(section, 0x103) || !containsStreamPID(section, 0x102) {
 		t.Fatalf("rewritten PMT=%x", section)
 	}
 }
@@ -77,7 +79,7 @@ func TestTSComponentFilterFourSelectionsAndPMTUpdate(t *testing.T) {
 	filter := newTSComponentFilter(file, false, false)
 	initial := testTransportStream(t, base)
 	updatedSection := makePMTSection(t, []testStream{{0x1b, 0x101, nil}, {0x06, 0x105, nil}, {0x0d, 0x106, nil}})
-	updated := append(packetizeSectionForTest(0x100, 7, updatedSection), makePayloadPacket(0x105)...)
+	updated := append(packetizeSectionForTest(0x100, 4, updatedSection), makePayloadPacket(0x105)...)
 	updated = append(updated, makePayloadPacket(0x106)...)
 	if _, err := filter.Write(append(initial, updated...)); err != nil || filter.Finish() != nil {
 		t.Fatal(err)
@@ -89,7 +91,7 @@ func TestTSComponentFilterFourSelectionsAndPMTUpdate(t *testing.T) {
 	wantContinuity := byte(3)
 	for offset := 0; offset < len(file.Bytes()); offset += tsPacketBytes {
 		packet := file.Bytes()[offset : offset+tsPacketBytes]
-		if packetPID(packet) != 0x100 {
+		if mpegts.PID(packet) != 0x100 {
 			continue
 		}
 		if packet[3]&0x0f != wantContinuity {
@@ -109,13 +111,13 @@ func TestTSComponentFilterHandlesMultiPacketPMT(t *testing.T) {
 		t.Fatal(err)
 	}
 	section := pmtSectionFromPackets(t, file.Bytes(), 0x100)
-	if !validMPEGCRC(section) || !bytes.Contains(section, descriptor) || containsStreamPID(section, 0x103) {
+	if !mpegts.ValidCRC(section) || !bytes.Contains(section, descriptor) || containsStreamPID(section, 0x103) {
 		t.Fatal("複数packetのPMTを正しく再生成できませんでした")
 	}
 	continuity := byte(3)
 	for offset := 0; offset < len(file.Bytes()); offset += tsPacketBytes {
 		packet := file.Bytes()[offset : offset+tsPacketBytes]
-		if packetPID(packet) != 0x100 {
+		if mpegts.PID(packet) != 0x100 {
 			continue
 		}
 		if packet[3]&0x0f != continuity {
@@ -188,7 +190,7 @@ func invalidPointerPacket() []byte {
 func oversizedSectionPacket() []byte {
 	packet := makePayloadPacket(0)
 	packet[1] |= 0x40
-	packet[4], packet[5], packet[6] = 0, 0x00, 0xb3
+	packet[4], packet[5], packet[6] = 0, 0x00, 0xbf
 	packet[7] = 0xff
 	return packet
 }
@@ -231,12 +233,15 @@ func finishSection(section []byte) []byte {
 	length := len(section) + 4 - 3
 	section[1] = section[1]&0xf0 | byte(length>>8)
 	section[2] = byte(length)
-	crc := mpegCRC(section)
+	crc := mpegts.CRC32(section)
 	return append(section, byte(crc>>24), byte(crc>>16), byte(crc>>8), byte(crc))
 }
 
 func packetizeSectionForTest(pid uint16, continuity byte, section []byte) []byte {
-	packets := packetizePMT(pid, continuity, section)
+	packets, err := mpegts.PacketizeSection(pid, continuity, section)
+	if err != nil {
+		panic(err)
+	}
 	var result []byte
 	for _, packet := range packets {
 		result = append(result, packet...)
@@ -257,25 +262,25 @@ func packetPIDsForTest(t *testing.T, data []byte) []uint16 {
 	}
 	result := make([]uint16, 0, len(data)/tsPacketBytes)
 	for offset := 0; offset < len(data); offset += tsPacketBytes {
-		result = append(result, packetPID(data[offset:offset+tsPacketBytes]))
+		result = append(result, mpegts.PID(data[offset:offset+tsPacketBytes]))
 	}
 	return result
 }
 
 func pmtSectionFromPackets(t *testing.T, data []byte, pid uint16) []byte {
 	t.Helper()
-	var collector psiCollector
+	var collector mpegts.PSICollector
 	for offset := 0; offset < len(data); offset += tsPacketBytes {
 		packet := data[offset : offset+tsPacketBytes]
-		if packetPID(packet) != pid {
+		if mpegts.PID(packet) != pid {
 			continue
 		}
-		section, done, err := collector.feed(packet)
+		sections, err := collector.Feed(packet)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if done {
-			return section
+		if len(sections) != 0 {
+			return sections[len(sections)-1]
 		}
 	}
 	t.Fatal("PMT not found")
