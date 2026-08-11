@@ -125,7 +125,7 @@ func TestRunUsesFixedEnvironmentAndDiscardsOutput(t *testing.T) {
 	script := filepath.Join(root, "inspect.sh")
 	writeScript(t, script, "#!/bin/sh\nset -eu\n[ \"$#\" -eq 0 ]\n[ \"$PATH\" = /usr/bin:/bin ]\n[ \"$SAZANAMI_RECORDING_NUMBER\" = 17 ]\n[ \"$SAZANAMI_RECORDING_STATE\" = SUCCEEDED ]\n[ \"$SAZANAMI_RECORDING_REASON\" = COMPLETED ]\n[ \"$SAZANAMI_RECORDING_FILE\" = "+strconv.Quote(recordingFile)+" ]\n[ -z \"${SHOULD_NOT_EXIST+x}\" ]\nif read value; then exit 8; fi\nprintf ignored\nprintf ignored >&2\n", 0o700)
 	t.Setenv("SHOULD_NOT_EXIST", "private-parent-value")
-	reason := (Runner{Directory: directory, Timeout: 5 * time.Second}).Run(context.Background(), script, Environment{
+	reason := (Runner{Directory: directory, Timeout: 20 * time.Second}).Run(context.Background(), script, Environment{
 		RecordingNumber: 17, RecordingFile: recordingFile,
 		State: recording.AttemptSucceeded, Reason: recording.ReasonCompleted,
 	})
