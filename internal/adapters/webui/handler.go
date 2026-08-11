@@ -25,9 +25,10 @@ import (
 )
 
 const (
-	maximumFormBytes = 4 * 1024
-	requestTimeout   = 10 * time.Second
-	contentPolicy    = "default-src 'none'; style-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+	maximumFormBytes     = 4 * 1024
+	readRequestTimeout   = 10 * time.Second
+	backupRequestTimeout = time.Hour
+	contentPolicy        = "default-src 'none'; style-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
 )
 
 //go:embed templates/*.html assets/style.css
@@ -93,7 +94,7 @@ func (handler *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 		writeError(tracked, request.Method, http.StatusMisdirectedRequest, "要求先を確認できません")
 		return
 	}
-	ctx, cancel := context.WithTimeout(request.Context(), requestTimeout)
+	ctx, cancel := context.WithTimeout(request.Context(), requestTimeout(request.URL.Path))
 	defer cancel()
 	request = request.WithContext(ctx)
 
@@ -114,6 +115,15 @@ func (handler *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 		reason = "not-found"
 		writeError(tracked, request.Method, http.StatusNotFound, "ページが見つかりません")
 	}
+}
+
+// requestTimeoutは大きなDBを複製して検証するバックアップだけを長く待つ。
+// 表示用の読み取りは短い期限を保ち、どの経路も無制限には待たない。
+func requestTimeout(path string) time.Duration {
+	if path == "/operations/backup" {
+		return backupRequestTimeout
+	}
+	return readRequestTimeout
 }
 
 func (handler *Handler) overview(writer http.ResponseWriter, request *http.Request) string {

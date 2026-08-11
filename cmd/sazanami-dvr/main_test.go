@@ -32,8 +32,36 @@ func TestVersion(t *testing.T) {
 	if code := run([]string{"--version"}, &output, &diagnostic); code != 0 {
 		t.Fatalf("code=%d err=%q", code, diagnostic.String())
 	}
-	if got, want := output.String(), "sazanami-dvr 0.0.28\n"; got != want {
+	if got, want := output.String(), "sazanami-dvr 0.0.29\n"; got != want {
 		t.Fatalf("version=%q want=%q", got, want)
+	}
+}
+
+func TestDatabaseCommandTimeout(t *testing.T) {
+	for _, command := range []string{"migrate", "backup", "restore", "recover"} {
+		if got := databaseCommandTimeout(command); got != time.Hour {
+			t.Fatalf("command=%s timeout=%s", command, got)
+		}
+	}
+	for _, command := range []string{"status", "unknown"} {
+		if got := databaseCommandTimeout(command); got != 10*time.Second {
+			t.Fatalf("command=%s timeout=%s", command, got)
+		}
+	}
+}
+
+func TestDatabaseCommandUsesParentContext(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDatabaseCommand(context.Background(), "migrate", []string{"--data-root", root}, io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := runDatabaseCommand(ctx, "status", []string{"--data-root", root}, io.Discard, io.Discard); err == nil {
+		t.Fatal("cancelled parent context was ignored")
 	}
 }
 

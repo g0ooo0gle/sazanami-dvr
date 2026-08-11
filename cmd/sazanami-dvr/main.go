@@ -38,8 +38,13 @@ import (
 )
 
 var (
-	version       = "0.0.28"
+	version       = "0.0.29"
 	productCommit = ""
+)
+
+const (
+	databaseReadTimeout        = 10 * time.Second
+	databaseMaintenanceTimeout = time.Hour
 )
 
 func main() {
@@ -110,7 +115,7 @@ func runContext(ctx context.Context, arguments []string, stdout, stderr io.Write
 		fmt.Fprintln(stderr, "使用方法: sazanami-dvr <catalog|ctrlcmd|db|recording|ui> ...")
 		return 2
 	}
-	if err := runDatabaseCommand(arguments[1], arguments[2:], stdout, stderr); err != nil {
+	if err := runDatabaseCommand(ctx, arguments[1], arguments[2:], stdout, stderr); err != nil {
 		fmt.Fprintf(stderr, "DB操作に失敗しました: %v\n", err)
 		return 1
 	}
@@ -665,7 +670,7 @@ func (backup *uiBackup) Create(ctx context.Context, started time.Time) (opsui.Ba
 	return opsui.BackupResult{ID: manifest.BackupID, State: manifest.State, SchemaVersion: manifest.SchemaVersion}, nil
 }
 
-func runDatabaseCommand(command string, arguments []string, stdout, stderr io.Writer) error {
+func runDatabaseCommand(parent context.Context, command string, arguments []string, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("db "+command, flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	dataRoot := flags.String("data-root", "", "owner-onlyのデータディレクトリ")
@@ -677,7 +682,7 @@ func runDatabaseCommand(command string, arguments []string, stdout, stderr io.Wr
 	if *dataRoot == "" || flags.NArg() != 0 {
 		return errorsStable("data-root-required")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(parent, databaseCommandTimeout(command))
 	defer cancel()
 	switch command {
 	case "status":
@@ -768,6 +773,17 @@ func runDatabaseCommand(command string, arguments []string, stdout, stderr io.Wr
 		return nil
 	default:
 		return errorsStable("unknown-db-command")
+	}
+}
+
+// databaseCommandTimeoutは、大きなDBを複製して検証する保守操作にだけ長い期限を与える。
+// 状態確認と不明な操作には短い期限を使い、どの操作も無制限には待たない。
+func databaseCommandTimeout(command string) time.Duration {
+	switch command {
+	case "migrate", "backup", "restore", "recover":
+		return databaseMaintenanceTimeout
+	default:
+		return databaseReadTimeout
 	}
 }
 
