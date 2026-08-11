@@ -103,7 +103,7 @@ func runContext(ctx context.Context, arguments []string, stdout, stderr io.Write
 	}
 	if arguments[0] == "recording" {
 		if len(arguments) < 2 || arguments[1] != "serve" {
-			fmt.Fprintf(stderr, "使用方法: sazanami-dvr recording serve --data-root <dir> --recording-root <dir> --channel-map <file> --provider mirakurun --base-url <url> [--http-listen %s] [--max-concurrent-recordings 1] [--post-recording-script-root <dir>]\n", recordinghttpadapter.DefaultAddress)
+			fmt.Fprintf(stderr, "使用方法: sazanami-dvr recording serve --data-root <dir> --recording-root <dir> --channel-map <file> --provider mirakurun --base-url <url> [--http-listen %s] [--max-concurrent-recordings <正の整数>] [--post-recording-script-root <dir>]\n", recordinghttpadapter.DefaultAddress)
 			return 2
 		}
 		if err := runRecordingCommand(ctx, arguments[2:], stdout, stderr); err != nil {
@@ -139,15 +139,20 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	listenAddress := flags.String("listen", ctrlcmdapp.DefaultAddress, "loopback、private IPまたは全interfaceのCtrlCmd待受アドレス")
 	httpListenAddress := flags.String("http-listen", recordinghttpadapter.DefaultAddress, "loopback、private IPまたは全interfaceのHTTP待受アドレス")
 	refreshInterval := flags.Duration("catalog-refresh-interval", catalogrefresh.DefaultInterval, "番組表を更新する間隔")
-	maximumRecordings := flags.Int("max-concurrent-recordings", recordingapp.DefaultMaximumConcurrentRecordings, "同時録画数（1～8）")
+	maximumRecordings := flags.Int("max-concurrent-recordings", recordingapp.DefaultMaximumConcurrentRecordings, "同時録画数（正の整数。省略時はMirakurunの設定台数）")
 	postRecordingRootPath := flags.String("post-recording-script-root", "", "owner-onlyの録画後スクリプトディレクトリ")
 	if err := flags.Parse(arguments); err != nil {
 		return errorsStable("invalid-command-arguments")
 	}
+	maximumRecordingsExplicit := false
+	flags.Visit(func(used *flag.Flag) {
+		if used.Name == "max-concurrent-recordings" {
+			maximumRecordingsExplicit = true
+		}
+	})
 	if *dataRoot == "" || *recordingRootPath == "" || *channelMap == "" || *providerName != "mirakurun" ||
 		*baseURL == "" || *refreshInterval < catalogrefresh.MinimumInterval || *refreshInterval > catalogrefresh.MaximumInterval ||
-		*maximumRecordings < recordingapp.DefaultMaximumConcurrentRecordings ||
-		*maximumRecordings > recordingapp.MaximumConcurrentRecordings || flags.NArg() != 0 {
+		*maximumRecordings < recordingapp.DefaultMaximumConcurrentRecordings || flags.NArg() != 0 {
 		return errorsStable("recording-arguments-required")
 	}
 	config := ctrlcmdapp.RecordingConfig()
@@ -157,6 +162,16 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	}
 	if err := recordinghttpadapter.ValidateListenAddress(*httpListenAddress, false); err != nil {
 		return errorsStable("local-http-listen-required")
+	}
+	catalogAdapter, err := mirakurunadapter.New(*baseURL)
+	if err != nil {
+		return errorsStable("provider-configuration-invalid")
+	}
+	defer catalogAdapter.CloseIdleConnections()
+	effectiveMaximum, maximumSource, err := selectRecordingMaximum(ctx, catalogAdapter, *maximumRecordings,
+		maximumRecordingsExplicit, stderr)
+	if err != nil {
+		return err
 	}
 	startupContext, startupCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer startupCancel()
@@ -196,7 +211,7 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	if err != nil {
 		return errorsStable("recording-snapshot-failed")
 	}
-	streamAdapter, err := mirakurunadapter.NewStreamWithLimit(*baseURL, *maximumRecordings)
+	streamAdapter, err := mirakurunadapter.NewStreamWithLimit(*baseURL, effectiveMaximum)
 	if err != nil {
 		return errorsStable("provider-configuration-invalid")
 	}
@@ -206,11 +221,6 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 		return errorsStable("provider-configuration-invalid")
 	}
 	defer liveStreamAdapter.CloseIdleConnections()
-	catalogAdapter, err := mirakurunadapter.New(*baseURL)
-	if err != nil {
-		return errorsStable("provider-configuration-invalid")
-	}
-	defer catalogAdapter.CloseIdleConnections()
 	logoAdapter, err := mirakurunadapter.NewLogo(*baseURL)
 	if err != nil {
 		return errorsStable("provider-configuration-invalid")
@@ -248,7 +258,7 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	if err := recovery.Run(startupContext); err != nil {
 		return errorsStable("recording-recovery-failed")
 	}
-	scheduler, err := recordingapp.NewScheduler(store, executor, recordingClock, *maximumRecordings)
+	scheduler, err := recordingapp.NewScheduler(store, executor, recordingClock, effectiveMaximum)
 	if err != nil {
 		return errorsStable("recording-scheduler-invalid")
 	}
@@ -333,8 +343,8 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 		Interval: *refreshInterval, Sync: refreshOperation.sync, Observe: observeCatalogRefresh(stdout, stderr),
 	}
 	go func() { refreshDone <- refresher.Run(serviceContext) }()
-	fmt.Fprintf(stdout, "録画プロセスを開始しました: ctrlcmd_scope=%s http_scope=%s services=%d catalog_refresh_interval=%s max_concurrent_recordings=%d\n",
-		recordingListenScope(*listenAddress), recordingListenScope(*httpListenAddress), snapshot.Count(), refreshInterval.String(), *maximumRecordings)
+	fmt.Fprintf(stdout, "録画プロセスを開始しました: ctrlcmd_scope=%s http_scope=%s services=%d catalog_refresh_interval=%s max_concurrent_recordings=%d max_concurrent_source=%s\n",
+		recordingListenScope(*listenAddress), recordingListenScope(*httpListenAddress), snapshot.Count(), refreshInterval.String(), effectiveMaximum, maximumSource)
 	writeCtrlCmdLANNotice(stdout, *listenAddress)
 	var serverErr, schedulerErr, refreshErr, httpErr error
 	serverFinished, schedulerFinished, refreshFinished, httpFinished := false, false, false, false
@@ -386,6 +396,36 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 		return errorsStable("recording-http-listen-failed")
 	}
 	return nil
+}
+
+// selectRecordingMaximumは明示値を優先し、未指定時だけMirakurunの一覧件数を一度取得する。
+// 取得失敗は一件へ戻すが、親contextの取消しはプロセス終了としてそのまま扱う。
+func selectRecordingMaximum(ctx context.Context, adapter *mirakurunadapter.Adapter, requested int,
+	explicit bool, diagnostic io.Writer,
+) (int, string, error) {
+	if ctx == nil || requested < recordingapp.DefaultMaximumConcurrentRecordings || diagnostic == nil {
+		return 0, "", errorsStable("recording-maximum-invalid")
+	}
+	effective := requested
+	source := "explicit"
+	if !explicit {
+		observed, err := adapter.ObserveTunerCount(ctx)
+		switch {
+		case err == nil:
+			effective = observed
+			source = "mirakurun"
+		case ctx.Err() != nil:
+			return 0, "", errorsStable("recording-startup-cancelled")
+		default:
+			effective = recordingapp.DefaultMaximumConcurrentRecordings
+			source = "fallback"
+			fmt.Fprintln(diagnostic, "Mirakurunのチューナー数を取得できなかったため、同時録画数を1件にしました: tuner-count-fallback")
+		}
+	}
+	if effective >= 20 {
+		fmt.Fprintln(diagnostic, "注意: 同時録画数が20件以上です。録画ごとの接続、メモリ、ファイル記述子が増える可能性があります。")
+	}
+	return effective, source, nil
 }
 
 type recordingHTTPFiles struct{ root *recordingfs.Root }

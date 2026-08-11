@@ -14,7 +14,6 @@ const (
 	minimumRunTime                     = 60 * time.Second
 	maximumWakeSize                    = 1
 	DefaultMaximumConcurrentRecordings = 1
-	MaximumConcurrentRecordings        = 8
 	postRecordingMinimumIdle           = 10 * time.Minute
 	postRecordingWakeMargin            = 5 * time.Minute
 )
@@ -99,10 +98,10 @@ type postRecordingPowerCandidate struct {
 	conflict bool
 }
 
-// NewSchedulerは既定一件、最大八件の範囲で録画を実行するschedulerを作る。
+// NewSchedulerは正の同時録画上限を使うschedulerを作る。
+// 上限値に比例するchannelやmapは作らず、資源は実際に始まった録画だけが使う。
 func NewScheduler(store ScheduleStore, executor ReservationExecutor, clock ScheduleClock, maximumConcurrent int) (*Scheduler, error) {
-	if store == nil || executor == nil || clock == nil || maximumConcurrent < DefaultMaximumConcurrentRecordings ||
-		maximumConcurrent > MaximumConcurrentRecordings {
+	if store == nil || executor == nil || clock == nil || maximumConcurrent < DefaultMaximumConcurrentRecordings {
 		return nil, errors.New("recording: invalid scheduler")
 	}
 	return &Scheduler{
@@ -143,13 +142,12 @@ func (scheduler *Scheduler) Notify() {
 
 // Runは終了コンテキストまで予約を処理する。DBへ確保済みの録画だけを上限内で並行実行する。
 func (scheduler *Scheduler) Run(ctx context.Context) error {
-	if scheduler == nil || ctx == nil || scheduler.maximumConcurrent < DefaultMaximumConcurrentRecordings ||
-		scheduler.maximumConcurrent > MaximumConcurrentRecordings {
+	if scheduler == nil || ctx == nil || scheduler.maximumConcurrent < DefaultMaximumConcurrentRecordings {
 		return errors.New("recording: invalid scheduler run")
 	}
 	executionContext, cancelExecutions := context.WithCancel(ctx)
 	defer cancelExecutions()
-	completed := make(chan executionCompletion, scheduler.maximumConcurrent)
+	completed := make(chan executionCompletion)
 	active := 0
 	pendingPower := postRecordingPowerCandidate{}
 	for {
@@ -290,9 +288,9 @@ func (scheduler *Scheduler) Run(ctx context.Context) error {
 		}
 		active++
 		go func(item core.Reservation, claimed core.Attempt) {
-			defer unregister()
-			defer cancelRecording()
 			result, executeErr := scheduler.executor.ExecuteClaimed(recordingContext, item, claimed)
+			unregister()
+			cancelRecording()
 			completed <- executionCompletion{result: result, err: executeErr}
 		}(*reservation, attempt)
 	}

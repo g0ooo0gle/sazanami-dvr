@@ -26,8 +26,6 @@ type streamLimits struct {
 
 var productionStreamLimits = streamLimits{connectHeader: 10 * time.Second, readIdle: 10 * time.Second}
 
-const maximumConcurrentStreams = 8
-
 // StreamAdapterはMirakurun互換のservice streamだけを開く専用HTTP clientを所有する。
 type StreamAdapter struct {
 	base   url.URL
@@ -58,7 +56,7 @@ func newStreamAdapterWithLimit(baseURL string, limits streamLimits, maximumConcu
 	if err != nil {
 		return nil, err
 	}
-	if limits.connectHeader <= 0 || limits.readIdle <= 0 || maximumConcurrent < 1 || maximumConcurrent > maximumConcurrentStreams {
+	if limits.connectHeader <= 0 || limits.readIdle <= 0 || maximumConcurrent < 1 {
 		return nil, provider.NewFailure(provider.ReasonInternal, "invalid-stream-http-limits")
 	}
 	dialer := &net.Dialer{Timeout: limits.connectHeader, KeepAlive: 30 * time.Second}

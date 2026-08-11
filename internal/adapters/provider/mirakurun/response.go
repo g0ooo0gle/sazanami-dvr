@@ -17,6 +17,7 @@ type cappedReader struct {
 	reader io.Reader
 	limit  int64
 	read   int64
+	over   bool
 }
 
 // Readは上限まで元の応答を読み、上限を1 byteでも超えた時点で固定errorを返す。
@@ -25,6 +26,7 @@ func (reader *cappedReader) Read(buffer []byte) (int, error) {
 		var one [1]byte
 		count, err := reader.reader.Read(one[:])
 		if count != 0 {
+			reader.over = true
 			return 0, errBodyOverLimit
 		}
 		return 0, err
@@ -43,6 +45,7 @@ type responseOperation struct {
 	cancel  context.CancelFunc
 	release func()
 	body    io.ReadCloser
+	reader  *cappedReader
 	decoder *json.Decoder
 
 	closeOnce sync.Once
@@ -50,9 +53,10 @@ type responseOperation struct {
 }
 
 func newResponseOperation(ctx context.Context, cancel context.CancelFunc, release func(), body io.ReadCloser, limit int64) *responseOperation {
-	decoder := json.NewDecoder(&cappedReader{reader: body, limit: limit})
+	reader := &cappedReader{reader: body, limit: limit}
+	decoder := json.NewDecoder(reader)
 	decoder.UseNumber()
-	return &responseOperation{ctx: ctx, cancel: cancel, release: release, body: body, decoder: decoder}
+	return &responseOperation{ctx: ctx, cancel: cancel, release: release, body: body, reader: reader, decoder: decoder}
 }
 
 func (operation *responseOperation) beginArray() error {
@@ -91,6 +95,9 @@ func (operation *responseOperation) finishDocument() error {
 }
 
 func (operation *responseOperation) failure(err error) error {
+	if operation.reader != nil && operation.reader.over {
+		err = errBodyOverLimit
+	}
 	failure := classifyDecodeFailure(operation.ctx, err)
 	_ = operation.close()
 	return failure

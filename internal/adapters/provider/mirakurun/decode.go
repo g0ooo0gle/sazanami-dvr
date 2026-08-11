@@ -56,6 +56,23 @@ func decodeVersion(decoder *json.Decoder) (VersionObservation, error) {
 	return result, nil
 }
 
+func decodeTuner(decoder *json.Decoder) error {
+	seen, err := beginObject(decoder)
+	if err != nil {
+		return err
+	}
+	tokens := 0
+	for decoder.More() {
+		if _, err := readObjectKey(decoder, seen); err != nil {
+			return err
+		}
+		if err := skipValue(decoder, 0, &tokens); err != nil {
+			return err
+		}
+	}
+	return endObject(decoder)
+}
+
 func decodeService(decoder *json.Decoder, provenance provider.Provenance) (catalog.ServiceObservation, error) {
 	var result catalog.ServiceObservation
 	seen, err := beginObject(decoder)

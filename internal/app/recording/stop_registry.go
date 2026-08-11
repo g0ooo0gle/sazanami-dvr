@@ -17,11 +17,11 @@ type stopRegistry struct {
 }
 
 func newStopRegistry(maximum int) *stopRegistry {
-	return &stopRegistry{maximum: maximum, items: make(map[catalogmodel.ID]context.CancelFunc, maximum)}
+	return &stopRegistry{maximum: maximum, items: make(map[catalogmodel.ID]context.CancelFunc)}
 }
 
 func (registry *stopRegistry) register(id catalogmodel.ID, cancel context.CancelFunc) (func(), error) {
-	if registry == nil || id == (catalogmodel.ID{}) || cancel == nil || registry.maximum < 1 || registry.maximum > MaximumConcurrentRecordings {
+	if registry == nil || id == (catalogmodel.ID{}) || cancel == nil || registry.maximum < 1 {
 		return nil, errors.New("recording: invalid stop registration")
 	}
 	registry.mu.Lock()
