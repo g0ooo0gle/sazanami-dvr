@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/g0ooo0gle/sazanami-dvr/internal/core/catalogmodel"
 )
 
 func TestOutputSettingsValidate(t *testing.T) {
@@ -138,6 +140,39 @@ func TestOutputNameBoundariesAndDefaultPlan(t *testing.T) {
 	reservation.Output.Template = strings.Repeat("a", MaxOutputNameBytes-2)
 	if _, err := expandOutputName(reservation); err == nil {
 		t.Fatal("241バイトの名前を受理しました")
+	}
+}
+
+func TestOneSegFilePlanUsesDedicatedSuffixAndOutput(t *testing.T) {
+	reservation := outputReservation(t)
+	reservation.Output = OutputSettings{Folder: "main", Template: "main.ts"}
+	reservation.OneSegOutput = &OneSegOutput{
+		ProviderServiceLocator: "1004",
+		Output:                 OutputSettings{Folder: "partial", Template: "program.TS"},
+	}
+	plan, err := NewOneSegFilePlan(reservation, catalogmodel.ID{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.FinalPath != "partial/program.oneseg.TS" || plan.PartialPath != "partial/program.oneseg.TS.partial" {
+		t.Fatalf("plan=%+v", plan)
+	}
+
+	reservation.OneSegOutput.Output.Template = "program.oneseg.ts"
+	plan, err = NewOneSegFilePlan(reservation, catalogmodel.ID{1})
+	if err != nil || plan.FinalPath != "partial/program.oneseg.oneseg.ts" {
+		t.Fatalf("plan=%+v err=%v", plan, err)
+	}
+}
+
+func TestOneSegFilePlanRechecksExpandedNameLimit(t *testing.T) {
+	reservation := outputReservation(t)
+	reservation.OneSegOutput = &OneSegOutput{
+		ProviderServiceLocator: "1004",
+		Output:                 OutputSettings{Template: strings.Repeat("a", MaxOutputNameBytes-3)},
+	}
+	if _, err := NewOneSegFilePlan(reservation, catalogmodel.ID{1}); err == nil {
+		t.Fatal("ワンセグsuffix追加後の上限超過を受理しました")
 	}
 }
 

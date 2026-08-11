@@ -47,3 +47,18 @@ func TestValidateChange(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestRuleValidationKeepsAllPartialModeValues(t *testing.T) {
+	for _, mode := range []uint8{0, 1, 2, 255} {
+		rule := Rule{
+			ID: catalogmodel.ID{1}, Number: 1, Version: 1,
+			Search: SearchCondition{Enabled: true},
+			Recording: RecordingSettings{Mode: 1, Priority: 3, PartialMode: mode,
+				PartialFolders: []Folder{{Path: "保存", Writer: "plugin", Name: "name"}}},
+			CreatedAtUTCMS: 1, UpdatedAtUTCMS: 1,
+		}
+		if err := rule.ValidateStored(); err != nil {
+			t.Fatalf("mode=%d err=%v", mode, err)
+		}
+	}
+}

@@ -103,6 +103,14 @@ func createReservationTx(ctx context.Context, tx *sql.Tx, reservation recording.
 	if _, _, err := recording.ScheduledOutputPath(reservation); err != nil {
 		return recording.Reservation{}, errors.New("sqlite: invalid expanded reservation output")
 	}
+	if reservation.OneSegOutput != nil {
+		if _, err := recording.NewOneSegFilePlan(reservation, reservation.ID); err != nil {
+			return recording.Reservation{}, errors.New("sqlite: invalid expanded one-seg output")
+		}
+	}
+	if err := replaceOneSegOutputTx(ctx, tx, reservation.ID, reservation.OneSegOutput); err != nil {
+		return recording.Reservation{}, err
+	}
 	return reservation, nil
 }
 
@@ -117,8 +125,10 @@ func (store *Store) ActiveReservations(ctx context.Context, limit int, after int
 		r.station_name, r.start_at_utc_ms, r.duration_seconds, r.requested_priority, r.requested_follow,
 		r.effective_follow, r.created_at_utc_ms, r.updated_at_utc_ms, r.enabled, r.use_default_margins,
 		r.effective_start_margin_seconds, r.effective_end_margin_seconds, r.output_folder, r.output_template, r.component_mode,
-		r.post_action_mode, r.post_power_mode, r.post_script_path
+		r.post_action_mode, r.post_power_mode, r.post_script_path,
+		o.provider_service_locator, o.output_folder, o.output_template
 		FROM ctrlcmd_reservation_ids m JOIN reservations r ON r.id=m.reservation_id
+		LEFT JOIN reservation_oneseg_outputs o ON o.reservation_id=r.id
 		WHERE r.state='ACTIVE' AND m.reserve_id>? ORDER BY m.reserve_id LIMIT ?`, after, limit)
 	if err != nil {
 		return nil, sanitize("query-reservations", err)
@@ -359,8 +369,10 @@ func activeFollowEnd(startMS, durationMS, endMarginSeconds, attemptStartMS int64
 
 // UpdateReservationは変更不可の番組情報を照合し、録画開始前の設定だけを更新する。
 func (store *Store) UpdateReservation(ctx context.Context, change recording.ReservationChange, now time.Time) error {
+	oneSeg := change.ResolvedOneSegOutput
 	if store == nil || store.writer == nil || ctx == nil || change.Validate() != nil || now.IsZero() ||
-		now.Location() != time.UTC || now.UnixMilli() < 0 {
+		now.Location() != time.UTC || now.UnixMilli() < 0 ||
+		(change.Request.OneSegOutput == nil) != (oneSeg == nil) || oneSeg != nil && oneSeg.Output != *change.Request.OneSegOutput {
 		return errors.New("sqlite: invalid reservation update")
 	}
 	store.reservationPower.Lock()
@@ -407,6 +419,25 @@ func (store *Store) UpdateReservation(ctx context.Context, change recording.Rese
 	}}
 	if _, _, err := recording.ScheduledOutputPath(candidate); err != nil {
 		return errors.New("sqlite: invalid expanded reservation output")
+	}
+	var reservationID []byte
+	if err := tx.QueryRowContext(ctx, `SELECT reservation_id FROM ctrlcmd_reservation_ids WHERE reserve_id=?`, change.Number).
+		Scan(&reservationID); err != nil {
+		return sanitize("read-updated-reservation-id", err)
+	}
+	var id catalogmodel.ID
+	if err := copyExact(id[:], reservationID); err != nil {
+		return errors.New("sqlite: corrupt reservation id")
+	}
+	candidate.ID = id
+	candidate.OneSegOutput = oneSeg
+	if oneSeg != nil {
+		if _, err := recording.NewOneSegFilePlan(candidate, id); err != nil {
+			return errors.New("sqlite: invalid expanded one-seg output")
+		}
+	}
+	if err := replaceOneSegOutputTx(ctx, tx, id, oneSeg); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return sanitize("commit-reservation-update", err)
@@ -579,8 +610,10 @@ func (store *Store) NextActiveReservation(ctx context.Context, now time.Time) (*
 		r.station_name, r.start_at_utc_ms, r.duration_seconds, r.requested_priority, r.requested_follow,
 		r.effective_follow, r.created_at_utc_ms, r.updated_at_utc_ms, r.enabled, r.use_default_margins,
 		r.effective_start_margin_seconds, r.effective_end_margin_seconds, r.output_folder, r.output_template, r.component_mode,
-		r.post_action_mode, r.post_power_mode, r.post_script_path
+		r.post_action_mode, r.post_power_mode, r.post_script_path,
+		o.provider_service_locator, o.output_folder, o.output_template
 		FROM ctrlcmd_reservation_ids m JOIN reservations r ON r.id=m.reservation_id
+		LEFT JOIN reservation_oneseg_outputs o ON o.reservation_id=r.id
 		WHERE r.state='ACTIVE' AND r.enabled=1 AND NOT EXISTS (
 			SELECT 1 FROM recording_attempts a WHERE a.reservation_id=r.id
 		)
@@ -630,6 +663,20 @@ func (store *Store) ClaimRecording(ctx context.Context, request recording.ClaimR
 	if existing != 0 {
 		return recording.Attempt{}, ErrAttemptExists
 	}
+	paths := []string{request.Plan.PartialPath, request.Plan.FinalPath}
+	if request.OneSegPlan != nil {
+		paths = append(paths, request.OneSegPlan.PartialPath, request.OneSegPlan.FinalPath)
+	}
+	var pathConflict int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM recording_segments
+		WHERE relative_partial_path IN (?, ?, ?, ?) OR relative_final_path IN (?, ?, ?, ?)`,
+		pathAt(paths, 0), pathAt(paths, 1), pathAt(paths, 2), pathAt(paths, 3),
+		pathAt(paths, 0), pathAt(paths, 1), pathAt(paths, 2), pathAt(paths, 3)).Scan(&pathConflict); err != nil {
+		return recording.Attempt{}, sanitize("find-recording-path-conflict", err)
+	}
+	if pathConflict != 0 {
+		return recording.Attempt{}, errors.New("sqlite: recording path conflict")
+	}
 	plannedStartMS := startMS - startMarginSeconds*1_000
 	endMS := startMS + (durationSeconds+endMarginSeconds)*1_000
 	if startMS < 0 || durationSeconds < 1 || plannedStartMS < 0 || endMS <= plannedStartMS || endMS-plannedStartMS > int64((24*time.Hour)/time.Millisecond) {
@@ -653,12 +700,23 @@ func (store *Store) ClaimRecording(ctx context.Context, request recording.ClaimR
 	if err != nil {
 		return recording.Attempt{}, sanitize("create-recording-segment", err)
 	}
+	if request.OneSegPlan != nil {
+		_, err = tx.ExecContext(ctx, `INSERT INTO recording_segments(
+			id, attempt_id, ordinal, state, relative_partial_path, relative_final_path,
+			availability, created_at_utc_ms, updated_at_utc_ms)
+			VALUES (?, ?, 1, 'PLANNED', ?, ?, 'PLANNED', ?, ?)`, request.OneSegSegmentID.Bytes(),
+			request.AttemptID.Bytes(), request.OneSegPlan.PartialPath, request.OneSegPlan.FinalPath, nowMS, nowMS)
+		if err != nil {
+			return recording.Attempt{}, sanitize("create-one-seg-recording-segment", err)
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return recording.Attempt{}, sanitize("commit-recording-claim", err)
 	}
 	return recording.Attempt{
 		ID: request.AttemptID, ReservationID: request.ReservationID, State: recording.AttemptClaimed,
 		PlannedStart: time.UnixMilli(plannedStartMS).UTC(), PlannedEnd: time.UnixMilli(endMS).UTC(), Plan: request.Plan,
+		OneSegPlan: request.OneSegPlan,
 	}, nil
 }
 
@@ -726,6 +784,41 @@ func (store *Store) RecordingStarted(ctx context.Context, attemptID catalogmodel
 	return time.UnixMilli(plannedEndMS).UTC(), nil
 }
 
+// OneSegRecordingStartedはメイン開始後に、任意のordinal 1だけを書込み中へ進める。
+func (store *Store) OneSegRecordingStarted(ctx context.Context, attemptID catalogmodel.ID, now time.Time) error {
+	if err := validateRecordingUpdate(store, ctx, attemptID, now); err != nil {
+		return err
+	}
+	tx, err := store.writer.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		return sanitize("begin-one-seg-recording-start", err)
+	}
+	defer tx.Rollback()
+	nowMS := now.UnixMilli()
+	result, err := tx.ExecContext(ctx, `UPDATE recording_segments SET state='WRITING', updated_at_utc_ms=?
+		WHERE attempt_id=? AND ordinal=1 AND state='PLANNED' AND EXISTS (
+			SELECT 1 FROM recording_attempts a WHERE a.id=? AND a.state='RECORDING')`,
+		nowMS, attemptID.Bytes(), attemptID.Bytes())
+	if err != nil {
+		return sanitize("mark-one-seg-recording-started", err)
+	}
+	if affected(result) != 1 {
+		return ErrAttemptState
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE recording_attempts SET state_version=state_version+1,
+		heartbeat_utc_ms=?, updated_at_utc_ms=? WHERE id=? AND state='RECORDING'`, nowMS, nowMS, attemptID.Bytes())
+	if err != nil {
+		return sanitize("touch-one-seg-recording-start", err)
+	}
+	if affected(result) != 1 {
+		return ErrAttemptState
+	}
+	if err := tx.Commit(); err != nil {
+		return sanitize("commit-one-seg-recording-start", err)
+	}
+	return nil
+}
+
 // UpdateRecordingProgressは5秒ごとのバイト数と生存時刻を保存し、現在の予定終了時刻を返す。
 func (store *Store) UpdateRecordingProgress(ctx context.Context, attemptID catalogmodel.ID, byteCount int64, now time.Time) (time.Time, error) {
 	if byteCount < 0 || validateRecordingUpdate(store, ctx, attemptID, now) != nil {
@@ -769,6 +862,50 @@ func (store *Store) UpdateRecordingProgress(ctx context.Context, attemptID catal
 	return time.UnixMilli(plannedEndMS).UTC(), nil
 }
 
+// UpdateOneSegProgressはordinal 1のbyte数だけを進め、メインと共通の予定終了を返す。
+func (store *Store) UpdateOneSegProgress(ctx context.Context, attemptID catalogmodel.ID, byteCount int64,
+	now time.Time,
+) (time.Time, error) {
+	if byteCount < 0 || validateRecordingUpdate(store, ctx, attemptID, now) != nil {
+		return time.Time{}, errors.New("sqlite: invalid one-seg recording progress")
+	}
+	tx, err := store.writer.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		return time.Time{}, sanitize("begin-one-seg-recording-progress", err)
+	}
+	defer tx.Rollback()
+	nowMS := now.UnixMilli()
+	result, err := tx.ExecContext(ctx, `UPDATE recording_segments SET byte_count=?, updated_at_utc_ms=?
+		WHERE attempt_id=? AND ordinal=1 AND state='WRITING' AND byte_count<=?`,
+		byteCount, nowMS, attemptID.Bytes(), byteCount)
+	if err != nil {
+		return time.Time{}, sanitize("update-one-seg-recording-progress", err)
+	}
+	if affected(result) != 1 {
+		return time.Time{}, ErrAttemptState
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE recording_attempts SET state_version=state_version+1,
+		heartbeat_utc_ms=?, updated_at_utc_ms=? WHERE id=? AND state='RECORDING'`, nowMS, nowMS, attemptID.Bytes())
+	if err != nil {
+		return time.Time{}, sanitize("touch-one-seg-recording-progress", err)
+	}
+	if affected(result) != 1 {
+		return time.Time{}, ErrAttemptState
+	}
+	var plannedEndMS int64
+	if err := tx.QueryRowContext(ctx, `SELECT planned_end_utc_ms FROM recording_attempts
+		WHERE id=? AND state='RECORDING'`, attemptID.Bytes()).Scan(&plannedEndMS); err != nil {
+		return time.Time{}, sanitize("read-one-seg-recording-planned-end", err)
+	}
+	if plannedEndMS < 0 {
+		return time.Time{}, errors.New("sqlite: corrupt one-seg recording planned end")
+	}
+	if err := tx.Commit(); err != nil {
+		return time.Time{}, sanitize("commit-one-seg-recording-progress", err)
+	}
+	return time.UnixMilli(plannedEndMS).UTC(), nil
+}
+
 // BeginFinalizationはファイル同期済みのバイト数とトークンを保存し、完成名を公開できる状態へ進める。
 func (store *Store) BeginFinalization(ctx context.Context, request recording.FinalizeRequest) error {
 	if store == nil || store.writer == nil || ctx == nil || request.Validate() != nil {
@@ -801,6 +938,35 @@ func (store *Store) BeginFinalization(ctx context.Context, request recording.Fin
 	if affected(result) != 1 {
 		return ErrAttemptState
 	}
+	var oneSegCount int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM recording_segments WHERE attempt_id=? AND ordinal=1`,
+		request.AttemptID.Bytes()).Scan(&oneSegCount); err != nil {
+		return sanitize("count-one-seg-finalization", err)
+	}
+	if (request.OneSeg == nil) != (oneSegCount == 0) {
+		return ErrAttemptState
+	}
+	if request.OneSeg != nil {
+		fileSynced := 0
+		if request.OneSeg.FileSynced {
+			fileSynced = 1
+		}
+		var integrity any
+		if !request.OneSeg.Publish {
+			integrity = request.OneSeg.Reason
+		}
+		result, err = tx.ExecContext(ctx, `UPDATE recording_segments SET state='PARTIAL', byte_count=?,
+			file_synced=?, availability=?, integrity_reason=?, updated_at_utc_ms=?
+			WHERE attempt_id=? AND ordinal=1 AND state IN ('PLANNED','WRITING') AND byte_count<=?`,
+			request.OneSeg.ByteCount, fileSynced, request.OneSeg.Availability, integrity, nowMS,
+			request.AttemptID.Bytes(), request.OneSeg.ByteCount)
+		if err != nil {
+			return sanitize("save-one-seg-finalization", err)
+		}
+		if affected(result) != 1 {
+			return ErrAttemptState
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return sanitize("commit-recording-finalization", err)
 	}
@@ -815,6 +981,41 @@ func (store *Store) MarkFinalPublished(ctx context.Context, attemptID catalogmod
 // MarkDirectorySyncedは完成名を含むディレクトリの同期を記録する。
 func (store *Store) MarkDirectorySynced(ctx context.Context, attemptID catalogmodel.ID, now time.Time) error {
 	return store.markFinalizationFlag(ctx, attemptID, "directory_synced", now)
+}
+
+// MarkOneSegFinalPublishedはordinal 1の完成名を公開した事実だけを保存する。
+func (store *Store) MarkOneSegFinalPublished(ctx context.Context, attemptID catalogmodel.ID, now time.Time) error {
+	return store.markSegmentFinalizationFlag(ctx, attemptID, 1, "final_published", now)
+}
+
+// MarkOneSegDirectorySyncedはordinal 1を完成状態へ確定する。
+func (store *Store) MarkOneSegDirectorySynced(ctx context.Context, attemptID catalogmodel.ID, now time.Time) error {
+	return store.markSegmentFinalizationFlag(ctx, attemptID, 1, "directory_synced", now)
+}
+
+// SetOneSegOutcomeは公開できなかったordinal 1を固定理由付きで部分・欠落・不一致へ確定する。
+func (store *Store) SetOneSegOutcome(ctx context.Context, attemptID catalogmodel.ID, outcome recording.OneSegResult,
+	now time.Time,
+) error {
+	if validateRecordingUpdate(store, ctx, attemptID, now) != nil || outcome.Validate() != nil || outcome.Publish {
+		return errors.New("sqlite: invalid one-seg outcome")
+	}
+	fileSynced := 0
+	if outcome.FileSynced {
+		fileSynced = 1
+	}
+	result, err := store.writer.ExecContext(ctx, `UPDATE recording_segments SET state='PARTIAL', byte_count=?,
+		file_synced=?, availability=?, integrity_reason=?, updated_at_utc_ms=?
+		WHERE attempt_id=? AND ordinal=1 AND state IN ('PLANNED','WRITING','PARTIAL','FINALIZED') AND EXISTS (
+			SELECT 1 FROM recording_attempts a WHERE a.id=? AND a.state='FINALIZING')`,
+		outcome.ByteCount, fileSynced, outcome.Availability, outcome.Reason, now.UnixMilli(), attemptID.Bytes(), attemptID.Bytes())
+	if err != nil {
+		return sanitize("save-one-seg-outcome", err)
+	}
+	if affected(result) != 1 {
+		return ErrAttemptState
+	}
+	return nil
 }
 
 // FinishAttemptは録画処理と予約を同じトランザクションで終了状態へ進める。
@@ -855,6 +1056,49 @@ func (store *Store) FinishAttempt(ctx context.Context, request recording.FinishR
 			plannedState.String != string(request.State) || plannedReason.String != string(request.Reason)) {
 		return ErrAttemptState
 	}
+	successful := request.State == recording.AttemptSucceeded ||
+		(request.State == recording.AttemptPartial && request.Reason == recording.ReasonUserRequestedStop)
+	var mainState recording.SegmentState
+	var mainAvailability recording.Availability
+	var mainSynced, mainPublished, mainDirectory int
+	if err := tx.QueryRowContext(ctx, `SELECT state, availability, file_synced, final_published, directory_synced
+		FROM recording_segments WHERE attempt_id=? AND ordinal=0`, request.AttemptID.Bytes()).
+		Scan(&mainState, &mainAvailability, &mainSynced, &mainPublished, &mainDirectory); err != nil {
+		return sanitize("read-main-segment-finish", err)
+	}
+	if successful && (mainState != recording.SegmentFinalized || mainAvailability != recording.AvailabilityFinal ||
+		mainSynced != 1 || mainPublished != 1 || mainDirectory != 1) {
+		return ErrAttemptState
+	}
+	var oneSegCount int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM recording_segments WHERE attempt_id=? AND ordinal=1`,
+		request.AttemptID.Bytes()).Scan(&oneSegCount); err != nil {
+		return sanitize("count-one-seg-finish", err)
+	}
+	if oneSegCount > 1 || successful && request.OneSeg != nil || request.OneSeg != nil && request.OneSeg.Publish || !successful &&
+		((oneSegCount == 0) != (request.OneSeg == nil)) {
+		return ErrAttemptState
+	}
+	if successful && oneSegCount == 1 {
+		var state recording.SegmentState
+		var availability recording.Availability
+		var fileSynced, finalPublished, directorySynced int
+		var integrity string
+		if err := tx.QueryRowContext(ctx, `SELECT state, availability, file_synced, final_published,
+			directory_synced, COALESCE(integrity_reason,'') FROM recording_segments
+			WHERE attempt_id=? AND ordinal=1`, request.AttemptID.Bytes()).
+			Scan(&state, &availability, &fileSynced, &finalPublished, &directorySynced, &integrity); err != nil {
+			return sanitize("read-one-seg-finish", err)
+		}
+		finalized := state == recording.SegmentFinalized && availability == recording.AvailabilityFinal &&
+			fileSynced == 1 && finalPublished == 1 && directorySynced == 1 && integrity == ""
+		settledFailure := (state == recording.SegmentPartial || state == recording.SegmentFinalized) && integrity != "" &&
+			(availability == recording.AvailabilityPartial || availability == recording.AvailabilityMissing ||
+				availability == recording.AvailabilityMismatched)
+		if !finalized && !settledFailure {
+			return ErrAttemptState
+		}
+	}
 	nowMS := request.Now.UnixMilli()
 	var actualEnd any
 	if actualStart.Valid {
@@ -873,12 +1117,10 @@ func (store *Store) FinishAttempt(ctx context.Context, request recording.FinishR
 	if affected(result) != 1 {
 		return ErrAttemptState
 	}
-	if request.State == recording.AttemptSucceeded ||
-		(request.State == recording.AttemptPartial && request.Reason == recording.ReasonUserRequestedStop) {
-		result, err = tx.ExecContext(ctx, `UPDATE recording_segments SET state='FINALIZED', byte_count=?,
-			availability='FINAL', updated_at_utc_ms=? WHERE attempt_id=? AND ordinal=0 AND state='PARTIAL'
-			AND file_synced=1 AND final_published=1 AND directory_synced=1`, request.ByteCount, nowMS,
-			request.AttemptID.Bytes())
+	if successful {
+		result, err = tx.ExecContext(ctx, `UPDATE recording_segments SET byte_count=?, updated_at_utc_ms=?
+			WHERE attempt_id=? AND ordinal=0 AND state='FINALIZED' AND availability='FINAL'`,
+			request.ByteCount, nowMS, request.AttemptID.Bytes())
 	} else {
 		result, err = tx.ExecContext(ctx, `UPDATE recording_segments SET state=CASE WHEN ?>0 THEN 'PARTIAL' ELSE state END,
 			byte_count=?, availability=?, updated_at_utc_ms=? WHERE attempt_id=? AND ordinal=0`,
@@ -889,6 +1131,22 @@ func (store *Store) FinishAttempt(ctx context.Context, request recording.FinishR
 	}
 	if affected(result) != 1 {
 		return ErrAttemptState
+	}
+	if !successful && request.OneSeg != nil {
+		fileSynced := 0
+		if request.OneSeg.FileSynced {
+			fileSynced = 1
+		}
+		result, err = tx.ExecContext(ctx, `UPDATE recording_segments SET state='PARTIAL', byte_count=?,
+			file_synced=?, availability=?, integrity_reason=?, updated_at_utc_ms=?
+			WHERE attempt_id=? AND ordinal=1`, request.OneSeg.ByteCount, fileSynced,
+			request.OneSeg.Availability, request.OneSeg.Reason, nowMS, request.AttemptID.Bytes())
+		if err != nil {
+			return sanitize("finish-one-seg-segment", err)
+		}
+		if affected(result) != 1 {
+			return ErrAttemptState
+		}
 	}
 	result, err = tx.ExecContext(ctx, `UPDATE reservations SET state='FINISHED', version=version+1,
 		updated_at_utc_ms=?, finished_at_utc_ms=?, terminal_reason='ATTEMPT_FINISHED'
@@ -911,13 +1169,15 @@ func scanReservation(scanner rowScanner) (recording.Reservation, error) {
 	var number, networkID, transportID, serviceID, eventID, startMS, duration, priority int64
 	var requestedFollow, effectiveFollow, enabled, useDefaultMargins, startMarginSeconds, endMarginSeconds, componentMode int64
 	var postActionMode, postPowerMode int64
+	var oneSegLocator, oneSegFolder, oneSegTemplate sql.NullString
 	var createdMS, updatedMS int64
 	if err := scanner.Scan(&id, &number, &item.Version, &item.State, &instanceID, &revisionID, &backendID,
 		&item.Program.ProviderServiceLocator, &item.Program.TuningTarget, &networkID, &transportID,
 		&serviceID, &eventID, &item.Program.Title, &item.Program.StationName, &startMS,
 		&duration, &priority, &requestedFollow, &effectiveFollow, &createdMS, &updatedMS,
 		&enabled, &useDefaultMargins, &startMarginSeconds, &endMarginSeconds, &item.Output.Folder, &item.Output.Template,
-		&componentMode, &postActionMode, &postPowerMode, &item.PostRecording.Script); err != nil {
+		&componentMode, &postActionMode, &postPowerMode, &item.PostRecording.Script,
+		&oneSegLocator, &oneSegFolder, &oneSegTemplate); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return recording.Reservation{}, err
 		}
@@ -965,6 +1225,16 @@ func scanReservation(scanner rowScanner) (recording.Reservation, error) {
 	if item.PostRecording.Validate() != nil {
 		return recording.Reservation{}, errors.New("sqlite: corrupt post-recording settings")
 	}
+	if oneSegLocator.Valid || oneSegFolder.Valid || oneSegTemplate.Valid {
+		if !oneSegLocator.Valid || !oneSegFolder.Valid || !oneSegTemplate.Valid {
+			return recording.Reservation{}, errors.New("sqlite: incomplete one-seg output")
+		}
+		item.OneSegOutput = &recording.OneSegOutput{ProviderServiceLocator: oneSegLocator.String,
+			Output: recording.OutputSettings{Folder: oneSegFolder.String, Template: oneSegTemplate.String}}
+		if item.OneSegOutput.Validate() != nil {
+			return recording.Reservation{}, errors.New("sqlite: corrupt one-seg output")
+		}
+	}
 	if useDefaultMargins == 0 {
 		item.Margins = &recording.RecordingMargins{Start: time.Duration(startMarginSeconds) * time.Second,
 			End: time.Duration(endMarginSeconds) * time.Second}
@@ -972,6 +1242,36 @@ func scanReservation(scanner rowScanner) (recording.Reservation, error) {
 	item.CreatedAt = time.UnixMilli(createdMS).UTC()
 	item.UpdatedAt = time.UnixMilli(updatedMS).UTC()
 	return item, nil
+}
+
+func replaceOneSegOutputTx(ctx context.Context, tx *sql.Tx, reservationID catalogmodel.ID,
+	output *recording.OneSegOutput,
+) error {
+	if output == nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM reservation_oneseg_outputs WHERE reservation_id=?`, reservationID.Bytes()); err != nil {
+			return sanitize("delete-one-seg-output", err)
+		}
+		return nil
+	}
+	if output.Validate() != nil {
+		return errors.New("sqlite: invalid one-seg output")
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO reservation_oneseg_outputs(
+		reservation_id, provider_service_locator, output_folder, output_template) VALUES (?, ?, ?, ?)
+		ON CONFLICT(reservation_id) DO UPDATE SET provider_service_locator=excluded.provider_service_locator,
+		output_folder=excluded.output_folder, output_template=excluded.output_template`, reservationID.Bytes(),
+		output.ProviderServiceLocator, output.Output.Folder, output.Output.Template)
+	if err != nil {
+		return sanitize("save-one-seg-output", err)
+	}
+	return nil
+}
+
+func pathAt(paths []string, index int) string {
+	if index < len(paths) {
+		return paths[index]
+	}
+	return ""
 }
 
 // encodePostRecordingModesはdomainの一値をschema 11互換値と電源値へ分ける。
@@ -1017,7 +1317,14 @@ func (store *Store) transitionAttempt(ctx context.Context, id catalogmodel.ID, f
 }
 
 func (store *Store) markFinalizationFlag(ctx context.Context, id catalogmodel.ID, column string, now time.Time) error {
-	if validateRecordingUpdate(store, ctx, id, now) != nil || (column != "final_published" && column != "directory_synced") {
+	return store.markSegmentFinalizationFlag(ctx, id, 0, column, now)
+}
+
+func (store *Store) markSegmentFinalizationFlag(ctx context.Context, id catalogmodel.ID, ordinal int,
+	column string, now time.Time,
+) error {
+	if validateRecordingUpdate(store, ctx, id, now) != nil || (ordinal != 0 && ordinal != 1) ||
+		(column != "final_published" && column != "directory_synced") {
 		return errors.New("sqlite: invalid recording finalization flag")
 	}
 	tx, err := store.writer.BeginTx(ctx, &sql.TxOptions{})
@@ -1026,12 +1333,16 @@ func (store *Store) markFinalizationFlag(ctx context.Context, id catalogmodel.ID
 	}
 	defer tx.Rollback()
 	nowMS := now.UnixMilli()
-	query := `UPDATE recording_segments SET ` + column + `=1, updated_at_utc_ms=? WHERE attempt_id=? AND ordinal=0
-		AND state='PARTIAL' AND file_synced=1`
+	set := column + `=1, updated_at_utc_ms=?`
+	if column == "directory_synced" {
+		set += `, state='FINALIZED', availability='FINAL', integrity_reason=NULL`
+	}
+	query := `UPDATE recording_segments SET ` + set + ` WHERE attempt_id=? AND ordinal=?
+		AND state='PARTIAL' AND file_synced=1 AND integrity_reason IS NULL`
 	if column == "directory_synced" {
 		query += ` AND final_published=1`
 	}
-	result, err := tx.ExecContext(ctx, query, nowMS, id.Bytes())
+	result, err := tx.ExecContext(ctx, query, nowMS, id.Bytes(), ordinal)
 	if err != nil {
 		return sanitize("mark-recording-finalization-flag", err)
 	}

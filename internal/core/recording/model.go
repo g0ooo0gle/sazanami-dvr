@@ -87,19 +87,25 @@ type ReservationRequest struct {
 	Disabled          bool
 	Margins           *RecordingMargins
 	Output            OutputSettings
-	Components        ComponentMode
-	PostRecording     PostRecordingSettings
+	// OneSegOutputがnilでなければ、同じ予約の二本目としてワンセグを保存する。
+	// 空値はservice解決後にメイン設定を継承する要求を表す。
+	OneSegOutput  *OutputSettings
+	Components    ComponentMode
+	PostRecording PostRecordingSettings
 }
 
 // ReservationChangeはKonomiTVが返す完全な予約情報から、変更対象と照合条件を分離した値である。
 type ReservationChange struct {
 	Number  int32
 	Request ReservationRequest
+	// ResolvedOneSegOutputはapp層が同じsnapshotで解決した、保存直前の内部値である。
+	ResolvedOneSegOutput *OneSegOutput
 }
 
 // Validateは保存済み予約へ安全に照合できる変更要求かを検証する。
 func (change ReservationChange) Validate() error {
-	if change.Number < 1 || change.Request.Validate() != nil {
+	if change.Number < 1 || change.Request.Validate() != nil ||
+		change.ResolvedOneSegOutput != nil && change.ResolvedOneSegOutput.Validate() != nil {
 		return errors.New("recording: invalid reservation change")
 	}
 	return nil
@@ -110,7 +116,8 @@ func (request ReservationRequest) Validate() error {
 	if request.Start.IsZero() || request.Start.Location() != time.UTC || request.Start.UnixMilli() < 0 ||
 		request.Duration < time.Second || request.Duration > 24*time.Hour || request.Duration%time.Second != 0 ||
 		request.Priority < 1 || request.Priority > 5 || validateRecordingTime(request.Start, request.Duration, request.Margins) != nil ||
-		request.Output.Validate() != nil || !request.Components.Valid() || request.PostRecording.Validate() != nil {
+		request.Output.Validate() != nil || request.OneSegOutput != nil && request.OneSegOutput.Validate() != nil ||
+		!request.Components.Valid() || request.PostRecording.Validate() != nil {
 		return errors.New("recording: invalid reservation request")
 	}
 	return nil
@@ -129,11 +136,13 @@ type Reservation struct {
 	Disabled        bool
 	Margins         *RecordingMargins
 	Output          OutputSettings
-	Components      ComponentMode
-	PostRecording   PostRecordingSettings
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
-	FinishedAt      *time.Time
+	// OneSegOutputは解決済みの接続先と予約時点で固定した保存先である。
+	OneSegOutput  *OneSegOutput
+	Components    ComponentMode
+	PostRecording PostRecordingSettings
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+	FinishedAt    *time.Time
 }
 
 // EffectiveMarginsは予約が実際に使う開始余白と終了余白を返す。
@@ -199,6 +208,7 @@ func (reservation Reservation) ValidateNew() error {
 	if program.Start.IsZero() || program.Start.Location() != time.UTC || program.Start.UnixMilli() < 0 ||
 		program.Duration < time.Second || program.Duration > 24*time.Hour || program.Duration%time.Second != 0 ||
 		validateRecordingTime(program.Start, program.Duration, reservation.Margins) != nil || reservation.Output.Validate() != nil ||
+		reservation.OneSegOutput != nil && reservation.OneSegOutput.Validate() != nil ||
 		!reservation.Components.Valid() || reservation.PostRecording.Validate() != nil {
 		return errors.New("recording: invalid reservation time")
 	}
@@ -384,7 +394,7 @@ func (plan FilePlan) Validate() error {
 	return nil
 }
 
-// ClaimRequestは一つの予約へ録画処理と最初のファイル計画を同時に割り当てる。
+// ClaimRequestは一つの予約へ録画処理と最大二つのファイル計画を同時に割り当てる。
 type ClaimRequest struct {
 	ReservationID   catalogmodel.ID
 	AttemptID       catalogmodel.ID
@@ -393,6 +403,8 @@ type ClaimRequest struct {
 	OwnerGeneration int64
 	Now             time.Time
 	Plan            FilePlan
+	OneSegSegmentID catalogmodel.ID
+	OneSegPlan      *FilePlan
 }
 
 // ValidateはDBへ録画所有権を保存できる値かを検証する。
@@ -402,6 +414,17 @@ func (request ClaimRequest) Validate() error {
 		request.OwnerGeneration < 1 || request.Now.IsZero() || request.Now.Location() != time.UTC || request.Now.UnixMilli() < 0 ||
 		request.Plan.Validate() != nil {
 		return errors.New("recording: invalid claim request")
+	}
+	if request.OneSegPlan == nil {
+		if request.OneSegSegmentID != zero {
+			return errors.New("recording: invalid one-seg claim")
+		}
+		return nil
+	}
+	if request.OneSegSegmentID == zero || request.OneSegSegmentID == request.SegmentID || request.OneSegPlan.Validate() != nil ||
+		request.OneSegPlan.PartialPath == request.Plan.PartialPath || request.OneSegPlan.PartialPath == request.Plan.FinalPath ||
+		request.OneSegPlan.FinalPath == request.Plan.PartialPath || request.OneSegPlan.FinalPath == request.Plan.FinalPath {
+		return errors.New("recording: invalid one-seg claim")
 	}
 	return nil
 }
@@ -415,6 +438,7 @@ type Attempt struct {
 	PlannedEnd    time.Time
 	ByteCount     int64
 	Plan          FilePlan
+	OneSegPlan    *FilePlan
 }
 
 // StopResultは予約取消しまたは録画停止をDBへ確定した結果である。
@@ -506,7 +530,22 @@ type RecoveryItem struct {
 	FinalPublished    bool
 	DirectorySynced   bool
 	Availability      Availability
+	SegmentState      SegmentState
+	IntegrityReason   TerminalReason
 	Recovered         bool
+	OneSeg            *RecoverySegment
+}
+
+// RecoverySegmentはワンセグsegmentをメインと分けて照合するための保存済み事実である。
+type RecoverySegment struct {
+	Plan            FilePlan
+	ByteCount       int64
+	State           SegmentState
+	FileSynced      bool
+	FinalPublished  bool
+	DirectorySynced bool
+	Availability    Availability
+	IntegrityReason TerminalReason
 }
 
 // FileFactはDBに記録した一つの相対パスで観測したファイル状態である。
@@ -532,6 +571,7 @@ type FinalizeRequest struct {
 	State     AttemptState
 	Reason    TerminalReason
 	Now       time.Time
+	OneSeg    *OneSegResult
 }
 
 // Validateは完成処理を始められる値かを検証する。
@@ -545,6 +585,44 @@ func (request FinalizeRequest) Validate() error {
 		(request.State != AttemptPartial || request.Reason != ReasonUserRequestedStop) {
 		return errors.New("recording: invalid planned final result")
 	}
+	if request.OneSeg != nil && request.OneSeg.Validate() != nil {
+		return errors.New("recording: invalid one-seg finalization result")
+	}
+	return nil
+}
+
+// OneSegResultは補助録画を公開できるか、部分・欠落・不一致として残すかを表す。
+type OneSegResult struct {
+	ByteCount    int64
+	Availability Availability
+	Reason       TerminalReason
+	FileSynced   bool
+	Publish      bool
+}
+
+// Validateはワンセグのfile状態と固定理由の組合せを検証する。
+func (result OneSegResult) Validate() error {
+	if result.ByteCount < 0 {
+		return errors.New("recording: invalid one-seg byte count")
+	}
+	if result.Publish {
+		if result.ByteCount < 188 || result.Availability != AvailabilityPartial || !result.FileSynced ||
+			(!result.Reason.successful() && result.Reason != ReasonUserRequestedStop) {
+			return errors.New("recording: invalid publishable one-seg result")
+		}
+		return nil
+	}
+	if !result.Reason.Valid() {
+		return errors.New("recording: missing one-seg failure reason")
+	}
+	switch result.Availability {
+	case AvailabilityPartial, AvailabilityMissing, AvailabilityMismatched:
+	default:
+		return errors.New("recording: invalid one-seg availability")
+	}
+	if result.Availability == AvailabilityMissing && result.ByteCount != 0 {
+		return errors.New("recording: missing one-seg has bytes")
+	}
 	return nil
 }
 
@@ -557,6 +635,7 @@ type FinishRequest struct {
 	Availability Availability
 	Recovered    bool
 	Now          time.Time
+	OneSeg       *OneSegResult
 }
 
 // Validateは終了状態とファイル状態の組合せを検証する。
@@ -565,6 +644,9 @@ func (request FinishRequest) Validate() error {
 	if request.AttemptID == zero || !request.Reason.Valid() || request.ByteCount < 0 ||
 		request.Now.IsZero() || request.Now.Location() != time.UTC || request.Now.UnixMilli() < 0 {
 		return errors.New("recording: invalid finish request")
+	}
+	if request.OneSeg != nil && request.OneSeg.Validate() != nil {
+		return errors.New("recording: invalid one-seg finish result")
 	}
 	switch request.State {
 	case AttemptSucceeded:

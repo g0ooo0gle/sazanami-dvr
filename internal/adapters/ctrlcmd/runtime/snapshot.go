@@ -167,6 +167,44 @@ func canonicalServiceLocator(value string) bool {
 	return err == nil && parsed > 0 && strconv.FormatUint(parsed, 10) == value
 }
 
+// ResolveOneSegはメインと同じnetwork ID／TSIDにある、別SIDの部分受信serviceを一意に解決する。
+func (snapshot *Snapshot) ResolveOneSeg(ctx context.Context, program recording.ProgramSnapshot) (string, error) {
+	if snapshot == nil || ctx == nil || ctx.Err() != nil {
+		return "", stable("one-seg-service-unavailable")
+	}
+	locator := ""
+	for _, service := range snapshot.value.Services {
+		if service.NetworkID != program.NetworkID || service.TransportStreamID != program.TransportStreamID ||
+			service.ServiceID == program.ServiceID || !service.PartialReception || !service.Verified || !service.Selected ||
+			!canonicalServiceLocator(service.ProviderLocator) {
+			continue
+		}
+		if locator != "" {
+			return "", stable("one-seg-service-unavailable")
+		}
+		locator = service.ProviderLocator
+	}
+	if locator == "" {
+		return "", stable("one-seg-service-unavailable")
+	}
+	return locator, nil
+}
+
+// ResolveOneSegReservationは番組と対応するワンセグserviceを同じsnapshot内で解決する。
+func (snapshot *Snapshot) ResolveOneSegReservation(ctx context.Context, request recording.ReservationRequest) (
+	recording.ProgramSnapshot, string, error,
+) {
+	program, err := snapshot.FindProgram(ctx, request)
+	if err != nil {
+		return recording.ProgramSnapshot{}, "", err
+	}
+	locator, err := snapshot.ResolveOneSeg(ctx, program)
+	if err != nil {
+		return recording.ProgramSnapshot{}, "", err
+	}
+	return program, locator, nil
+}
+
 // Currentは同じ完成済みスナップショットを返す。返却後に内部データを更新しない。
 func (snapshot *Snapshot) Current(ctx context.Context) (channel.Snapshot, error) {
 	if snapshot == nil || ctx == nil {

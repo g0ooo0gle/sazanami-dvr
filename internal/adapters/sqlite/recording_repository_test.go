@@ -52,6 +52,98 @@ func TestReservationCreateReadbackAndDuplicate(t *testing.T) {
 	}
 }
 
+func TestOneSegReservationRoundTripUpdateDeleteAndRestart(t *testing.T) {
+	root, store := openMigratedStore(t)
+	reservation := reservationForTest(t, store)
+	reservation.OneSegOutput = &recording.OneSegOutput{
+		ProviderServiceLocator: "1004",
+		Output:                 recording.OutputSettings{Folder: "ワンセグ", Template: "$Title$.ts"},
+	}
+	created, err := store.CreateReservation(context.Background(), reservation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertOneSegReservation := func(t *testing.T, current *Store, want *recording.OneSegOutput) {
+		t.Helper()
+		items, readErr := current.ActiveReservations(context.Background(), 1, 0)
+		if readErr != nil || len(items) != 1 || items[0].OneSegOutput == nil || *items[0].OneSegOutput != *want {
+			t.Fatalf("items=%+v err=%v", items, readErr)
+		}
+	}
+	assertOneSegReservation(t, store, reservation.OneSegOutput)
+
+	nextSettings := recording.OutputSettings{Folder: "mobile", Template: "$ReserveID$.ts"}
+	request := reservationRequestForTest(reservation)
+	request.OneSegOutput = &nextSettings
+	next := &recording.OneSegOutput{ProviderServiceLocator: "1005", Output: nextSettings}
+	if err := store.UpdateReservation(context.Background(), recording.ReservationChange{
+		Number: created.Number, Request: request, ResolvedOneSegOutput: next,
+	}, reservation.CreatedAt.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	assertOneSegReservation(t, store, next)
+
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenStore(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	assertOneSegReservation(t, reopened, next)
+	request.OneSegOutput = nil
+	if err := reopened.UpdateReservation(context.Background(), recording.ReservationChange{
+		Number: created.Number, Request: request,
+	}, reservation.CreatedAt.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	items, err := reopened.ActiveReservations(context.Background(), 1, 0)
+	if err != nil || len(items) != 1 || items[0].OneSegOutput != nil {
+		t.Fatalf("items=%+v err=%v", items, err)
+	}
+}
+
+func TestOneSegReservationFailureRollsBackWholeCreate(t *testing.T) {
+	_, store := openMigratedStore(t)
+	reservation := reservationForTest(t, store)
+	reservation.OneSegOutput = &recording.OneSegOutput{ProviderServiceLocator: "1004"}
+	if _, err := store.writer.Exec(`CREATE TRIGGER fail_one_seg_insert BEFORE INSERT ON reservation_oneseg_outputs
+		BEGIN SELECT RAISE(ABORT, 'test failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateReservation(context.Background(), reservation); err == nil {
+		t.Fatal("ワンセグ行の失敗後に予約を作成しました")
+	}
+	var reservations, mappings, oneSeg int
+	if err := store.reader.QueryRow(`SELECT count(*) FROM reservations`).Scan(&reservations); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.reader.QueryRow(`SELECT count(*) FROM ctrlcmd_reservation_ids`).Scan(&mappings); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.reader.QueryRow(`SELECT count(*) FROM reservation_oneseg_outputs`).Scan(&oneSeg); err != nil {
+		t.Fatal(err)
+	}
+	if reservations != 0 || mappings != 0 || oneSeg != 0 {
+		t.Fatalf("reservations=%d mappings=%d one_seg=%d", reservations, mappings, oneSeg)
+	}
+}
+
+func TestOneSegReservationScannerRejectsNonCanonicalLocator(t *testing.T) {
+	_, store := openMigratedStore(t)
+	reservation := reservationForTest(t, store)
+	created, err := store.CreateReservation(context.Background(), reservation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.writer.Exec(`INSERT INTO reservation_oneseg_outputs(
+		reservation_id, provider_service_locator, output_folder, output_template) VALUES (?, '01004', '', '')`,
+		created.ID.Bytes()); err == nil {
+		t.Fatal("非canonical locatorを保存しました")
+	}
+}
+
 func TestPostRecordingModesRoundTripAndSurviveRestart(t *testing.T) {
 	root, store := openMigratedStore(t)
 	base := reservationForTest(t, store)
@@ -939,6 +1031,193 @@ func TestRecordingAttemptLifecycle(t *testing.T) {
 	}
 }
 
+func TestOneSegClaimCreatesTwoSegmentsAtomically(t *testing.T) {
+	_, store := openMigratedStore(t)
+	reservation := reservationForTest(t, store)
+	if _, err := store.CreateReservation(context.Background(), reservation); err != nil {
+		t.Fatal(err)
+	}
+	mainPlan := recording.FilePlan{PartialPath: "2026/08/main.ts.partial", FinalPath: "2026/08/main.ts"}
+	oneSegPlan := recording.FilePlan{PartialPath: "2026/08/main.oneseg.ts.partial", FinalPath: "2026/08/main.oneseg.ts"}
+	request := recording.ClaimRequest{
+		ReservationID: reservation.ID, AttemptID: testID(t, 200), SegmentID: testID(t, 201),
+		OneSegSegmentID: testID(t, 202), OwnerID: testID(t, 203), OwnerGeneration: 1,
+		Now: reservation.CreatedAt.Add(time.Minute), Plan: mainPlan, OneSegPlan: &oneSegPlan,
+	}
+	attempt, err := store.ClaimRecording(context.Background(), request)
+	if err != nil || attempt.OneSegPlan == nil || *attempt.OneSegPlan != oneSegPlan {
+		t.Fatalf("attempt=%+v err=%v", attempt, err)
+	}
+	rows, err := store.reader.Query(`SELECT ordinal, relative_partial_path, relative_final_path
+		FROM recording_segments WHERE attempt_id=? ORDER BY ordinal`, request.AttemptID.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	wants := []recording.FilePlan{mainPlan, oneSegPlan}
+	index := 0
+	for rows.Next() {
+		var ordinal int
+		var partial, final string
+		if err := rows.Scan(&ordinal, &partial, &final); err != nil {
+			t.Fatal(err)
+		}
+		if index >= len(wants) || ordinal != index || partial != wants[index].PartialPath || final != wants[index].FinalPath {
+			t.Fatalf("index=%d ordinal=%d partial=%q final=%q", index, ordinal, partial, final)
+		}
+		index++
+	}
+	if err := rows.Err(); err != nil || index != 2 {
+		t.Fatalf("segments=%d err=%v", index, err)
+	}
+}
+
+func TestOneSegLifecycleKeepsMainByteCountAndSettlesBothSegments(t *testing.T) {
+	_, store := openMigratedStore(t)
+	reservation := reservationForTest(t, store)
+	if _, err := store.CreateReservation(context.Background(), reservation); err != nil {
+		t.Fatal(err)
+	}
+	oneSegPlan := recording.FilePlan{PartialPath: "2026/08/main.oneseg.ts.partial", FinalPath: "2026/08/main.oneseg.ts"}
+	request := recording.ClaimRequest{
+		ReservationID: reservation.ID, AttemptID: testID(t, 212), SegmentID: testID(t, 213),
+		OneSegSegmentID: testID(t, 214), OwnerID: testID(t, 215), OwnerGeneration: 1,
+		Now:        reservation.CreatedAt.Add(time.Minute),
+		Plan:       recording.FilePlan{PartialPath: "2026/08/main.ts.partial", FinalPath: "2026/08/main.ts"},
+		OneSegPlan: &oneSegPlan,
+	}
+	if _, err := store.ClaimRecording(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	now := request.Now
+	if err := store.StartAttempt(context.Background(), request.AttemptID, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecordingStarted(context.Background(), request.AttemptID, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.OneSegRecordingStarted(context.Background(), request.AttemptID, now.Add(3*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpdateRecordingProgress(context.Background(), request.AttemptID, 376, now.Add(4*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpdateOneSegProgress(context.Background(), request.AttemptID, 188, now.Add(5*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginFinalization(context.Background(), recording.FinalizeRequest{
+		AttemptID: request.AttemptID, Token: testID(t, 216), ByteCount: 376,
+		State: recording.AttemptSucceeded, Reason: recording.ReasonCompleted, Now: now.Add(6 * time.Second),
+		OneSeg: &recording.OneSegResult{ByteCount: 188, Availability: recording.AvailabilityPartial,
+			Reason: recording.ReasonCompleted, FileSynced: true, Publish: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkFinalPublished(context.Background(), request.AttemptID, now.Add(7*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkDirectorySynced(context.Background(), request.AttemptID, now.Add(8*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkOneSegFinalPublished(context.Background(), request.AttemptID, now.Add(9*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkOneSegDirectorySynced(context.Background(), request.AttemptID, now.Add(10*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishAttempt(context.Background(), recording.FinishRequest{
+		AttemptID: request.AttemptID, State: recording.AttemptSucceeded, Reason: recording.ReasonCompleted,
+		ByteCount: 376, Availability: recording.AvailabilityFinal, Now: now.Add(11 * time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var attemptBytes int64
+	if err := store.reader.QueryRow(`SELECT byte_count FROM recording_attempts WHERE id=?`, request.AttemptID.Bytes()).Scan(&attemptBytes); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := store.reader.Query(`SELECT ordinal, state, byte_count, availability FROM recording_segments
+		WHERE attempt_id=? ORDER BY ordinal`, request.AttemptID.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	wantBytes := []int64{376, 188}
+	index := 0
+	for rows.Next() {
+		var ordinal int
+		var state recording.SegmentState
+		var bytes int64
+		var availability recording.Availability
+		if err := rows.Scan(&ordinal, &state, &bytes, &availability); err != nil {
+			t.Fatal(err)
+		}
+		if ordinal != index || state != recording.SegmentFinalized || bytes != wantBytes[index] ||
+			availability != recording.AvailabilityFinal {
+			t.Fatalf("ordinal=%d state=%s bytes=%d availability=%s", ordinal, state, bytes, availability)
+		}
+		index++
+	}
+	if err := rows.Err(); err != nil || index != 2 || attemptBytes != 376 {
+		t.Fatalf("segments=%d attempt_bytes=%d err=%v", index, attemptBytes, err)
+	}
+}
+
+func TestOneSegClaimSecondInsertFailureRollsBackAttempt(t *testing.T) {
+	_, store := openMigratedStore(t)
+	reservation := reservationForTest(t, store)
+	if _, err := store.CreateReservation(context.Background(), reservation); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.writer.Exec(`CREATE TRIGGER fail_one_seg_segment BEFORE INSERT ON recording_segments
+		WHEN NEW.ordinal=1 BEGIN SELECT RAISE(ABORT, 'test failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	oneSegPlan := recording.FilePlan{PartialPath: "2026/08/aux.ts.partial", FinalPath: "2026/08/aux.ts"}
+	request := recording.ClaimRequest{
+		ReservationID: reservation.ID, AttemptID: testID(t, 204), SegmentID: testID(t, 205),
+		OneSegSegmentID: testID(t, 206), OwnerID: testID(t, 207), OwnerGeneration: 1,
+		Now:        reservation.CreatedAt.Add(time.Minute),
+		Plan:       recording.FilePlan{PartialPath: "2026/08/main.ts.partial", FinalPath: "2026/08/main.ts"},
+		OneSegPlan: &oneSegPlan,
+	}
+	if _, err := store.ClaimRecording(context.Background(), request); err == nil {
+		t.Fatal("ワンセグsegment失敗後にclaimを確定しました")
+	}
+	var attempts, segments int
+	if err := store.reader.QueryRow(`SELECT count(*) FROM recording_attempts WHERE id=?`, request.AttemptID.Bytes()).Scan(&attempts); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.reader.QueryRow(`SELECT count(*) FROM recording_segments WHERE attempt_id=?`, request.AttemptID.Bytes()).Scan(&segments); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 0 || segments != 0 {
+		t.Fatalf("attempts=%d segments=%d", attempts, segments)
+	}
+}
+
+func TestSchemaRejectsRecordingSegmentOrdinalTwo(t *testing.T) {
+	_, store := openMigratedStore(t)
+	reservation := reservationForTest(t, store)
+	if _, err := store.CreateReservation(context.Background(), reservation); err != nil {
+		t.Fatal(err)
+	}
+	request := recording.ClaimRequest{
+		ReservationID: reservation.ID, AttemptID: testID(t, 208), SegmentID: testID(t, 209),
+		OwnerID: testID(t, 210), OwnerGeneration: 1, Now: reservation.CreatedAt.Add(time.Minute),
+		Plan: recording.FilePlan{PartialPath: "2026/08/main.ts.partial", FinalPath: "2026/08/main.ts"},
+	}
+	if _, err := store.ClaimRecording(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.writer.Exec(`INSERT INTO recording_segments(
+		id, attempt_id, ordinal, state, relative_partial_path, relative_final_path,
+		availability, created_at_utc_ms, updated_at_utc_ms)
+		VALUES (?, ?, 2, 'PLANNED', 'bad.partial', 'bad.ts', 'PLANNED', 1, 1)`,
+		testID(t, 211).Bytes(), request.AttemptID.Bytes()); err == nil {
+		t.Fatal("ordinal 2を保存しました")
+	}
+}
+
 func TestRecordingAttemptCanFinishWithoutOpeningStream(t *testing.T) {
 	_, store := openMigratedStore(t)
 	reservation := reservationForTest(t, store)
@@ -1241,5 +1520,15 @@ func reservationForTest(t *testing.T, store *Store) recording.Reservation {
 			TransportStreamID: uint16(transportID), ServiceID: uint16(serviceID), EventID: uint16(eventID),
 			Title: title, StationName: "テスト局", Start: start, Duration: 30 * time.Minute,
 		},
+	}
+}
+
+func reservationRequestForTest(reservation recording.Reservation) recording.ReservationRequest {
+	return recording.ReservationRequest{
+		NetworkID: reservation.Program.NetworkID, TransportStreamID: reservation.Program.TransportStreamID,
+		ServiceID: reservation.Program.ServiceID, EventID: reservation.Program.EventID,
+		Start: reservation.Program.Start, Duration: reservation.Program.Duration, Priority: reservation.Priority,
+		RequestedFollow: reservation.RequestedFollow, Disabled: reservation.Disabled, Margins: reservation.Margins,
+		Output: reservation.Output, Components: reservation.Components, PostRecording: reservation.PostRecording,
 	}
 }

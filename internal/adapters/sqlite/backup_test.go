@@ -31,7 +31,7 @@ func TestIncrementalBackupPublishAndVerify(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manifest.Format != backupManifestFormat || manifest.SchemaVersion != 12 || manifest.DatabaseBytes < 1 ||
+	if manifest.Format != backupManifestFormat || manifest.SchemaVersion != 13 || manifest.DatabaseBytes < 1 ||
 		manifest.DatabaseSHA256 == "" || manifest.PageCount < 1 || manifest.JournalMode != "wal" ||
 		manifest.Synchronous != "full" || !manifest.ForeignKeys || manifest.CGOEnabled {
 		t.Fatalf("manifest=%+v", manifest)

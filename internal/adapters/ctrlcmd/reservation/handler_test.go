@@ -167,6 +167,91 @@ func TestAddRejectsForcedTunerWithoutPartialAcceptance(t *testing.T) {
 	}
 }
 
+func TestAddAndChangeAcceptOneSegOutput(t *testing.T) {
+	for _, command := range []int32{CommandAdd, CommandChange} {
+		t.Run(fmt.Sprintf("command-%d", command), func(t *testing.T) {
+			operations := &fakeOperations{}
+			reserveID := int32(1)
+			if command == CommandAdd {
+				reserveID = 0
+			}
+			request := reservationRequestSettingsWithOneSeg(t, command, Version, reserveID, 1,
+				[]oneSegWireFolder{{path: "mobile", writer: "Write_Default.dll", name: "RecName_Macro.dll?$Title$.ts"}})
+			var response bytes.Buffer
+			if err := (Handler{Operations: operations, Limits: codec.DefaultLimits()}).Handle(
+				context.Background(), request, &response,
+			); err != nil {
+				t.Fatal(err)
+			}
+			frame, err := codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
+			if err != nil || frame.Code != ResultSuccess {
+				t.Fatalf("frame=%+v err=%v", frame, err)
+			}
+			var got *recording.OutputSettings
+			if command == CommandAdd && len(operations.added) == 1 {
+				got = operations.added[0].OneSegOutput
+			}
+			if command == CommandChange && len(operations.changed) == 1 {
+				got = operations.changed[0].Request.OneSegOutput
+			}
+			want := recording.OutputSettings{Folder: "mobile", Template: "$Title$.ts"}
+			if got == nil || *got != want {
+				t.Fatalf("one_seg=%+v", got)
+			}
+		})
+	}
+}
+
+func TestDecodeOneSegSettingsProfile(t *testing.T) {
+	tests := []struct {
+		name     string
+		flag     uint8
+		folders  []oneSegWireFolder
+		want     *recording.OutputSettings
+		wantFail bool
+	}{
+		{name: "disabled", flag: 0},
+		{name: "inherit", flag: 1, want: &recording.OutputSettings{}},
+		{name: "empty row normalizes", flag: 1, folders: []oneSegWireFolder{{}}, want: &recording.OutputSettings{}},
+		{name: "dedicated", flag: 1, folders: []oneSegWireFolder{{
+			path: "mobile", writer: "Write_Default.dll", name: "RecName_Macro.dll?$Title$.ts",
+		}}, want: &recording.OutputSettings{Folder: "mobile", Template: "$Title$.ts"}},
+		{name: "mode two", flag: 2, wantFail: true},
+		{name: "mode 255", flag: 255, wantFail: true},
+		{name: "disabled with folder", folders: []oneSegWireFolder{{path: "mobile"}}, wantFail: true},
+		{name: "two folders", flag: 1, folders: []oneSegWireFolder{{path: "a"}, {path: "b"}}, wantFail: true},
+		{name: "wrong writer", flag: 1, folders: []oneSegWireFolder{{writer: "Other.dll"}}, wantFail: true},
+		{name: "writer case", flag: 1, folders: []oneSegWireFolder{{writer: "write_default.dll"}}, wantFail: true},
+		{name: "wrong name", flag: 1, folders: []oneSegWireFolder{{name: "Other.dll"}}, wantFail: true},
+		{name: "empty template argument", flag: 1, folders: []oneSegWireFolder{{name: "RecName_Macro.dll?"}}, wantFail: true},
+		{name: "reserved", flag: 1, folders: []oneSegWireFolder{{reserved: "x"}}, wantFail: true},
+		{name: "absolute", flag: 1, folders: []oneSegWireFolder{{path: "/outside"}}, wantFail: true},
+		{name: "parent", flag: 1, folders: []oneSegWireFolder{{path: "../outside"}}, wantFail: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var body bytes.Buffer
+			writer, _ := codec.NewWriter(&body, codec.DefaultLimits())
+			writeInputSettingsWireFull(t, writer, 1, 3, true, 0, 0, 0, 0,
+				recording.OutputSettings{}, "", 0, false, 0, test.flag, test.folders)
+			reader, err := codec.NewReader(body.Bytes(), codec.DefaultLimits())
+			if err != nil {
+				t.Fatal(err)
+			}
+			settings, decodeErr := decodeSettings(reader)
+			if test.wantFail {
+				if decodeErr == nil {
+					t.Fatalf("settings=%+v", settings)
+				}
+				return
+			}
+			if decodeErr != nil || reader.Exact() != nil || !sameOutputPointer(settings.oneSegOutput, test.want) {
+				t.Fatalf("settings=%+v err=%v", settings, decodeErr)
+			}
+		})
+	}
+}
+
 func TestAddAcceptsDisabledAndMarginBoundariesAtomically(t *testing.T) {
 	operations := &fakeOperations{}
 	handler := Handler{Operations: operations, Limits: codec.DefaultLimits()}
@@ -937,6 +1022,22 @@ func reservationRequestSettingsWithTuner(t *testing.T, command int32, version ui
 	serviceMode uint32, output recording.OutputSettings, post recording.PostRecordingSettings, fileNames []string,
 	tunerID uint32,
 ) []byte {
+	return reservationRequestSettingsFull(t, command, version, reserveID, recordingMode, priority, follow,
+		useMargins, startMargin, endMargin, count, serviceMode, output, post, fileNames, tunerID, 0, nil)
+}
+
+func reservationRequestSettingsWithOneSeg(t *testing.T, command int32, version uint16, reserveID int32,
+	partial uint8, folders []oneSegWireFolder,
+) []byte {
+	return reservationRequestSettingsFull(t, command, version, reserveID, 1, 3, true,
+		0, 0, 0, 1, 0, recording.OutputSettings{}, recording.PostRecordingSettings{}, nil, 0, partial, folders)
+}
+
+func reservationRequestSettingsFull(t *testing.T, command int32, version uint16, reserveID int32,
+	recordingMode, priority uint8, follow bool, useMargins uint8, startMargin, endMargin int32, count int,
+	serviceMode uint32, output recording.OutputSettings, post recording.PostRecordingSettings, fileNames []string,
+	tunerID uint32, partial uint8, partialFolders []oneSegWireFolder,
+) []byte {
 	t.Helper()
 	var itemBody bytes.Buffer
 	item, err := codec.NewWriter(&itemBody, codec.DefaultLimits())
@@ -979,8 +1080,12 @@ func reservationRequestSettingsWithTuner(t *testing.T, command int32, version ui
 	if err := item.SystemTime(start); err != nil {
 		t.Fatal(err)
 	}
-	writeInputSettingsWithPostRecordingAndTuner(t, item, recordingMode, priority, follow, useMargins, startMargin,
-		endMargin, serviceMode, output, post, tunerID)
+	suspend, reboot, ok := encodePostRecordingMode(post.Mode)
+	if !ok {
+		t.Fatalf("invalid post recording mode: %d", post.Mode)
+	}
+	writeInputSettingsWireFull(t, item, recordingMode, priority, follow, useMargins, startMargin, endMargin,
+		serviceMode, output, post.Script, suspend, reboot, tunerID, partial, partialFolders)
 	if err := item.I32(0); err != nil {
 		t.Fatal(err)
 	}
@@ -1056,6 +1161,18 @@ func writeInputSettingsWireWithTuner(t *testing.T, writer *codec.Writer, mode, p
 	useMargins uint8, startMargin, endMargin int32, serviceMode uint32, output recording.OutputSettings,
 	batch string, suspend uint8, reboot bool, tunerID uint32,
 ) {
+	writeInputSettingsWireFull(t, writer, mode, priority, follow, useMargins, startMargin, endMargin, serviceMode,
+		output, batch, suspend, reboot, tunerID, 0, nil)
+}
+
+type oneSegWireFolder struct {
+	path, writer, name, reserved string
+}
+
+func writeInputSettingsWireFull(t *testing.T, writer *codec.Writer, mode, priority uint8, follow bool,
+	useMargins uint8, startMargin, endMargin int32, serviceMode uint32, output recording.OutputSettings,
+	batch string, suspend uint8, reboot bool, tunerID uint32, partial uint8, partialFolders []oneSegWireFolder,
+) {
 	t.Helper()
 	var folder bytes.Buffer
 	if output != (recording.OutputSettings{}) {
@@ -1101,9 +1218,22 @@ func writeInputSettingsWireWithTuner(t *testing.T, writer *codec.Writer, mode, p
 	_ = settingsWriter.I32(startMargin)
 	_ = settingsWriter.I32(endMargin)
 	_ = settingsWriter.U8(0)
-	_ = settingsWriter.U8(0)
+	_ = settingsWriter.U8(partial)
 	_ = settingsWriter.U32(tunerID)
-	writeTestVector(t, settingsWriter, nil, 0)
+	var partialBody bytes.Buffer
+	for _, value := range partialFolders {
+		var fields bytes.Buffer
+		fieldWriter, _ := codec.NewWriter(&fields, codec.DefaultLimits())
+		for _, field := range []string{value.path, value.writer, value.name, value.reserved} {
+			if err := fieldWriter.String(field); err != nil {
+				t.Fatal(err)
+			}
+		}
+		folderWriter, _ := codec.NewWriter(&partialBody, codec.DefaultLimits())
+		_ = folderWriter.I32(int32(4 + fields.Len()))
+		_ = folderWriter.Bytes(fields.Bytes())
+	}
+	writeTestVector(t, settingsWriter, partialBody.Bytes(), len(partialFolders))
 	if err := writer.I32(int32(4 + body.Len())); err != nil {
 		t.Fatal(err)
 	}
@@ -1214,7 +1344,7 @@ func readListedReservation(reader *codec.Reader, want recording.Reservation) err
 		settings, err := decodeSettings(item)
 		if err != nil || settings.priority != want.Priority || settings.follow != want.EffectiveFollow ||
 			settings.disabled != want.Disabled || !sameMargins(settings.margins, want.Margins) || settings.output != want.Output ||
-			settings.postRecording != want.PostRecording {
+			settings.postRecording != want.PostRecording || !sameOneSegSettings(settings.oneSegOutput, want.OneSegOutput) {
 			return fmt.Errorf("settings=%+v err=%v", settings, err)
 		}
 		if settings.components != want.Components {
@@ -1245,6 +1375,14 @@ func readListedReservation(reader *codec.Reader, want recording.Reservation) err
 
 func sameMargins(left, right *recording.RecordingMargins) bool {
 	return left == nil && right == nil || left != nil && right != nil && *left == *right
+}
+
+func sameOutputPointer(left, right *recording.OutputSettings) bool {
+	return left == nil && right == nil || left != nil && right != nil && *left == *right
+}
+
+func sameOneSegSettings(left *recording.OutputSettings, right *recording.OneSegOutput) bool {
+	return left == nil && right == nil || left != nil && right != nil && *left == right.Output
 }
 
 func listedReservation(number int32) recording.Reservation {

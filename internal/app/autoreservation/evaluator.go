@@ -19,6 +19,7 @@ type Catalog interface {
 	CurrentProgramsByService(context.Context, int, catalogmodel.ProgramCursor) ([]catalogmodel.CurrentProgram, error)
 	ReservationRequestForProgram(catalogmodel.CurrentProgram, uint8, bool) (recording.ReservationRequest, error)
 	FindProgram(context.Context, recording.ReservationRequest) (recording.ProgramSnapshot, error)
+	ResolveOneSeg(context.Context, recording.ProgramSnapshot) (string, error)
 }
 
 // EvaluationStoreは規則読出しと規則に結び付く予約のtransaction保存を提供する。
@@ -39,6 +40,8 @@ type Result struct {
 	RecordedTitleMatches         int
 	UnavailableRules             int
 	ForcedTunerUnavailableRules  int
+	OneSegUnavailableRules       int
+	OneSegUnresolvedPrograms     int
 	LimitReached                 bool
 }
 
@@ -54,12 +57,14 @@ type Evaluator struct {
 }
 
 type preparedRule struct {
-	rule        autoreservation.Rule
-	matcher     autoreservation.ProgramMatcher
-	skip        bool
-	unavailable bool
-	forcedTuner bool
-	post        recording.PostRecordingSettings
+	rule              autoreservation.Rule
+	matcher           autoreservation.ProgramMatcher
+	skip              bool
+	unavailable       bool
+	forcedTuner       bool
+	oneSeg            *recording.OutputSettings
+	oneSegUnavailable bool
+	post              recording.PostRecordingSettings
 }
 
 // Runは規則と対象番組を固定してから評価し、一件ずつtransactionで予約する。
@@ -88,6 +93,9 @@ func (evaluator Evaluator) Run(ctx context.Context) (Result, error) {
 			result.UnavailableRules++
 			if prepared[index].forcedTuner {
 				result.ForcedTunerUnavailableRules++
+			}
+			if prepared[index].oneSegUnavailable {
+				result.OneSegUnavailableRules++
 			}
 		}
 	}
@@ -124,6 +132,7 @@ func (evaluator Evaluator) Run(ctx context.Context) (Result, error) {
 			}
 			request.Disabled = settings.Mode == 5
 			request.Output = output
+			request.OneSegOutput = candidate.oneSeg
 			request.PostRecording = candidate.post
 			request.Components, supported = automaticComponentMode(settings.ServiceMode)
 			if !supported {
@@ -148,8 +157,14 @@ func (evaluator Evaluator) Run(ctx context.Context) (Result, error) {
 				result.LimitReached = true
 				return nil
 			}
-			snapshot, err := evaluator.Catalog.FindProgram(ctx, request)
+			snapshot, oneSeg, oneSegUnresolved, err := evaluator.resolveProgram(ctx, request)
 			if err != nil {
+				if ctx.Err() != nil {
+					return errors.New("autoreservation: context ended")
+				}
+				if oneSegUnresolved {
+					result.OneSegUnresolvedPrograms++
+				}
 				continue
 			}
 			id, err := evaluator.NewID()
@@ -160,6 +175,7 @@ func (evaluator Evaluator) Run(ctx context.Context) (Result, error) {
 				ID: id, Version: 1, State: recording.ReservationActive, Program: snapshot,
 				Priority: request.Priority, RequestedFollow: request.RequestedFollow,
 				Disabled: request.Disabled, Margins: request.Margins, Output: request.Output, Components: request.Components,
+				OneSegOutput:  oneSeg,
 				PostRecording: request.PostRecording,
 				CreatedAt:     now, UpdatedAt: now,
 			})
@@ -190,6 +206,24 @@ func (evaluator Evaluator) Run(ctx context.Context) (Result, error) {
 		return nil
 	})
 	return result, err
+}
+
+func (evaluator Evaluator) resolveProgram(ctx context.Context, request recording.ReservationRequest) (
+	recording.ProgramSnapshot, *recording.OneSegOutput, bool, error,
+) {
+	snapshot, err := evaluator.Catalog.FindProgram(ctx, request)
+	if err != nil || request.OneSegOutput == nil {
+		return snapshot, nil, false, err
+	}
+	locator, err := evaluator.Catalog.ResolveOneSeg(ctx, snapshot)
+	if err != nil {
+		return recording.ProgramSnapshot{}, nil, true, err
+	}
+	oneSeg, err := recording.ResolveOneSegOutput(request, locator)
+	if err != nil {
+		return recording.ProgramSnapshot{}, nil, true, err
+	}
+	return snapshot, oneSeg, false, nil
 }
 
 func readRules(ctx context.Context, store EvaluationStore) ([]autoreservation.Rule, error) {
@@ -281,11 +315,17 @@ func prepareRule(rule autoreservation.Rule, validateScript func(string) error) p
 		prepared.forcedTuner = true
 		return prepared
 	}
-	if (settings.Mode != 1 && settings.Mode != 5) || settings.Exact ||
-		settings.Continue || settings.PartialMode != 0 || len(settings.PartialFolders) != 0 {
+	if (settings.Mode != 1 && settings.Mode != 5) || settings.Exact || settings.Continue {
 		prepared.unavailable = true
 		return prepared
 	}
+	oneSeg, supported := automaticOneSegOutputSettings(settings)
+	if !supported {
+		prepared.unavailable = true
+		prepared.oneSegUnavailable = true
+		return prepared
+	}
+	prepared.oneSeg = oneSeg
 	postMode, ok := automaticPostRecordingMode(settings.Suspend, settings.Reboot)
 	if !ok {
 		prepared.unavailable = true
@@ -373,6 +413,41 @@ func automaticOutputSettings(settings autoreservation.RecordingSettings) (record
 	}
 	output := recording.OutputSettings{Folder: folder.Path, Template: template}
 	return output, output.Validate() == nil
+}
+
+// automaticOneSegOutputSettingsは保存済みのワンセグ設定を、単発予約と同じ実行可能範囲へ変換する。
+func automaticOneSegOutputSettings(settings autoreservation.RecordingSettings) (*recording.OutputSettings, bool) {
+	switch settings.PartialMode {
+	case 0:
+		return nil, len(settings.PartialFolders) == 0
+	case 1:
+	default:
+		return nil, false
+	}
+	if len(settings.PartialFolders) == 0 {
+		return &recording.OutputSettings{}, true
+	}
+	if len(settings.PartialFolders) != 1 {
+		return nil, false
+	}
+	folder := settings.PartialFolders[0]
+	if folder.Writer != "" && folder.Writer != "Write_Default.dll" {
+		return nil, false
+	}
+	const plugin = "RecName_Macro.dll"
+	template := ""
+	switch {
+	case folder.Name == "" || folder.Name == plugin:
+	case strings.HasPrefix(folder.Name, plugin+"?") && len(folder.Name) > len(plugin)+1:
+		template = folder.Name[len(plugin)+1:]
+	default:
+		return nil, false
+	}
+	output := recording.OutputSettings{Folder: folder.Path, Template: template}
+	if output.Validate() != nil {
+		return nil, false
+	}
+	return &output, true
 }
 
 func matchService(services []autoreservation.ServiceRange, request recording.ReservationRequest) bool {

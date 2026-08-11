@@ -482,6 +482,53 @@ func TestSnapshotResolvesOneLiveService(t *testing.T) {
 	}
 }
 
+func TestSnapshotResolvesUniqueOneSegService(t *testing.T) {
+	main := channel.Service{ProviderLocator: "1003", NetworkID: 1, TransportStreamID: 2, ServiceID: 3,
+		Verified: true, Selected: true}
+	oneSeg := channel.Service{ProviderLocator: "1004", NetworkID: 1, TransportStreamID: 2, ServiceID: 4,
+		PartialReception: true, Verified: true, Selected: true}
+	program := recording.ProgramSnapshot{NetworkID: 1, TransportStreamID: 2, ServiceID: 3}
+	snapshot := &Snapshot{value: channel.Snapshot{Services: []channel.Service{main, oneSeg}}}
+	locator, err := snapshot.ResolveOneSeg(context.Background(), program)
+	if err != nil || locator != "1004" {
+		t.Fatalf("locator=%q err=%v", locator, err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		change func(*channel.Service)
+	}{
+		{name: "same sid", change: func(service *channel.Service) { service.ServiceID = 3 }},
+		{name: "other network", change: func(service *channel.Service) { service.NetworkID = 9 }},
+		{name: "other tsid", change: func(service *channel.Service) { service.TransportStreamID = 9 }},
+		{name: "not partial", change: func(service *channel.Service) { service.PartialReception = false }},
+		{name: "unverified", change: func(service *channel.Service) { service.Verified = false }},
+		{name: "unselected", change: func(service *channel.Service) { service.Selected = false }},
+		{name: "noncanonical", change: func(service *channel.Service) { service.ProviderLocator = "01004" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := oneSeg
+			test.change(&candidate)
+			invalid := &Snapshot{value: channel.Snapshot{Services: []channel.Service{main, candidate}}}
+			if _, err := invalid.ResolveOneSeg(context.Background(), program); err == nil {
+				t.Fatal("対象外serviceを解決しました")
+			}
+		})
+	}
+	duplicate := &Snapshot{value: channel.Snapshot{Services: []channel.Service{main, oneSeg, {
+		ProviderLocator: "1005", NetworkID: 1, TransportStreamID: 2, ServiceID: 5,
+		PartialReception: true, Verified: true, Selected: true,
+	}}}}
+	if _, err := duplicate.ResolveOneSeg(context.Background(), program); err == nil {
+		t.Fatal("複数候補を解決しました")
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := snapshot.ResolveOneSeg(canceled, program); err == nil {
+		t.Fatal("取消し後にserviceを解決しました")
+	}
+}
+
 func TestSnapshotResolvesOneLogoService(t *testing.T) {
 	service := channel.Service{ProviderLocator: "1003", ServiceName: "放送局", NetworkID: 1,
 		TransportStreamID: 2, ServiceID: 3, Verified: true, Selected: true}
