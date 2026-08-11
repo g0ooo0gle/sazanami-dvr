@@ -185,10 +185,10 @@ mkdir -m 700 <recording-root>
   --channel-map <channel-map> \
   --provider mirakurun \
   --base-url <mirakurun-url> \
-  --http-listen 127.0.0.1:40773
+  --http-listen 127.0.0.1:4521
 ```
 
-CtrlCmdは既定で`0.0.0.0:4510`に待ち受けます。認証なしでLANへ公開されるため、インターネットへ直接公開しないでください。同じPCだけで使う場合は`--listen 127.0.0.1:4510`を追加します。録画履歴HTTPは、上の例のとおり同じPCだけから接続できます。
+CtrlCmdは既定で`0.0.0.0:4520`に待ち受けます。認証なしでLANへ公開されるため、インターネットへ直接公開しないでください。同じPCだけで使う場合は`--listen 127.0.0.1:4520`を追加します。録画履歴HTTPは、上の例のとおり同じPCだけから接続できます。
 
 このプロセスは、起動直後と既定5分ごとにMirakurunの版、サービス、番組を確認します。更新が成功すると、保存済みの自動予約条件も評価します。録画用の放送ストリームは余白を反映した予定開始時刻に開きます。既定値は番組開始の5秒前です。ライブ用はクライアントが301を送った場合だけ開きます。更新間隔は`--catalog-refresh-interval`で5分から24時間の範囲に変更できます。停止には`SIGINT`または`SIGTERM`を使います。詳しくは[録画機能の運用手順](docs/recording-operations.md)を参照してください。
 
@@ -205,7 +205,7 @@ CtrlCmdは既定で`0.0.0.0:4510`に待ち受けます。認証なしでLANへ�
 sazanami-dvr ui serve --data-root <data-root>
 ```
 
-既定のURLは`http://127.0.0.1:40772/`です。WebUIは表示と手動バックアップだけを行います。詳しくは[運用WebUIの利用手順](docs/web-ui-operations.md)を参照してください。
+既定のURLは`http://127.0.0.1:4522/`です。WebUIは表示と手動バックアップだけを行います。詳しくは[運用WebUIの利用手順](docs/web-ui-operations.md)を参照してください。
 
 DBの状態確認、移行、バックアップ、復元には次のコマンドを使います。
 
@@ -239,7 +239,7 @@ sazanami-dvr db recover --data-root <data-root> --operation-id <uuid>
 | `ctrlcmd serve` | チャンネル確認用に待ち受ける |
 | `ui serve` | 運用WebUIを表示する |
 
-CtrlCmdは`recording serve`と`ctrlcmd serve`のどちらも、既定で`0.0.0.0:4510`に待ち受けます。認証とTLSはないため、信頼できる宅内LANだけで使い、ルーターのポート転送やインターネットへの直接公開は行わないでください。`--listen 127.0.0.1:4510`を指定すれば同じPCだけに絞れます。録画履歴HTTPとWebUIの既定値は`127.0.0.1`のままです。
+CtrlCmdは`recording serve`と`ctrlcmd serve`のどちらも、既定で`0.0.0.0:4520`に待ち受けます。認証とTLSはないため、信頼できる宅内LANだけで使い、ルーターのポート転送やインターネットへの直接公開は行わないでください。`--listen 127.0.0.1:4520`を指定すれば同じPCだけに絞れます。録画履歴HTTPは`127.0.0.1:4521`、WebUIは`127.0.0.1:4522`が既定です。各フラグでは、旧番号を含む別の有効なポートも明示できます。
 
 ## 開発
 

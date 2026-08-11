@@ -63,4 +63,4 @@ sazanami-dvr catalog sync \
 sazanami-dvr ui serve --data-root <data-root> --listen 127.0.0.1:40800
 ```
 
-WebUIは保存済みのカタログを表示するだけで、Mirakurunへの同期を始めません。Mirakurunが同じPCの40772番ポートを使っている場合は、上の例のように別のポートを指定してください。詳しくは[運用WebUIの利用手順](web-ui-operations.md)を参照してください。
+WebUIは保存済みのカタログを表示するだけで、Mirakurunへの同期を始めません。既定では4522番ポートを使うため、同じPCの40772番ポートで動くMirakurunとは重なりません。詳しくは[運用WebUIの利用手順](web-ui-operations.md)を参照してください。

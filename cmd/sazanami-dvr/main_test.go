@@ -20,8 +20,11 @@ import (
 	"time"
 
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/provider/fake"
+	recordinghttpadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/recordinghttp"
 	sqliteadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/sqlite"
+	webuiadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/webui"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/app/catalogsync"
+	ctrlcmdapp "github.com/g0ooo0gle/sazanami-dvr/internal/app/ctrlcmd"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/catalogmodel"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/provider"
 	providercatalog "github.com/g0ooo0gle/sazanami-dvr/internal/core/provider/catalog"
@@ -34,6 +37,39 @@ func TestVersion(t *testing.T) {
 	}
 	if got, want := output.String(), "sazanami-dvr 0.0.29\n"; got != want {
 		t.Fatalf("version=%q want=%q", got, want)
+	}
+}
+
+func TestDefaultListenerAddressesAndLegacyExplicitPorts(t *testing.T) {
+	if ctrlcmdapp.DefaultAddress != "0.0.0.0:4520" ||
+		recordinghttpadapter.DefaultAddress != "127.0.0.1:4521" ||
+		defaultWebUIAddress != "127.0.0.1:4522" {
+		t.Fatalf("defaults ctrlcmd=%q http=%q webui=%q", ctrlcmdapp.DefaultAddress, recordinghttpadapter.DefaultAddress, defaultWebUIAddress)
+	}
+	ctrlcmdConfig := ctrlcmdapp.DefaultConfig()
+	ctrlcmdConfig.Address = "127.0.0.1:4510"
+	if err := ctrlcmdConfig.Validate(); err != nil {
+		t.Fatalf("legacy CtrlCmd port rejected: %v", err)
+	}
+	if err := recordinghttpadapter.ValidateListenAddress("127.0.0.1:40773", false); err != nil {
+		t.Fatalf("legacy recording HTTP port rejected: %v", err)
+	}
+	if err := webuiadapter.ValidateListenAddress("127.0.0.1:40772", false); err != nil {
+		t.Fatalf("legacy WebUI port rejected: %v", err)
+	}
+	for _, test := range []struct {
+		arguments []string
+		current   string
+		legacy    string
+	}{
+		{[]string{"ui"}, defaultWebUIAddress, "127.0.0.1:40772"},
+		{[]string{"recording"}, recordinghttpadapter.DefaultAddress, "127.0.0.1:40773"},
+	} {
+		var output, diagnostic bytes.Buffer
+		if code := run(test.arguments, &output, &diagnostic); code != 2 ||
+			!strings.Contains(diagnostic.String(), test.current) || strings.Contains(diagnostic.String(), test.legacy) {
+			t.Fatalf("arguments=%v code=%d usage=%q", test.arguments, code, diagnostic.String())
+		}
 	}
 }
 
@@ -349,7 +385,7 @@ func TestCtrlCmdLANNoticeDoesNotExposeAddress(t *testing.T) {
 	var output bytes.Buffer
 	writeCtrlCmdLANNotice(&output, "10.254.254.39:4510")
 	text := output.String()
-	if strings.Count(text, "認証なし") != 1 || strings.Contains(text, "10.254.254.39") {
+	if strings.Count(text, "認証なし") != 1 || !strings.Contains(text, "127.0.0.1:4520") || strings.Contains(text, "10.254.254.39") {
 		t.Fatalf("notice=%q", text)
 	}
 	output.Reset()

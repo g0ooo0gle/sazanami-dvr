@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	DefaultAddress       = "0.0.0.0:4510"
+	DefaultAddress       = "0.0.0.0:4520"
 	DefaultConnections   = 32
 	DefaultHandlers      = 16
 	DefaultHeaderTimeout = 2 * time.Second

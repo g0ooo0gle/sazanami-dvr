@@ -9,7 +9,7 @@ Android TV実機またはAndroid TV専用システムイメージでは、まだ
 ## 先にSazanami DVRを起動する
 
 Komorebiを別の端末で使う場合、Sazanami DVRのCtrlCmdはLANから接続できる必要があります。
-`recording serve`は既定で`0.0.0.0:4510`に待ち受けるため、通常は追加設定が不要です。
+`recording serve`は既定で`0.0.0.0:4520`に待ち受けるため、通常は追加設定が不要です。
 認証はないので、信頼できる宅内LANだけで使い、インターネットへ直接公開しないでください。
 
 録画済みTSの再生と局ロゴも使う場合は、HTTPもLANで待ち受けます。
@@ -17,7 +17,7 @@ Komorebiを別の端末で使う場合、Sazanami DVRのCtrlCmdはLANから接�
 ```text
 sazanami-dvr recording serve \
   <ほかの引数> \
-  --http-listen 0.0.0.0:40773
+  --http-listen 0.0.0.0:4521
 ```
 
 ## Komorebiの接続先を設定する
@@ -27,8 +27,8 @@ Komorebiの設定画面で、次の順に設定します。
 1. 「接続設定」を開く
 2. 「利用するシステム」で`EDCB (EpgTimerSrv)`を選ぶ
 3. 「EDCB (IPアドレス)」にSazanami DVRを動かすPCのLANアドレスを入力する
-4. 「EDCB (TCPポート)」に`4510`を入力する
-5. 録画済みTSと局ロゴも使う場合は、「EDCB (HTTP/HTTPSポート)」に`40773`を入力する
+4. 「EDCB (TCPポート)」に`4520`を入力する
+5. 録画済みTSと局ロゴも使う場合は、「EDCB (HTTP/HTTPSポート)」に`4521`を入力する
 6. 「優先ソース」で`EDCB (ダイレクトストリーミング)`を選ぶ
 
 最後の設定が重要です。初期値の「メインシステムに従う（トランスコード）」では、Komorebiは
