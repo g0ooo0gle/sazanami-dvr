@@ -111,6 +111,14 @@ func observeAutomaticReservation(stdout, stderr io.Writer) func(autoreservationa
 			fmt.Fprintf(stdout, "automatic_reservation_unavailable reason=forced-tuner-not-supported-by-provider rules=%d\n",
 				result.ForcedTunerUnavailableRules)
 		}
+		if result.OneSegUnavailableRules > 0 {
+			fmt.Fprintf(stdout, "automatic_reservation_unavailable reason=one-seg-profile-unsupported rules=%d\n",
+				result.OneSegUnavailableRules)
+		}
+		if result.OneSegUnresolvedPrograms > 0 {
+			fmt.Fprintf(stdout, "automatic_reservation_unavailable reason=one-seg-service-unresolved programs=%d\n",
+				result.OneSegUnresolvedPrograms)
+		}
 	}
 }
 

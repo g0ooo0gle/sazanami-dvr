@@ -119,7 +119,8 @@ func TestFilePlanAndRecordingRequests(t *testing.T) {
 	}
 	now := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
 	claim := ClaimRequest{
-		ReservationID: idForTest(t, 5), AttemptID: idForTest(t, 6), SegmentID: idForTest(t, 7),
+		ReservationID: idForTest(t, 5), ReservationVersion: 1,
+		AttemptID: idForTest(t, 6), SegmentID: idForTest(t, 7),
 		OwnerID: idForTest(t, 8), OwnerGeneration: 1, Now: now, Plan: plan,
 	}
 	if err := claim.Validate(); err != nil {

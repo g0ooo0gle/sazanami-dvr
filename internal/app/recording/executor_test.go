@@ -432,6 +432,62 @@ func TestExecutorRecordsOneSegAfterMainStartsAndPublishesMainFirst(t *testing.T)
 	}
 }
 
+func TestExecutorPublishesSyncedOneSegStoppedAtNormalMainEnd(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	end := start.Add(time.Minute)
+	clock := &lockedClock{now: start}
+	events := &concurrentEvents{}
+	store := &attemptMemory{start: start, end: end, onOperation: events.add}
+	oneSegWritten := make(chan struct{})
+	mainLease := &coordinatedLease{read: func(_ context.Context, destination []byte) (int, providerstream.Terminal, error) {
+		<-oneSegWritten
+		copy(destination, bytesOf(0x47, 188))
+		clock.set(end)
+		return 188, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
+	}}
+	var oneSegReads atomic.Int32
+	oneSegLease := &coordinatedLease{read: func(ctx context.Context, destination []byte) (int, providerstream.Terminal, error) {
+		if oneSegReads.Add(1) == 1 {
+			copy(destination, bytesOf(0x47, 188))
+			close(oneSegWritten)
+			return 188, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
+		}
+		<-ctx.Done()
+		return 0, providerstream.Terminal{Done: true, Reason: providerstream.TerminalCancelled},
+			provider.NewFailure(provider.ReasonCancelled, "test")
+	}}
+	stream := &coordinatedProvider{events: events, main: mainLease, oneSeg: oneSegLease}
+	executor := oneSegExecutorForTest(t, store, stream, clock, events)
+	reservation := reservationForExecutor(t, start, time.Minute)
+	reservation.OneSegOutput = &core.OneSegOutput{ProviderServiceLocator: "1004"}
+	result, err := executor.Execute(context.Background(), reservation)
+	if err != nil || result.State != core.AttemptSucceeded || store.finalize.OneSeg == nil ||
+		!store.finalize.OneSeg.Publish || store.finalize.OneSeg.ByteCount != 188 ||
+		store.finalize.OneSeg.Reason != core.ReasonCompleted {
+		t.Fatalf("result=%+v oneSeg=%+v err=%v", result, store.finalize.OneSeg, err)
+	}
+}
+
+func TestOneSegCoordinatorPublishesUsefulAuxiliaryThatObservedUserStopFirst(t *testing.T) {
+	for _, reason := range []core.TerminalReason{core.ReasonUserRequestedStop, core.ReasonStreamCancelled} {
+		t.Run(string(reason), func(t *testing.T) {
+			done := make(chan core.OneSegResult, 1)
+			done <- core.OneSegResult{
+				ByteCount: minimumUsefulTS, Availability: core.AvailabilityPartial,
+				Reason: reason, FileSynced: true,
+			}
+			coordinator := &oneSegCoordinator{
+				done: done, started: true, cancel: func() {},
+			}
+			result := coordinator.join(core.ReasonUserRequestedStop, true)
+			if !result.Publish || result.ByteCount != minimumUsefulTS ||
+				result.Reason != core.ReasonUserRequestedStop || result.Availability != core.AvailabilityPartial {
+				t.Fatalf("result=%+v", result)
+			}
+		})
+	}
+}
+
 func TestExecutorKeepsMainSuccessWhenOneSegOpenFails(t *testing.T) {
 	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
 	end := start.Add(time.Minute)
@@ -506,6 +562,127 @@ func TestExecutorJoinsOneSegBeforeFailedMainBecomesTerminal(t *testing.T) {
 	if eventIndex(values, "one-seg-read-stopped") < 0 ||
 		eventIndex(values, "one-seg-read-stopped") >= eventIndex(values, "finished") {
 		t.Fatalf("補助処理の終了前にterminalへ進みました: %v", values)
+	}
+}
+
+func TestOneSegReconnectsIndependentlyAndUsesDistinctCorrelationIDs(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	end := start.Add(2 * time.Minute)
+	clock := &mutableClock{now: start}
+	store := &attemptMemory{start: start, end: end, progressEnd: end}
+	lease := &fakeLease{read: func(destination []byte) (int, providerstream.Terminal, error) {
+		copy(destination, bytesOf(0x47, 188))
+		clock.now = end
+		return 188, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
+	}}
+	stream := &fakeProvider{
+		errors: []error{provider.NewFailure(provider.ReasonTimeout, "test")},
+		leases: []providerstream.Lease{nil, lease},
+	}
+	operations := []string{}
+	plan := core.FilePlan{PartialPath: "2026/08/program.oneseg.ts.partial", FinalPath: "2026/08/program.oneseg.ts"}
+	attempt := core.Attempt{ID: appID(t, 65), PlannedStart: start, PlannedEnd: end, OneSegPlan: &plan}
+	reservation := reservationForExecutor(t, start, 2*time.Minute)
+	reservation.OneSegOutput = &core.OneSegOutput{ProviderServiceLocator: "1004"}
+	executor := Executor{
+		Store: store, Stream: stream, Clock: clock,
+		Files: FileOperations{CreatePartial: func(core.FilePlan) (PartialFile, error) {
+			return &fakePartial{operations: &operations}, nil
+		}},
+		WithDeadline: func(ctx context.Context, _ time.Time) (context.Context, context.CancelFunc) {
+			return context.WithCancel(ctx)
+		},
+		Wait: func(context.Context, time.Duration) error { return nil },
+	}
+	result := executor.runOneSeg(context.Background(), reservation, attempt, end, start.Add(core.MaxEffectiveDuration))
+	if !result.Publish || result.ByteCount != 188 || result.Reason != core.ReasonCompletedAfterReconnect ||
+		stream.opens != 2 || len(stream.requests) != 2 ||
+		stream.requests[0].CorrelationID != attempt.ID.String()+"-oneseg" ||
+		stream.requests[1].CorrelationID != attempt.ID.String()+"-oneseg-reconnect-1" ||
+		lease.cancel != 1 || lease.close != 1 {
+		t.Fatalf("result=%+v requests=%+v cancel=%d close=%d", result, stream.requests, lease.cancel, lease.close)
+	}
+}
+
+func TestOneSegFileFailuresStaySeparateFromMainResult(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		createErr  error
+		shortWrite bool
+		syncErr    error
+		closeErr   error
+		want       core.TerminalReason
+		missing    bool
+	}{
+		{name: "create", createErr: errors.New("test"), want: core.ReasonFileCreateFailed, missing: true},
+		{name: "write", shortWrite: true, want: core.ReasonFileWriteFailed},
+		{name: "sync", syncErr: errors.New("test"), want: core.ReasonFileSyncFailed},
+		{name: "close", closeErr: errors.New("test"), want: core.ReasonFileSyncFailed},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+			end := start.Add(time.Minute)
+			clock := &mutableClock{now: start}
+			store := &attemptMemory{start: start, end: end, progressEnd: end}
+			operations := []string{}
+			file := &fakePartial{operations: &operations, short: test.shortWrite, syncErr: test.syncErr, closeErr: test.closeErr}
+			lease := &fakeLease{read: func(destination []byte) (int, providerstream.Terminal, error) {
+				copy(destination, bytesOf(0x47, 188))
+				if !test.shortWrite {
+					clock.now = end
+				}
+				return 188, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
+			}}
+			stream := &fakeProvider{lease: lease}
+			plan := core.FilePlan{PartialPath: "2026/08/program.oneseg.ts.partial", FinalPath: "2026/08/program.oneseg.ts"}
+			attempt := core.Attempt{ID: appID(t, 66), PlannedStart: start, PlannedEnd: end, OneSegPlan: &plan}
+			reservation := reservationForExecutor(t, start, time.Minute)
+			reservation.OneSegOutput = &core.OneSegOutput{ProviderServiceLocator: "1004"}
+			executor := Executor{
+				Store: store, Stream: stream, Clock: clock,
+				Files: FileOperations{CreatePartial: func(core.FilePlan) (PartialFile, error) {
+					if test.createErr != nil {
+						return nil, test.createErr
+					}
+					return file, nil
+				}},
+				WithDeadline: func(ctx context.Context, _ time.Time) (context.Context, context.CancelFunc) {
+					return context.WithCancel(ctx)
+				},
+				Wait: func(context.Context, time.Duration) error { return nil },
+			}
+			result := executor.runOneSeg(context.Background(), reservation, attempt, end,
+				start.Add(core.MaxEffectiveDuration))
+			if result.Publish || result.Reason != test.want ||
+				(test.missing && result.Availability != core.AvailabilityMissing) {
+				t.Fatalf("result=%+v", result)
+			}
+		})
+	}
+}
+
+func TestOneSegPublicationFailureIsSavedWithoutFailingMain(t *testing.T) {
+	now := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	store := &attemptMemory{}
+	plan := core.FilePlan{PartialPath: "2026/08/program.oneseg.ts.partial", FinalPath: "2026/08/program.oneseg.ts"}
+	coordinator := &oneSegCoordinator{
+		executor: Executor{
+			Store: store, Clock: &mutableClock{now: now},
+			Files: FileOperations{LinkFinal: func(core.FilePlan) error { return errors.New("test") }},
+		},
+		attempt: core.Attempt{ID: appID(t, 67), OneSegPlan: &plan}, joined: true,
+		result: core.OneSegResult{
+			ByteCount: 188, Availability: core.AvailabilityPartial,
+			Reason: core.ReasonCompleted, FileSynced: true, Publish: true,
+		},
+	}
+	if err := coordinator.publish(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if store.finalize.OneSeg == nil || store.finalize.OneSeg.Publish ||
+		store.finalize.OneSeg.Reason != core.ReasonFinalPublicationFailed ||
+		store.finalize.OneSeg.Availability != core.AvailabilityPartial {
+		t.Fatalf("outcome=%+v", store.finalize.OneSeg)
 	}
 }
 

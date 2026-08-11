@@ -628,7 +628,8 @@ func (executor Executor) Claim(ctx context.Context, reservation recording.Reserv
 		return recording.Attempt{}, err
 	}
 	claim := recording.ClaimRequest{
-		ReservationID: reservation.ID, AttemptID: attemptID, SegmentID: segmentID, OwnerID: executor.OwnerID,
+		ReservationID: reservation.ID, ReservationVersion: reservation.Version,
+		AttemptID: attemptID, SegmentID: segmentID, OwnerID: executor.OwnerID,
 		OwnerGeneration: executor.Generation, Now: executor.now(), Plan: plan,
 	}
 	if reservation.OneSegOutput != nil {

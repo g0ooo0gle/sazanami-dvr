@@ -15,6 +15,15 @@ func (store *Store) RecoveryAttempts(ctx context.Context, limit int, after catal
 	if store == nil || store.reader == nil || ctx == nil || limit < 1 || limit > recording.MaxRecoveryPage {
 		return nil, errors.New("sqlite: invalid recovery query")
 	}
+	var crossPathConflict int
+	if err := store.reader.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1 FROM recording_segments p JOIN recording_segments f
+		ON p.relative_partial_path=f.relative_final_path)`).Scan(&crossPathConflict); err != nil {
+		return nil, sanitize("check-recording-recovery-paths", err)
+	}
+	if crossPathConflict != 0 {
+		return nil, errors.New("sqlite: recording recovery path conflict")
+	}
 	rows, err := store.reader.QueryContext(ctx, `SELECT a.id, a.reservation_id, a.state,
 		a.planned_start_utc_ms, a.planned_end_utc_ms, a.byte_count, a.finalization_token,
 		a.planned_final_state, a.planned_terminal_reason, a.recovered,
@@ -246,8 +255,13 @@ func validateRecoveryValues(item recording.RecoveryItem, startMS, endMS, byteCou
 		(finalPublished != 1 || directorySynced != 1) {
 		return errors.New("sqlite: successful recording lacks publication evidence")
 	}
-	if item.State == recording.AttemptFinalizing && item.Availability != recording.AvailabilityPartial {
-		return errors.New("sqlite: finalizing recording is not partial")
+	if item.State == recording.AttemptFinalizing {
+		partial := item.SegmentState == recording.SegmentPartial && item.Availability == recording.AvailabilityPartial
+		final := item.SegmentState == recording.SegmentFinalized && item.Availability == recording.AvailabilityFinal &&
+			fileSynced == 1 && finalPublished == 1 && directorySynced == 1 && item.IntegrityReason == ""
+		if !partial && !final {
+			return errors.New("sqlite: finalizing recording has invalid main segment")
+		}
 	}
 	if (item.State == recording.AttemptSucceeded || item.State == recording.AttemptPartial) && item.Availability != recording.AvailabilityFinal &&
 		item.Availability != recording.AvailabilityMissing && item.Availability != recording.AvailabilityMismatched {

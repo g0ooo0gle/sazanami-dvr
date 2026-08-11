@@ -639,6 +639,70 @@ func TestMigrateRejectsSchemasBeforeTwelveWithoutBackup(t *testing.T) {
 	}
 }
 
+func TestMigrateRejectsCorruptSchemaTwelveBeforeBackup(t *testing.T) {
+	for index, test := range []struct {
+		name       string
+		statements []string
+	}{
+		{name: "null ordinal", statements: []string{
+			`DROP TABLE recording_segments`, `CREATE TABLE recording_segments(ordinal)`,
+			`INSERT INTO recording_segments(ordinal) VALUES (NULL)`,
+		}},
+		{name: "text ordinal", statements: []string{
+			`DROP TABLE recording_segments`, `CREATE TABLE recording_segments(ordinal)`,
+			`INSERT INTO recording_segments(ordinal) VALUES ('0')`,
+		}},
+		{name: "ordinal one", statements: []string{
+			`DROP TABLE recording_segments`, `CREATE TABLE recording_segments(ordinal)`,
+			`INSERT INTO recording_segments(ordinal) VALUES (1)`,
+		}},
+		{name: "ordinal two", statements: []string{
+			`DROP TABLE recording_segments`, `CREATE TABLE recording_segments(ordinal)`,
+			`INSERT INTO recording_segments(ordinal) VALUES (2)`,
+		}},
+		{name: "column drift", statements: []string{
+			`ALTER TABLE recording_segments ADD COLUMN unexpected TEXT`,
+		}},
+		{name: "index drift", statements: []string{
+			`DROP INDEX recording_segments_attempt_idx`,
+		}},
+		{name: "trigger drift", statements: []string{
+			`DROP TRIGGER program_revisions_no_update`,
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.Chmod(root, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			createDatabaseThroughMigration(t, root, 12)
+			database, err := openWriter(context.Background(), root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, statement := range test.statements {
+				if _, err := database.Exec(statement); err != nil {
+					_ = database.Close()
+					t.Fatal(err)
+				}
+			}
+			if err := database.Close(); err != nil {
+				t.Fatal(err)
+			}
+			result, err := MigrateDatabaseWithBackup(context.Background(), root, MigrationRequest{
+				AppliedAt: time.UnixMilli(40).UTC(), BackupID: testID(t, byte(230+index)), ProductVersion: "test",
+				ProductCommit: strings.Repeat("c", 40), Now: func() time.Time { return time.UnixMilli(41).UTC() },
+			})
+			if err == nil || result.Backup != nil {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+			if _, statErr := os.Stat(filepath.Join(root, "backups")); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("backup directory err=%v", statErr)
+			}
+		})
+	}
+}
+
 func TestVersionOneMigrationFailureLeavesDatabaseBehind(t *testing.T) {
 	for _, test := range []struct {
 		name    string

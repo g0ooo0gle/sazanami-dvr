@@ -33,6 +33,7 @@ type oneSegAttemptStore struct {
 	coordinator *oneSegCoordinator
 }
 
+// RecordingStartedはメインの録画開始を保存した後だけ、ワンセグの補助処理を始める。
 func (store *oneSegAttemptStore) RecordingStarted(ctx context.Context, attemptID catalogmodel.ID,
 	now time.Time,
 ) (time.Time, error) {
@@ -43,12 +44,14 @@ func (store *oneSegAttemptStore) RecordingStarted(ctx context.Context, attemptID
 	return plannedEnd, err
 }
 
+// BeginFinalizationはワンセグの終了を待ち、二つの同期結果を一緒に保存する。
 func (store *oneSegAttemptStore) BeginFinalization(ctx context.Context, request core.FinalizeRequest) error {
 	oneSeg := store.coordinator.join(request.Reason, true)
 	request.OneSeg = &oneSeg
 	return store.AttemptStore.BeginFinalization(ctx, request)
 }
 
+// MarkDirectorySyncedはメインの完成を確定してから、公開可能なワンセグを処理する。
 func (store *oneSegAttemptStore) MarkDirectorySynced(ctx context.Context, attemptID catalogmodel.ID,
 	now time.Time,
 ) error {
@@ -58,6 +61,7 @@ func (store *oneSegAttemptStore) MarkDirectorySynced(ctx context.Context, attemp
 	return store.coordinator.publish(ctx)
 }
 
+// FinishAttemptは失敗したメインより先に補助処理を止め、ワンセグの部分状態も同時に確定する。
 func (store *oneSegAttemptStore) FinishAttempt(ctx context.Context, request core.FinishRequest) error {
 	successful := request.State == core.AttemptSucceeded ||
 		(request.State == core.AttemptPartial && request.Reason == core.ReasonUserRequestedStop)
@@ -117,12 +121,28 @@ func (coordinator *oneSegCoordinator) join(mainReason core.TerminalReason, allow
 	}
 	cancel := coordinator.cancel
 	coordinator.mu.Unlock()
-	cancel()
-	result := <-coordinator.done
-	if allowPublish && mainReason == core.ReasonUserRequestedStop && result.ByteCount >= minimumUsefulTS &&
-		result.FileSynced && result.Reason == core.ReasonStreamCancelled {
+	var result core.OneSegResult
+	stoppedAtMainEnd := false
+	select {
+	case result = <-coordinator.done:
+		cancel()
+	default:
+		stoppedAtMainEnd = true
+		cancel()
+		result = <-coordinator.done
+	}
+	usefulStoppedFile := result.ByteCount >= minimumUsefulTS && result.FileSynced
+	mainStoppedAuxiliary := stoppedAtMainEnd && result.Reason == core.ReasonStreamCancelled
+	userStoppedAuxiliary := mainReason == core.ReasonUserRequestedStop &&
+		(result.Reason == core.ReasonUserRequestedStop || result.Reason == core.ReasonStreamCancelled)
+	if allowPublish && usefulStoppedFile && (mainStoppedAuxiliary || userStoppedAuxiliary) &&
+		(mainReason == core.ReasonCompleted || mainReason == core.ReasonCompletedAfterReconnect ||
+			mainReason == core.ReasonUserRequestedStop) {
 		result.Publish = true
-		result.Reason = core.ReasonUserRequestedStop
+		result.Reason = core.ReasonCompleted
+		if mainReason == core.ReasonUserRequestedStop {
+			result.Reason = core.ReasonUserRequestedStop
+		}
 		result.Availability = core.AvailabilityPartial
 	}
 	if !allowPublish && result.Publish {

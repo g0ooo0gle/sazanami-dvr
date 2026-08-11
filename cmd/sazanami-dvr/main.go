@@ -212,7 +212,11 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	if err != nil {
 		return errorsStable("recording-snapshot-failed")
 	}
-	streamAdapter, err := mirakurunadapter.NewStreamWithLimit(*baseURL, effectiveMaximum)
+	recordingConnections, err := recordingStreamLimit(effectiveMaximum)
+	if err != nil {
+		return errorsStable("recording-stream-limit-invalid")
+	}
+	streamAdapter, err := mirakurunadapter.NewStreamWithLimit(*baseURL, recordingConnections)
 	if err != nil {
 		return errorsStable("provider-configuration-invalid")
 	}
