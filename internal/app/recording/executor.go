@@ -30,7 +30,7 @@ type AttemptStore interface {
 	OneSegRecordingStarted(context.Context, catalogmodel.ID, time.Time) error
 	UpdateRecordingProgress(context.Context, catalogmodel.ID, int64, time.Time) (time.Time, error)
 	UpdateOneSegProgress(context.Context, catalogmodel.ID, int64, time.Time) (time.Time, error)
-	BeginFinalization(context.Context, recording.FinalizeRequest) error
+	BeginFinalization(context.Context, recording.FinalizeRequest) (recording.FinalizeRequest, error)
 	MarkFinalPublished(context.Context, catalogmodel.ID, time.Time) error
 	MarkDirectorySynced(context.Context, catalogmodel.ID, time.Time) error
 	MarkOneSegFinalPublished(context.Context, catalogmodel.ID, time.Time) error
@@ -297,14 +297,22 @@ func (executor Executor) publishAndPostProcess(ctx context.Context, reservation 
 	if err != nil {
 		return result, err
 	}
+	if result.State != recording.AttemptSucceeded &&
+		(result.State != recording.AttemptPartial || result.Reason != recording.ReasonUserRequestedStop) {
+		return result, nil
+	}
 	if reservation.PostRecording.Script != "" {
 		postReason := "post-recording-script-invalid"
 		if executor.Files.FinalPath != nil && executor.PostRecording != nil {
 			finalPath, pathErr := executor.Files.FinalPath(attempt.Plan)
 			if pathErr == nil {
-				postReason = executor.PostRecording(ctx, PostRecordingRequest{
+				postContext := ctx
+				if result.State == recording.AttemptPartial {
+					postContext = context.WithoutCancel(ctx)
+				}
+				postReason = executor.PostRecording(postContext, PostRecordingRequest{
 					Script: reservation.PostRecording.Script, RecordingNumber: reservation.Number,
-					FinalPath: finalPath, State: state, Reason: reason,
+					FinalPath: finalPath, State: result.State, Reason: result.Reason,
 				})
 			}
 		}
@@ -324,11 +332,26 @@ func (executor Executor) publishFinal(ctx context.Context, attempt recording.Att
 	if err != nil {
 		return Result{}, errors.New("recording: finalization token generation failed")
 	}
-	if err := executor.Store.BeginFinalization(ctx, recording.FinalizeRequest{
+	if ctx.Err() != nil {
+		state = recording.AttemptPartial
+		reason = recording.ReasonUserRequestedStop
+	}
+	finalization, err := executor.Store.BeginFinalization(ctx, recording.FinalizeRequest{
 		AttemptID: attempt.ID, Token: token, ByteCount: byteCount, State: state, Reason: reason, Now: executor.now(),
-	}); err != nil {
+	})
+	if errors.Is(err, recording.ErrFinalizationUnavailable) && ctx.Err() != nil {
+		return executor.finishByCount(context.WithoutCancel(ctx), attempt.ID, byteCount,
+			recording.ReasonProcessShutdown, true)
+	}
+	if err != nil {
 		return Result{}, errors.New("recording: persist finalization start")
 	}
+	if finalization.Validate() != nil || finalization.AttemptID != attempt.ID || finalization.Token != token ||
+		finalization.ByteCount != byteCount {
+		return Result{}, errors.New("recording: invalid finalization result")
+	}
+	state, reason = finalization.State, finalization.Reason
+	ctx = context.WithoutCancel(ctx)
 	if err := executor.Files.LinkFinal(attempt.Plan); err != nil {
 		if errors.Is(err, recording.ErrFinalExists) {
 			return Result{State: recording.AttemptFinalizing, Reason: recording.ReasonFinalNameConflict}, err

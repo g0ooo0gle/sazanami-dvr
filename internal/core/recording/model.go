@@ -38,6 +38,8 @@ var (
 	ErrFinalExists = errors.New("recording: final file already exists")
 	// ErrReservationUnavailableは予約が存在しないか、終了または読出し後の変更により確保できないことを表す。
 	ErrReservationUnavailable = errors.New("recording: reservation is not available")
+	// ErrFinalizationUnavailableは録画の終了状態が先行処理によって変わり、要求どおりに確定できないことを表す。
+	ErrFinalizationUnavailable = errors.New("recording: finalization state changed")
 )
 
 // ReservationStateは一回限りの予約が実行前か終了済みかを表す。
