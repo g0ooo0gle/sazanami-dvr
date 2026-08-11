@@ -215,6 +215,13 @@ func (handler *Handler) liveSegment(writer http.ResponseWriter, request *http.Re
 	if !singleRange(writer, request) {
 		return
 	}
+	select {
+	case handler.streams <- struct{}{}:
+		defer func() { <-handler.streams }()
+	default:
+		writeError(writer, http.StatusServiceUnavailable, "stream-limit")
+		return
+	}
 	file, rejection := handler.hls.openSegment(segment)
 	if rejection != nil {
 		writeHLSRejection(writer, rejection)

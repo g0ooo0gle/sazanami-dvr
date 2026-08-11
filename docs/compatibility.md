@@ -76,7 +76,7 @@ Android TV向けKomorebiは、KonomiTV経由の接続とEDCB直接接続の両�
 | 完成録画の一覧 | CtrlCmd 2017 | Android上で確認済み | 公式APKで16件を取得。通常完了と利用者停止で確定した部分録画が対象。最大16,384件、DBは256件ずつ読む |
 | 完成録画の詳細 | CtrlCmd 2024 | Android上で確認済み | 一覧から選んだ一件の詳細取得に成功 |
 | 再生URLの取得 | HTTP resolver | Android上で確認済み | 絶対パスを含まない仮想URLから再生を開始 |
-| 元のTSの直接再生とシーク | HTTP GET／HEAD／Range | Android上で確認済み | 再生開始と30秒送りに成功。終了後の接続は0本。Range要求の自動テスト、同時8件、完成状態、権限、所有者、サイズの再確認も実施 |
+| 元のTSの直接再生とシーク | HTTP GET／HEAD／Range | Android上で確認済み | 再生開始と30秒送りに成功。終了後の接続は0本。Range要求の自動テスト、HLS分割TSと共有する同時8件の配信枠、完成状態、権限、所有者、サイズの再確認も実施 |
 | HTTP APIで元のTSを再生 | `/api/xcode` option 10 | 自動確認済み | EDCB直接接続で、録画再生方法として「HTTP API」を選ぶ場合。原画質一件だけを表示し、既存の完成条件とRange配信を使用。Android画面は未確認 |
 | 代替画像、空チャプター、最小タイル情報 | HTTP | 自動確認済み | 一覧を壊さないための最小応答。実サムネイルではない |
 | 局ロゴ | HTTP | 実通信確認済み | `/legacy/logo.lua`でKonomiTV経路と同じPNGを取得。Android TV画面は未確認 |
