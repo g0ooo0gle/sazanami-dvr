@@ -128,7 +128,7 @@ func validateValues(search SearchCondition, settings RecordingSettings) error {
 		}
 	}
 	if settings.Mode > 9 || settings.Priority < 1 || settings.Priority > 5 || settings.Suspend > 4 ||
-		settings.PartialMode > 1 || !validText(settings.Batch) || len(settings.Folders) > maxFolders ||
+		!validText(settings.Batch) || len(settings.Folders) > maxFolders ||
 		len(settings.PartialFolders) > maxFolders || (settings.StartMargin == nil) != (settings.EndMargin == nil) {
 		return errors.New("autoreservation: invalid recording settings")
 	}

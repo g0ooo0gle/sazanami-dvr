@@ -15,6 +15,11 @@ type Catalog interface {
 	FindProgram(context.Context, recording.ReservationRequest) (recording.ProgramSnapshot, error)
 }
 
+// OneSegResolverは一つの完成済みsnapshot内で番組と部分受信serviceをまとめて解決する。
+type OneSegResolver interface {
+	ResolveOneSegReservation(context.Context, recording.ReservationRequest) (recording.ProgramSnapshot, string, error)
+}
+
 // ReservationStoreは予約の確定保存と上限付き読出しを行う。
 type ReservationStore interface {
 	CreateReservation(context.Context, recording.Reservation) (recording.Reservation, error)
@@ -32,6 +37,7 @@ type Clock interface {
 // ReservationServiceは番組照合後に予約を一度だけ確定する。
 type ReservationService struct {
 	Catalog Catalog
+	OneSeg  OneSegResolver
 	Store   ReservationStore
 	Clock   Clock
 	NewID   func() (catalogmodel.ID, error)
@@ -49,7 +55,7 @@ func (service ReservationService) Add(ctx context.Context, request recording.Res
 		return recording.Reservation{}, errors.New("recording: invalid clock")
 	}
 	now = now.UTC()
-	program, err := service.Catalog.FindProgram(ctx, request)
+	program, oneSeg, err := service.resolveProgram(ctx, request)
 	planned := recording.Reservation{Program: program, Margins: request.Margins, Output: request.Output,
 		Components: request.Components, PostRecording: request.PostRecording}
 	if err != nil || !program.Start.Equal(request.Start) || program.Duration != request.Duration ||
@@ -64,6 +70,7 @@ func (service ReservationService) Add(ctx context.Context, request recording.Res
 		ID: id, Version: 1, State: recording.ReservationActive, Program: program,
 		Priority: request.Priority, RequestedFollow: request.RequestedFollow,
 		Disabled: request.Disabled, Margins: request.Margins, Output: request.Output, Components: request.Components,
+		OneSegOutput:  oneSeg,
 		PostRecording: request.PostRecording,
 		CreatedAt:     now, UpdatedAt: now,
 	})
@@ -94,6 +101,16 @@ func (service ReservationService) Change(ctx context.Context, change recording.R
 	if now.IsZero() || now.UnixMilli() < 0 {
 		return errors.New("recording: invalid clock")
 	}
+	if change.Request.OneSegOutput != nil {
+		if service.Catalog == nil {
+			return errors.New("recording: one-seg service unavailable")
+		}
+		program, oneSeg, err := service.resolveProgram(ctx, change.Request)
+		if err != nil || !program.Start.Equal(change.Request.Start) || program.Duration != change.Request.Duration {
+			return errors.New("recording: program not reservable")
+		}
+		change.ResolvedOneSegOutput = oneSeg
+	}
 	if err := service.Store.UpdateReservation(ctx, change, now); err != nil {
 		return err
 	}
@@ -101,6 +118,27 @@ func (service ReservationService) Change(ctx context.Context, change recording.R
 		service.OnAdded()
 	}
 	return nil
+}
+
+func (service ReservationService) resolveProgram(ctx context.Context, request recording.ReservationRequest) (
+	recording.ProgramSnapshot, *recording.OneSegOutput, error,
+) {
+	if request.OneSegOutput == nil {
+		program, err := service.Catalog.FindProgram(ctx, request)
+		return program, nil, err
+	}
+	if service.OneSeg == nil {
+		return recording.ProgramSnapshot{}, nil, errors.New("recording: one-seg service unavailable")
+	}
+	program, locator, err := service.OneSeg.ResolveOneSegReservation(ctx, request)
+	if err != nil {
+		return recording.ProgramSnapshot{}, nil, errors.New("recording: one-seg service unavailable")
+	}
+	resolved, err := recording.ResolveOneSegOutput(request, locator)
+	if err != nil {
+		return recording.ProgramSnapshot{}, nil, errors.New("recording: one-seg output unavailable")
+	}
+	return program, resolved, nil
 }
 
 // Deleteは録画開始前の予約を取り消すか、実行中の一件へ利用者停止を要求する。

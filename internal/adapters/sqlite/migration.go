@@ -285,6 +285,12 @@ func MigrateDatabaseWithBackup(ctx context.Context, dataRoot string, request Mig
 	}
 	allowBehind := false
 	if before.State == StateBehind {
+		if before.CurrentVersion+1 != before.TargetVersion {
+			return result, errors.New("sqlite: migration must start from the previous schema")
+		}
+		if err := validateMigrationSource(ctx, database, before); err != nil {
+			return result, err
+		}
 		from, to := before.CurrentVersion, before.TargetVersion
 		manifest, backupErr := createBackup(ctx, dataRoot, database, BackupRequest{
 			ID: request.BackupID, Purpose: "pre_migration", MigrationFromSchema: &from, MigrationToSchema: &to,
@@ -306,6 +312,21 @@ func MigrateDatabaseWithBackup(ctx context.Context, dataRoot string, request Mig
 		return result, errors.New("sqlite: migration pragma readback failed")
 	}
 	return result, nil
+}
+
+// validateMigrationSourceはbackupを作る前に、次版で扱えない既存値がないことを確認する。
+func validateMigrationSource(ctx context.Context, database *sql.DB, inspection Inspection) error {
+	if inspection.CurrentVersion != 12 || inspection.TargetVersion != 13 {
+		return nil
+	}
+	var unsupported int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM recording_segments WHERE ordinal<>0`).Scan(&unsupported); err != nil {
+		return errors.New("sqlite: inspect recording segments before migration")
+	}
+	if unsupported != 0 {
+		return errors.New("sqlite: unsupported recording segment before migration")
+	}
+	return nil
 }
 
 // migrateは空DBだけを、全pending migrationを1 transactionにまとめてCURRENTへ進める。

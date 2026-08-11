@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -112,6 +113,38 @@ func TestAutomaticRuleCommandsRoundTrip(t *testing.T) {
 	response = handleRequest(t, handler, deleteRequest(t, 1, limits))
 	if response.Code != resultSuccess || operations.deleted != 1 {
 		t.Fatalf("delete response=%+v deleted=%d", response, operations.deleted)
+	}
+}
+
+func TestAutomaticRuleKeepsUnsupportedPartialModes(t *testing.T) {
+	limits := codec.DefaultLimits()
+	for _, mode := range []uint8{2, 255} {
+		t.Run(fmt.Sprintf("mode-%d", mode), func(t *testing.T) {
+			rule := core.Rule{
+				Search: core.SearchCondition{Enabled: true},
+				Recording: core.RecordingSettings{Mode: 1, Priority: 3, PartialMode: mode,
+					PartialFolders: []core.Folder{{Path: "one", Writer: "Other.dll", Name: "OtherName.dll"}}},
+			}
+			operations := &fakeOperations{}
+			response := handleRequest(t, Handler{Operations: operations, Limits: limits},
+				requestForRule(t, CommandAdd, rule, limits))
+			if response.Code != resultSuccess || len(operations.rules) != 1 || operations.rules[0].Recording.PartialMode != mode {
+				t.Fatalf("response=%+v rules=%+v", response, operations.rules)
+			}
+			response = handleRequest(t, Handler{Operations: operations, Limits: limits}, versionRequest(t, CommandList, limits))
+			reader, err := codec.NewReader(response.Body, limits)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := reader.U16(); err != nil {
+				t.Fatal(err)
+			}
+			var listed core.Rule
+			if err := reader.Vector(1, 1, func(item *codec.Reader, _ int) error { return decodeAutoAdd(item, &listed) }); err != nil ||
+				reader.Exact() != nil || listed.Recording.PartialMode != mode || len(listed.Recording.PartialFolders) != 1 {
+				t.Fatalf("listed=%+v err=%v", listed, err)
+			}
+		})
 	}
 }
 

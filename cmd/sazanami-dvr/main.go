@@ -270,7 +270,7 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 		return errorsStable("post-recording-power-controller-invalid")
 	}
 	reservations := recordingapp.ReservationService{
-		Catalog: snapshots, Store: store, Clock: recordingClock, NewID: catalogmodel.NewID,
+		Catalog: snapshots, OneSeg: snapshots, Store: store, Clock: recordingClock, NewID: catalogmodel.NewID,
 		OnAdded: scheduler.Notify, OnStop: scheduler.NotifyStop,
 	}
 	automaticRules := autoreservationapp.RuleService{Store: store, Clock: recordingClock, NewID: catalogmodel.NewID}

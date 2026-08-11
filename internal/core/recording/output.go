@@ -30,6 +30,36 @@ type OutputSettings struct {
 	Template string
 }
 
+// OneSegOutputは予約時点で固定したワンセグサービスと保存先である。
+// 接続先はprovider固有の文字列として扱い、domainでは内容を解釈しない。
+type OneSegOutput struct {
+	ProviderServiceLocator string
+	Output                 OutputSettings
+}
+
+// Validateは接続先と保存先を安全に永続化できるか確認する。
+func (output OneSegOutput) Validate() error {
+	parsed, err := strconv.ParseUint(output.ProviderServiceLocator, 10, 63)
+	if !validText(output.ProviderServiceLocator, 1, 256) || err != nil || parsed == 0 ||
+		strconv.FormatUint(parsed, 10) != output.ProviderServiceLocator || output.Output.Validate() != nil {
+		return errors.New("recording: invalid one-seg output")
+	}
+	return nil
+}
+
+// ResolveOneSegOutputは有効要求へ解決済み接続先を結び付ける。
+// 空の保存先はメイン設定を継承する指定としてそのまま固定する。
+func ResolveOneSegOutput(request ReservationRequest, providerServiceLocator string) (*OneSegOutput, error) {
+	if request.OneSegOutput == nil {
+		return nil, nil
+	}
+	result := &OneSegOutput{ProviderServiceLocator: providerServiceLocator, Output: *request.OneSegOutput}
+	if result.Validate() != nil {
+		return nil, errors.New("recording: invalid resolved one-seg output")
+	}
+	return result, nil
+}
+
 // Validateは外部pathや未対応マクロへ解決されない要求値かを確認する。
 func (settings OutputSettings) Validate() error {
 	if settings.Folder != "" && !validOutputFolder(settings.Folder) {
@@ -65,6 +95,37 @@ func NewReservationFilePlan(reservation Reservation, attemptID catalogmodel.ID) 
 	plan := FilePlan{PartialPath: directory + "/" + name + ".partial", FinalPath: directory + "/" + name}
 	if err := plan.Validate(); err != nil {
 		return FilePlan{}, errors.New("recording: invalid generated reservation file plan")
+	}
+	return plan, nil
+}
+
+// NewOneSegFilePlanはワンセグ用の保存先を使い、完成名の拡張子直前へ`.oneseg`を一度加える。
+func NewOneSegFilePlan(reservation Reservation, attemptID catalogmodel.ID) (FilePlan, error) {
+	if reservation.OneSegOutput == nil || reservation.OneSegOutput.Validate() != nil {
+		return FilePlan{}, errors.New("recording: invalid one-seg file plan source")
+	}
+	oneSeg := reservation
+	oneSeg.Output = reservation.OneSegOutput.Output
+	if oneSeg.Output == (OutputSettings{}) {
+		oneSeg.Output = reservation.Output
+	}
+	plan, err := NewReservationFilePlan(oneSeg, attemptID)
+	if err != nil {
+		return FilePlan{}, err
+	}
+	name := path.Base(plan.FinalPath)
+	if len(name) < 3 || !strings.EqualFold(name[len(name)-3:], ".ts") {
+		return FilePlan{}, errors.New("recording: invalid one-seg file extension")
+	}
+	name = name[:len(name)-3] + ".oneseg" + name[len(name)-3:]
+	if !validOutputName(name) {
+		return FilePlan{}, errors.New("recording: invalid one-seg output name")
+	}
+	directory := path.Dir(plan.FinalPath)
+	plan.FinalPath = directory + "/" + name
+	plan.PartialPath = plan.FinalPath + ".partial"
+	if err := plan.Validate(); err != nil {
+		return FilePlan{}, errors.New("recording: invalid generated one-seg file plan")
 	}
 	return plan, nil
 }

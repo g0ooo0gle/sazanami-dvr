@@ -55,6 +55,17 @@ func (holder *SnapshotHolder) FindProgram(ctx context.Context, request recording
 	return snapshot.FindProgram(ctx, request)
 }
 
+// ResolveOneSegReservationは一回の呼出し中に同じ完成済みsnapshotだけを使って番組と部分受信serviceを解決する。
+func (holder *SnapshotHolder) ResolveOneSegReservation(ctx context.Context, request recording.ReservationRequest) (
+	recording.ProgramSnapshot, string, error,
+) {
+	snapshot := holder.Load()
+	if snapshot == nil {
+		return recording.ProgramSnapshot{}, "", stable("one-seg-service-unavailable")
+	}
+	return snapshot.ResolveOneSegReservation(ctx, request)
+}
+
 // ResolveLiveServiceは要求開始時のスナップショット一つだけでライブ放送局を照合する。
 func (holder *SnapshotHolder) ResolveLiveService(ctx context.Context, networkID, transportStreamID, serviceID uint16) (provider.TuningTarget, error) {
 	snapshot := holder.Load()

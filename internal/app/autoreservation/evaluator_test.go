@@ -73,7 +73,12 @@ func (store *evaluationStore) DisableAutomaticReservation(_ context.Context, pro
 	return store.disableResult, store.disableErr
 }
 
-type evaluationCatalog struct{ programs []catalogmodel.CurrentProgram }
+type evaluationCatalog struct {
+	programs    []catalogmodel.CurrentProgram
+	findErr     error
+	oneSegErr   error
+	oneSegValue string
+}
 
 func (catalog evaluationCatalog) CurrentProgramsByService(_ context.Context, limit int,
 	after catalogmodel.ProgramCursor,
@@ -99,13 +104,26 @@ func (evaluationCatalog) ReservationRequestForProgram(program catalogmodel.Curre
 	}, nil
 }
 
-func (evaluationCatalog) FindProgram(_ context.Context, request recording.ReservationRequest) (recording.ProgramSnapshot, error) {
+func (catalog evaluationCatalog) FindProgram(_ context.Context, request recording.ReservationRequest) (recording.ProgramSnapshot, error) {
+	if catalog.findErr != nil {
+		return recording.ProgramSnapshot{}, catalog.findErr
+	}
 	return recording.ProgramSnapshot{
 		ProgramInstanceID: catalogmodel.ID{byte(request.EventID)}, ProgramRevisionID: catalogmodel.ID{99},
 		BackendID: catalogmodel.ID{98}, ProviderServiceLocator: "1", TuningTarget: "1",
 		NetworkID: request.NetworkID, TransportStreamID: request.TransportStreamID, ServiceID: request.ServiceID,
 		EventID: request.EventID, Title: "番組", StationName: "局", Start: request.Start, Duration: request.Duration,
 	}, nil
+}
+
+func (catalog evaluationCatalog) ResolveOneSeg(_ context.Context, _ recording.ProgramSnapshot) (string, error) {
+	if catalog.oneSegErr != nil {
+		return "", catalog.oneSegErr
+	}
+	if catalog.oneSegValue != "" {
+		return catalog.oneSegValue, nil
+	}
+	return "2", nil
 }
 
 type fixedClock struct{ now time.Time }
@@ -185,6 +203,90 @@ func TestEvaluatorDoesNotCreateForMatchingForcedTunerRule(t *testing.T) {
 	if err != nil || result.Matched != 0 || result.Created != 0 || result.UnavailableRules != 1 ||
 		result.ForcedTunerUnavailableRules != 1 || len(store.created) != 0 {
 		t.Fatalf("result=%+v created=%d err=%v", result, len(store.created), err)
+	}
+}
+
+func TestEvaluatorCreatesOneSegReservationFromSupportedProfile(t *testing.T) {
+	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+	rule := storedRule(1, autoreservation.SearchCondition{Enabled: true})
+	rule.Recording.PartialMode = 1
+	rule.Recording.PartialFolders = []autoreservation.Folder{{
+		Path: "mobile", Writer: "Write_Default.dll", Name: "RecName_Macro.dll?$Title$.ts",
+	}}
+	store := &evaluationStore{rules: []autoreservation.Rule{rule}, seen: make(map[catalogmodel.ID]struct{})}
+	result, err := (Evaluator{
+		Store: store, Catalog: evaluationCatalog{
+			programs:    []catalogmodel.CurrentProgram{currentProgram(1, now.Add(time.Hour), "番組", "", catalogmodel.FreeYes)},
+			oneSegValue: "1004",
+		}, Clock: fixedClock{now},
+		NewID:       func() (catalogmodel.ID, error) { return catalogmodel.ID{10}, nil },
+		IsDuplicate: func(error) bool { return false },
+	}).Run(context.Background())
+	wantOutput := recording.OutputSettings{Folder: "mobile", Template: "$Title$.ts"}
+	if err != nil || result.Created != 1 || result.OneSegUnavailableRules != 0 || result.OneSegUnresolvedPrograms != 0 ||
+		len(store.created) != 1 || store.created[0].OneSegOutput == nil ||
+		store.created[0].OneSegOutput.ProviderServiceLocator != "1004" || store.created[0].OneSegOutput.Output != wantOutput {
+		t.Fatalf("result=%+v created=%+v err=%v", result, store.created, err)
+	}
+}
+
+func TestEvaluatorKeepsUnsupportedOneSegRulesWithoutCreatingReservation(t *testing.T) {
+	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+	rules := make([]autoreservation.Rule, 0, 4)
+	for index, mode := range []uint8{2, 255} {
+		rule := storedRule(int32(index+1), autoreservation.SearchCondition{Enabled: true})
+		rule.Recording.PartialMode = mode
+		rules = append(rules, rule)
+	}
+	multiple := storedRule(3, autoreservation.SearchCondition{Enabled: true})
+	multiple.Recording.PartialMode = 1
+	multiple.Recording.PartialFolders = []autoreservation.Folder{{Path: "a"}, {Path: "b"}}
+	rules = append(rules, multiple)
+	unrelated := storedRule(4, autoreservation.SearchCondition{Enabled: true})
+	unrelated.Recording.Exact = true
+	rules = append(rules, unrelated)
+	forced := storedRule(5, autoreservation.SearchCondition{Enabled: true})
+	forced.Recording.PartialMode = 2
+	forced.Recording.TunerID = 9
+	rules = append(rules, forced)
+	store := &evaluationStore{rules: rules, seen: make(map[catalogmodel.ID]struct{})}
+	result, err := (Evaluator{
+		Store: store, Catalog: evaluationCatalog{programs: []catalogmodel.CurrentProgram{
+			currentProgram(1, now.Add(time.Hour), "番組", "", catalogmodel.FreeYes),
+		}}, Clock: fixedClock{now},
+		NewID:       func() (catalogmodel.ID, error) { return catalogmodel.ID{10}, nil },
+		IsDuplicate: func(error) bool { return false },
+	}).Run(context.Background())
+	if err != nil || result.UnavailableRules != 5 || result.OneSegUnavailableRules != 3 ||
+		result.ForcedTunerUnavailableRules != 1 || result.Created != 0 || len(store.created) != 0 {
+		t.Fatalf("result=%+v created=%+v err=%v", result, store.created, err)
+	}
+}
+
+func TestEvaluatorCountsOnlyOneSegResolutionFailures(t *testing.T) {
+	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+	rule := storedRule(1, autoreservation.SearchCondition{Enabled: true})
+	rule.Recording.PartialMode = 1
+	program := currentProgram(1, now.Add(time.Hour), "番組", "", catalogmodel.FreeYes)
+	for _, test := range []struct {
+		name       string
+		catalog    evaluationCatalog
+		wantOneSeg int
+	}{
+		{name: "main program", catalog: evaluationCatalog{programs: []catalogmodel.CurrentProgram{program}, findErr: errors.New("not found")}},
+		{name: "one seg", catalog: evaluationCatalog{programs: []catalogmodel.CurrentProgram{program}, oneSegErr: errors.New("not found")}, wantOneSeg: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := &evaluationStore{rules: []autoreservation.Rule{rule}, seen: make(map[catalogmodel.ID]struct{})}
+			result, err := (Evaluator{
+				Store: store, Catalog: test.catalog, Clock: fixedClock{now},
+				NewID:       func() (catalogmodel.ID, error) { return catalogmodel.ID{10}, nil },
+				IsDuplicate: func(error) bool { return false },
+			}).Run(context.Background())
+			if err != nil || result.OneSegUnresolvedPrograms != test.wantOneSeg || result.Created != 0 {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+		})
 	}
 }
 
