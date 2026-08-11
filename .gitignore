@@ -1,6 +1,7 @@
 # Go build／coverage生成物
 /sazanami-dvr
 /bin/
+/dist/
 *.test
 *.prof
 coverage.out
