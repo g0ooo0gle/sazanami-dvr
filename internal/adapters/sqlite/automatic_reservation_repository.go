@@ -155,6 +155,8 @@ func (store *Store) CreateAutomaticReservation(ctx context.Context, ruleNumber i
 	if store == nil || store.writer == nil || ctx == nil || ruleNumber < 1 || reservation.ValidateNew() != nil {
 		return recording.Reservation{}, errors.New("sqlite: invalid automatic reservation")
 	}
+	store.reservationPower.Lock()
+	defer store.reservationPower.Unlock()
 	tx, err := store.writer.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
 		return recording.Reservation{}, sanitize("begin-automatic-reservation", err)
@@ -199,6 +201,8 @@ func (store *Store) DisableAutomaticReservation(ctx context.Context, programID c
 		now.IsZero() || now.Location() != time.UTC || now.UnixMilli() < 0 {
 		return false, errors.New("sqlite: invalid automatic reservation disable")
 	}
+	store.reservationPower.Lock()
+	defer store.reservationPower.Unlock()
 	result, err := store.writer.ExecContext(ctx, `UPDATE reservations SET enabled=0,
 		version=version+1, updated_at_utc_ms=? WHERE id=(
 			SELECT reservation_id FROM automatic_reservation_matches WHERE program_instance_id=?

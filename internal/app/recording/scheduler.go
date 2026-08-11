@@ -24,6 +24,8 @@ type ScheduleStore interface {
 	ExpireOneDisabledReservation(context.Context, time.Time) (bool, error)
 	NextDisabledReservationDeadline(context.Context, time.Time) (*time.Time, error)
 	NextActiveReservation(context.Context, time.Time) (*core.Reservation, error)
+	LockPostRecordingPowerDecision()
+	UnlockPostRecordingPowerDecision()
 }
 
 // ReservationExecutorは予約をDBへ確保し、確保済み録画を実行するか未実行として確定する。
@@ -190,7 +192,7 @@ func (scheduler *Scheduler) Run(ctx context.Context) error {
 			return scheduler.stopExecutions(cancelExecutions, completed, active, errors.New("recording: read next reservation"))
 		}
 		if active == 0 && pendingPower.present {
-			result := scheduler.executePostRecordingPower(ctx, pendingPower, now, reservation)
+			result := scheduler.executePendingPostRecordingPower(ctx, pendingPower, now)
 			pendingPower = postRecordingPowerCandidate{}
 			if scheduler.observePostPower != nil {
 				if result.Reason != "" {
@@ -294,6 +296,22 @@ func (scheduler *Scheduler) Run(ctx context.Context) error {
 			completed <- executionCompletion{result: result, err: executeErr}
 		}(*reservation, attempt)
 	}
+}
+
+// executePendingPostRecordingPowerは予約変更を止めた短い区間で次予約を読み直し、同じ状態のまま電源動作を始める。
+func (scheduler *Scheduler) executePendingPostRecordingPower(ctx context.Context,
+	candidate postRecordingPowerCandidate, now time.Time,
+) PostRecordingPowerResult {
+	scheduler.store.LockPostRecordingPowerDecision()
+	defer scheduler.store.UnlockPostRecordingPowerDecision()
+	next, err := scheduler.store.NextActiveReservation(ctx, now)
+	if err != nil {
+		if ctx.Err() != nil {
+			return PostRecordingPowerResult{Reason: "post-recording-power-cancelled"}
+		}
+		return PostRecordingPowerResult{Reason: "post-recording-power-unavailable"}
+	}
+	return scheduler.executePostRecordingPower(ctx, candidate, now, next)
 }
 
 func (candidate *postRecordingPowerCandidate) add(mode core.PostRecordingMode) {

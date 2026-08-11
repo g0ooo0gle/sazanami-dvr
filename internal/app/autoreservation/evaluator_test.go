@@ -179,12 +179,24 @@ func TestEvaluatorInheritsDisabledPriorityFollowAndMargins(t *testing.T) {
 }
 
 func TestAutomaticPostRecordingModeMatrix(t *testing.T) {
+	type wireMode struct {
+		suspend uint8
+		reboot  bool
+	}
+	accepted := map[wireMode]recording.PostRecordingMode{
+		{0, false}: recording.PostRecordingDefault,
+		{4, false}: recording.PostRecordingNothing,
+		{1, false}: recording.PostRecordingStandby,
+		{1, true}:  recording.PostRecordingStandbyReboot,
+		{2, false}: recording.PostRecordingSuspend,
+		{2, true}:  recording.PostRecordingSuspendReboot,
+		{3, false}: recording.PostRecordingShutdown,
+	}
 	for rawSuspend := 0; rawSuspend <= 255; rawSuspend++ {
 		for _, reboot := range []bool{false, true} {
 			mode, ok := automaticPostRecordingMode(uint8(rawSuspend), reboot)
-			wantOK := rawSuspend == 0 && !reboot || rawSuspend == 4 && !reboot ||
-				rawSuspend == 1 || rawSuspend == 2 || rawSuspend == 3 && !reboot
-			if ok != wantOK || ok && !mode.Valid() {
+			wantMode, wantOK := accepted[wireMode{uint8(rawSuspend), reboot}]
+			if ok != wantOK || ok && mode != wantMode {
 				t.Fatalf("suspend=%d reboot=%v mode=%d ok=%v", rawSuspend, reboot, mode, ok)
 			}
 		}
