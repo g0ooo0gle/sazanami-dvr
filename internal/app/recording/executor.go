@@ -27,10 +27,15 @@ type AttemptStore interface {
 	StartAttempt(context.Context, catalogmodel.ID, time.Time) error
 	AttemptStopRequested(context.Context, catalogmodel.ID) (bool, error)
 	RecordingStarted(context.Context, catalogmodel.ID, time.Time) (time.Time, error)
+	OneSegRecordingStarted(context.Context, catalogmodel.ID, time.Time) error
 	UpdateRecordingProgress(context.Context, catalogmodel.ID, int64, time.Time) (time.Time, error)
+	UpdateOneSegProgress(context.Context, catalogmodel.ID, int64, time.Time) (time.Time, error)
 	BeginFinalization(context.Context, recording.FinalizeRequest) error
 	MarkFinalPublished(context.Context, catalogmodel.ID, time.Time) error
 	MarkDirectorySynced(context.Context, catalogmodel.ID, time.Time) error
+	MarkOneSegFinalPublished(context.Context, catalogmodel.ID, time.Time) error
+	MarkOneSegDirectorySynced(context.Context, catalogmodel.ID, time.Time) error
+	SetOneSegOutcome(context.Context, catalogmodel.ID, recording.OneSegResult, time.Time) error
 	FinishAttempt(context.Context, recording.FinishRequest) error
 }
 
@@ -117,6 +122,9 @@ func (executor Executor) Miss(ctx context.Context, reservation recording.Reserva
 		AttemptID: attempt.ID, State: recording.AttemptMissed, Reason: reason,
 		Availability: recording.AvailabilityMissing, Now: executor.now(),
 	}
+	if attempt.OneSegPlan != nil {
+		finish.OneSeg = &recording.OneSegResult{Availability: recording.AvailabilityMissing, Reason: reason}
+	}
 	if err := executor.Store.FinishAttempt(ctx, finish); err != nil {
 		return Result{}, errors.New("recording: finish missed attempt")
 	}
@@ -135,6 +143,13 @@ func (executor Executor) Execute(ctx context.Context, reservation recording.Rese
 // ExecuteClaimedはDBへ確保済みの一件を実行する。
 // SchedulerはClaimの完了後だけこの処理をGo routineで起動し、同じ予約の二重起動を防ぐ。
 func (executor Executor) ExecuteClaimed(ctx context.Context, reservation recording.Reservation, attempt recording.Attempt) (Result, error) {
+	if attempt.OneSegPlan != nil {
+		return executor.executeClaimedWithOneSeg(ctx, reservation, attempt)
+	}
+	return executor.executeClaimed(ctx, reservation, attempt)
+}
+
+func (executor Executor) executeClaimed(ctx context.Context, reservation recording.Reservation, attempt recording.Attempt) (Result, error) {
 	if err := executor.validateClaimed(ctx, reservation, attempt); err != nil {
 		return Result{}, err
 	}
@@ -222,7 +237,7 @@ func (executor Executor) ExecuteClaimed(ctx context.Context, reservation recordi
 			copyResult.PlannedEnd = plannedEnd
 			started = true
 		}
-		copyResult = executor.copy(streamContext, lease, partial, attempt, reservation.Components, copyResult)
+		copyResult = executor.copy(streamContext, lease, partial, attempt, reservation.Components, copyResult, false)
 		_ = lease.Cancel()
 		_ = lease.Close()
 		if copyResult.Reason == recording.ReasonUserRequestedStop {
@@ -346,7 +361,7 @@ func (executor Executor) publishFinal(ctx context.Context, attempt recording.Att
 }
 
 func (executor Executor) copy(ctx context.Context, lease providerstream.Lease, file PartialFile, attempt recording.Attempt,
-	componentMode recording.ComponentMode, result streamCopyResult,
+	componentMode recording.ComponentMode, result streamCopyResult, oneSeg bool,
 ) streamCopyResult {
 	result.ReachedEnd = false
 	result.Retryable = false
@@ -403,7 +418,13 @@ func (executor Executor) copy(ctx context.Context, lease providerstream.Lease, f
 		}
 		now := executor.now()
 		if now.Sub(result.LastProgress) >= progressInterval {
-			plannedEnd, err := executor.Store.UpdateRecordingProgress(context.WithoutCancel(ctx), attempt.ID, result.ByteCount, now)
+			var plannedEnd time.Time
+			var err error
+			if oneSeg {
+				plannedEnd, err = executor.Store.UpdateOneSegProgress(context.WithoutCancel(ctx), attempt.ID, result.ByteCount, now)
+			} else {
+				plannedEnd, err = executor.Store.UpdateRecordingProgress(context.WithoutCancel(ctx), attempt.ID, result.ByteCount, now)
+			}
 			if err != nil || plannedEnd.IsZero() || plannedEnd.Location() != time.UTC ||
 				!plannedEnd.After(attempt.PlannedStart) || plannedEnd.After(result.MaximumEnd) ||
 				executor.FollowExtensionOnly && plannedEnd.Before(result.PlannedEnd) {
@@ -606,10 +627,22 @@ func (executor Executor) Claim(ctx context.Context, reservation recording.Reserv
 	if err != nil {
 		return recording.Attempt{}, err
 	}
-	attempt, err := executor.Store.ClaimRecording(ctx, recording.ClaimRequest{
+	claim := recording.ClaimRequest{
 		ReservationID: reservation.ID, AttemptID: attemptID, SegmentID: segmentID, OwnerID: executor.OwnerID,
 		OwnerGeneration: executor.Generation, Now: executor.now(), Plan: plan,
-	})
+	}
+	if reservation.OneSegOutput != nil {
+		claim.OneSegSegmentID, err = executor.NewID()
+		if err != nil {
+			return recording.Attempt{}, errors.New("recording: one-seg segment id generation failed")
+		}
+		oneSegPlan, planErr := recording.NewOneSegFilePlan(reservation, attemptID)
+		if planErr != nil {
+			return recording.Attempt{}, planErr
+		}
+		claim.OneSegPlan = &oneSegPlan
+	}
+	attempt, err := executor.Store.ClaimRecording(ctx, claim)
 	if err != nil {
 		return recording.Attempt{}, err
 	}
@@ -623,7 +656,11 @@ func (executor Executor) validateClaimed(ctx context.Context, reservation record
 	if attempt.ID == (catalogmodel.ID{}) || attempt.ReservationID != reservation.ID ||
 		attempt.State != recording.AttemptClaimed || attempt.PlannedStart.IsZero() || attempt.PlannedEnd.IsZero() ||
 		attempt.PlannedStart.Location() != time.UTC || attempt.PlannedEnd.Location() != time.UTC ||
-		!attempt.PlannedEnd.After(attempt.PlannedStart) || attempt.Plan.Validate() != nil {
+		!attempt.PlannedEnd.After(attempt.PlannedStart) || attempt.Plan.Validate() != nil ||
+		(attempt.OneSegPlan == nil) != (reservation.OneSegOutput == nil) ||
+		attempt.OneSegPlan != nil && (attempt.OneSegPlan.Validate() != nil ||
+			attempt.OneSegPlan.PartialPath == attempt.Plan.PartialPath || attempt.OneSegPlan.PartialPath == attempt.Plan.FinalPath ||
+			attempt.OneSegPlan.FinalPath == attempt.Plan.PartialPath || attempt.OneSegPlan.FinalPath == attempt.Plan.FinalPath) {
 		return errors.New("recording: invalid claimed attempt")
 	}
 	return nil

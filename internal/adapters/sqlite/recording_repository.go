@@ -1005,7 +1005,7 @@ func (store *Store) SetOneSegOutcome(ctx context.Context, attemptID catalogmodel
 		fileSynced = 1
 	}
 	result, err := store.writer.ExecContext(ctx, `UPDATE recording_segments SET state='PARTIAL', byte_count=?,
-		file_synced=?, availability=?, integrity_reason=?, updated_at_utc_ms=?
+		file_synced=?, final_published=0, directory_synced=0, availability=?, integrity_reason=?, updated_at_utc_ms=?
 		WHERE attempt_id=? AND ordinal=1 AND state IN ('PLANNED','WRITING','PARTIAL','FINALIZED') AND EXISTS (
 			SELECT 1 FROM recording_attempts a WHERE a.id=? AND a.state='FINALIZING')`,
 		outcome.ByteCount, fileSynced, outcome.Availability, outcome.Reason, now.UnixMilli(), attemptID.Bytes(), attemptID.Bytes())
@@ -1138,7 +1138,7 @@ func (store *Store) FinishAttempt(ctx context.Context, request recording.FinishR
 			fileSynced = 1
 		}
 		result, err = tx.ExecContext(ctx, `UPDATE recording_segments SET state='PARTIAL', byte_count=?,
-			file_synced=?, availability=?, integrity_reason=?, updated_at_utc_ms=?
+			file_synced=?, final_published=0, directory_synced=0, availability=?, integrity_reason=?, updated_at_utc_ms=?
 			WHERE attempt_id=? AND ordinal=1`, request.OneSeg.ByteCount, fileSynced,
 			request.OneSeg.Availability, request.OneSeg.Reason, nowMS, request.AttemptID.Bytes())
 		if err != nil {

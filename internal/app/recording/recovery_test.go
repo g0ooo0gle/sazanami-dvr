@@ -10,11 +10,14 @@ import (
 )
 
 type recoveryMemory struct {
-	item         core.RecoveryItem
-	observation  core.FileObservation
-	finish       []core.FinishRequest
-	availability []core.Availability
-	operations   []string
+	item               core.RecoveryItem
+	observation        core.FileObservation
+	oneSegObservation  core.FileObservation
+	finish             []core.FinishRequest
+	availability       []core.Availability
+	oneSegAvailability []core.Availability
+	oneSegOutcomes     []core.OneSegResult
+	operations         []string
 }
 
 func (memory *recoveryMemory) RecoveryAttempts(_ context.Context, _ int, after catalogmodel.ID) ([]core.RecoveryItem, error) {
@@ -36,6 +39,33 @@ func (memory *recoveryMemory) MarkDirectorySynced(context.Context, catalogmodel.
 	return nil
 }
 
+func (memory *recoveryMemory) MarkOneSegFinalPublished(context.Context, catalogmodel.ID, time.Time) error {
+	memory.operations = append(memory.operations, "one-published")
+	memory.item.OneSeg.FinalPublished = true
+	return nil
+}
+
+func (memory *recoveryMemory) MarkOneSegDirectorySynced(context.Context, catalogmodel.ID, time.Time) error {
+	memory.operations = append(memory.operations, "one-directory-recorded")
+	memory.item.OneSeg.State = core.SegmentFinalized
+	memory.item.OneSeg.Availability = core.AvailabilityFinal
+	memory.item.OneSeg.DirectorySynced = true
+	return nil
+}
+
+func (memory *recoveryMemory) SetOneSegOutcome(_ context.Context, _ catalogmodel.ID, result core.OneSegResult,
+	_ time.Time,
+) error {
+	memory.operations = append(memory.operations, "one-outcome")
+	memory.oneSegOutcomes = append(memory.oneSegOutcomes, result)
+	memory.item.OneSeg.State = core.SegmentPartial
+	memory.item.OneSeg.ByteCount = result.ByteCount
+	memory.item.OneSeg.FileSynced = result.FileSynced
+	memory.item.OneSeg.Availability = result.Availability
+	memory.item.OneSeg.IntegrityReason = result.Reason
+	return nil
+}
+
 func (memory *recoveryMemory) FinishAttempt(_ context.Context, request core.FinishRequest) error {
 	memory.finish = append(memory.finish, request)
 	memory.item.State = request.State
@@ -43,9 +73,21 @@ func (memory *recoveryMemory) FinishAttempt(_ context.Context, request core.Fini
 	return nil
 }
 
-func (memory *recoveryMemory) SetRecordingAvailability(_ context.Context, _ catalogmodel.ID, availability core.Availability, _ core.TerminalReason, _ time.Time) error {
+func (memory *recoveryMemory) SetRecordingAvailability(_ context.Context, _ catalogmodel.ID,
+	availability core.Availability, reason core.TerminalReason, _ time.Time,
+) error {
 	memory.availability = append(memory.availability, availability)
 	memory.item.Availability = availability
+	memory.item.IntegrityReason = reason
+	return nil
+}
+
+func (memory *recoveryMemory) SetOneSegAvailability(_ context.Context, _ catalogmodel.ID,
+	availability core.Availability, reason core.TerminalReason, _ time.Time,
+) error {
+	memory.oneSegAvailability = append(memory.oneSegAvailability, availability)
+	memory.item.OneSeg.Availability = availability
+	memory.item.OneSeg.IntegrityReason = reason
 	return nil
 }
 
@@ -192,30 +234,135 @@ func TestRecoveryReconcilesHistoricalSuccessAndIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestRecoveryFinalizesMainBeforeOneSeg(t *testing.T) {
+	item := recoveryItem(t, core.AttemptFinalizing)
+	item.FileSynced = true
+	item.FinalizationToken = appID(t, 56)
+	addOneSegRecovery(t, &item, core.SegmentPartial, core.AvailabilityPartial)
+	item.OneSeg.FileSynced = true
+	memory := recoveryMemory{
+		item: item, observation: core.FileObservation{Partial: regularFact(376)},
+		oneSegObservation: core.FileObservation{Partial: regularFact(376)},
+	}
+	if err := recoveryForTest(&memory).Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"link", "published", "directory-sync", "remove", "directory-sync", "directory-recorded",
+		"one-link", "one-published", "one-directory-sync", "one-remove", "one-directory-sync", "one-directory-recorded",
+	}
+	if !equalStrings(memory.operations, want) || len(memory.finish) != 1 ||
+		memory.finish[0].State != core.AttemptSucceeded || memory.finish[0].OneSeg != nil {
+		t.Fatalf("operations=%v finish=%+v", memory.operations, memory.finish)
+	}
+}
+
+func TestRecoveryKeepsCompletedMainWhenOneSegIsMissing(t *testing.T) {
+	item := recoveryItem(t, core.AttemptFinalizing)
+	item.FileSynced = true
+	item.FinalPublished = true
+	item.DirectorySynced = true
+	item.SegmentState = core.SegmentFinalized
+	item.Availability = core.AvailabilityFinal
+	item.FinalizationToken = appID(t, 57)
+	addOneSegRecovery(t, &item, core.SegmentPartial, core.AvailabilityPartial)
+	item.OneSeg.FileSynced = true
+	memory := recoveryMemory{item: item, observation: core.FileObservation{Final: regularFact(376)}}
+	if err := recoveryForTest(&memory).Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !equalStrings(memory.operations, []string{"directory-sync", "one-outcome"}) ||
+		len(memory.oneSegOutcomes) != 1 || memory.oneSegOutcomes[0].Availability != core.AvailabilityMissing ||
+		memory.oneSegOutcomes[0].Reason != core.ReasonFileMissing || len(memory.finish) != 1 ||
+		memory.finish[0].State != core.AttemptSucceeded {
+		t.Fatalf("operations=%v oneSeg=%+v finish=%+v", memory.operations, memory.oneSegOutcomes, memory.finish)
+	}
+	if err := recoveryForTest(&memory).Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(memory.oneSegOutcomes) != 1 || len(memory.finish) != 1 {
+		t.Fatalf("二回目の復旧で状態が増えました: oneSeg=%+v finish=%+v", memory.oneSegOutcomes, memory.finish)
+	}
+}
+
+func TestRecoverySettlesInterruptedOneSegWithMain(t *testing.T) {
+	item := recoveryItem(t, core.AttemptRecording)
+	addOneSegRecovery(t, &item, core.SegmentWriting, core.AvailabilityPlanned)
+	memory := recoveryMemory{
+		item: item, observation: core.FileObservation{Partial: regularFact(376)},
+		oneSegObservation: core.FileObservation{Partial: regularFact(188)},
+	}
+	if err := recoveryForTest(&memory).Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(memory.finish) != 1 || memory.finish[0].State != core.AttemptPartial || memory.finish[0].OneSeg == nil ||
+		memory.finish[0].OneSeg.ByteCount != 188 || memory.finish[0].OneSeg.Availability != core.AvailabilityPartial ||
+		memory.finish[0].OneSeg.Reason != core.ReasonProcessInterrupted || len(memory.operations) != 0 {
+		t.Fatalf("finish=%+v operations=%v", memory.finish, memory.operations)
+	}
+}
+
+func TestRecoveryReconcilesCompletedOneSegWithoutChangingMain(t *testing.T) {
+	item := recoveryItem(t, core.AttemptSucceeded)
+	item.FileSynced = true
+	item.FinalPublished = true
+	item.DirectorySynced = true
+	item.FinalizationToken = appID(t, 58)
+	addOneSegRecovery(t, &item, core.SegmentFinalized, core.AvailabilityFinal)
+	item.OneSeg.FileSynced = true
+	item.OneSeg.FinalPublished = true
+	item.OneSeg.DirectorySynced = true
+	memory := recoveryMemory{item: item, observation: core.FileObservation{Final: regularFact(376)}}
+	if err := recoveryForTest(&memory).Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(memory.availability) != 0 || len(memory.oneSegAvailability) != 1 ||
+		memory.oneSegAvailability[0] != core.AvailabilityMissing || len(memory.finish) != 0 {
+		t.Fatalf("main=%v oneSeg=%v finish=%v", memory.availability, memory.oneSegAvailability, memory.finish)
+	}
+}
+
 func recoveryForTest(memory *recoveryMemory) Recovery {
+	oneSegPlan := func(plan core.FilePlan) bool {
+		return memory.item.OneSeg != nil && plan == memory.item.OneSeg.Plan
+	}
+	operation := func(plan core.FilePlan, name string) {
+		if oneSegPlan(plan) {
+			name = "one-" + name
+		}
+		memory.operations = append(memory.operations, name)
+	}
+	observation := func(plan core.FilePlan) *core.FileObservation {
+		if oneSegPlan(plan) {
+			return &memory.oneSegObservation
+		}
+		return &memory.observation
+	}
 	return Recovery{
 		Store: memory, Clock: &mutableClock{now: time.Date(2026, 8, 5, 2, 0, 0, 0, time.UTC)},
 		Files: RecoveryFiles{
 			FileOperations: FileOperations{
 				CreatePartial: func(core.FilePlan) (PartialFile, error) { return nil, nil },
-				LinkFinal: func(core.FilePlan) error {
-					memory.operations = append(memory.operations, "link")
-					memory.observation.Final = memory.observation.Partial
-					memory.observation.SameFile = true
+				LinkFinal: func(plan core.FilePlan) error {
+					operation(plan, "link")
+					current := observation(plan)
+					current.Final = current.Partial
+					current.SameFile = true
 					return nil
 				},
-				SyncDirectory: func(core.FilePlan) error {
-					memory.operations = append(memory.operations, "directory-sync")
+				SyncDirectory: func(plan core.FilePlan) error {
+					operation(plan, "directory-sync")
 					return nil
 				},
-				RemovePartial: func(core.FilePlan) error {
-					memory.operations = append(memory.operations, "remove")
-					memory.observation.Partial = core.FileFact{}
-					memory.observation.SameFile = false
+				RemovePartial: func(plan core.FilePlan) error {
+					operation(plan, "remove")
+					current := observation(plan)
+					current.Partial = core.FileFact{}
+					current.SameFile = false
 					return nil
 				},
 			},
-			Inspect: func(core.FilePlan) (core.FileObservation, error) { return memory.observation, nil },
+			Inspect: func(plan core.FilePlan) (core.FileObservation, error) { return *observation(plan), nil },
 		},
 	}
 }
@@ -232,11 +379,36 @@ func recoveryItem(t *testing.T, state core.AttemptState) core.RecoveryItem {
 		ID: id, ReservationID: appID(t, 51), State: state, PlannedStart: start,
 		PlannedEnd: start.Add(time.Hour), ByteCount: 376, Plan: plan,
 	}}
+	item.SegmentState = core.SegmentPlanned
+	item.Availability = core.AvailabilityPlanned
+	if state == core.AttemptStarting || state == core.AttemptRecording {
+		item.SegmentState = core.SegmentWriting
+	}
 	if state == core.AttemptFinalizing || state == core.AttemptSucceeded {
 		item.PlannedState = core.AttemptSucceeded
 		item.PlannedReason = core.ReasonCompleted
+		item.SegmentState = core.SegmentPartial
+		item.Availability = core.AvailabilityPartial
+	}
+	if state == core.AttemptSucceeded {
+		item.SegmentState = core.SegmentFinalized
+		item.Availability = core.AvailabilityFinal
 	}
 	return item
+}
+
+func addOneSegRecovery(t *testing.T, item *core.RecoveryItem, state core.SegmentState,
+	availability core.Availability,
+) {
+	t.Helper()
+	plan, err := core.NewFilePlan(item.PlannedStart, appID(t, 55))
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.OneSeg = &core.RecoverySegment{
+		Plan: plan, ByteCount: 376, State: state, Availability: availability,
+	}
+	item.OneSegPlan = &plan
 }
 
 func regularFact(size int64) core.FileFact {

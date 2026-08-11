@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,6 +21,7 @@ type mutableClock struct{ now time.Time }
 func (clock *mutableClock) Now() time.Time { return clock.now }
 
 type attemptMemory struct {
+	mu           sync.Mutex
 	start        time.Time
 	end          time.Time
 	startEnd     time.Time
@@ -34,19 +37,30 @@ type attemptMemory struct {
 	publishErr   error
 	directoryErr error
 	stop         atomic.Bool
+	onOperation  func(string)
+}
+
+func (store *attemptMemory) record(operation string) {
+	store.mu.Lock()
+	store.operations = append(store.operations, operation)
+	callback := store.onOperation
+	store.mu.Unlock()
+	if callback != nil {
+		callback(operation)
+	}
 }
 
 func (store *attemptMemory) ClaimRecording(_ context.Context, request core.ClaimRequest) (core.Attempt, error) {
 	store.claim = request
-	store.operations = append(store.operations, "claim")
+	store.record("claim")
 	return core.Attempt{
 		ID: request.AttemptID, ReservationID: request.ReservationID, State: core.AttemptClaimed,
-		PlannedStart: store.start, PlannedEnd: store.end, Plan: request.Plan,
+		PlannedStart: store.start, PlannedEnd: store.end, Plan: request.Plan, OneSegPlan: request.OneSegPlan,
 	}, nil
 }
 
 func (store *attemptMemory) StartAttempt(context.Context, catalogmodel.ID, time.Time) error {
-	store.operations = append(store.operations, "starting")
+	store.record("starting")
 	return nil
 }
 
@@ -55,41 +69,80 @@ func (store *attemptMemory) AttemptStopRequested(context.Context, catalogmodel.I
 }
 
 func (store *attemptMemory) RecordingStarted(context.Context, catalogmodel.ID, time.Time) (time.Time, error) {
-	store.operations = append(store.operations, "recording")
+	store.record("recording")
 	if store.startEnd.IsZero() {
 		store.startEnd = store.end
 	}
 	return store.startEnd, nil
 }
 
+func (store *attemptMemory) OneSegRecordingStarted(context.Context, catalogmodel.ID, time.Time) error {
+	store.record("one-seg-recording")
+	return nil
+}
+
 func (store *attemptMemory) UpdateRecordingProgress(_ context.Context, _ catalogmodel.ID, count int64, _ time.Time) (time.Time, error) {
+	store.mu.Lock()
 	store.progress = append(store.progress, count)
-	store.operations = append(store.operations, "progress")
 	if store.progressEnd.IsZero() {
 		store.progressEnd = store.end
 	}
-	return store.progressEnd, store.progressErr
+	end, err := store.progressEnd, store.progressErr
+	store.mu.Unlock()
+	store.record("progress")
+	return end, err
+}
+
+func (store *attemptMemory) UpdateOneSegProgress(_ context.Context, _ catalogmodel.ID, count int64,
+	_ time.Time,
+) (time.Time, error) {
+	store.mu.Lock()
+	if store.progressEnd.IsZero() {
+		store.progressEnd = store.end
+	}
+	end, err := store.progressEnd, store.progressErr
+	store.mu.Unlock()
+	store.record("one-seg-progress")
+	return end, err
 }
 
 func (store *attemptMemory) BeginFinalization(_ context.Context, request core.FinalizeRequest) error {
 	store.finalize = request
-	store.operations = append(store.operations, "finalizing")
+	store.record("finalizing")
 	return store.finalizeErr
 }
 
 func (store *attemptMemory) MarkFinalPublished(context.Context, catalogmodel.ID, time.Time) error {
-	store.operations = append(store.operations, "published")
+	store.record("published")
 	return store.publishErr
 }
 
 func (store *attemptMemory) MarkDirectorySynced(context.Context, catalogmodel.ID, time.Time) error {
-	store.operations = append(store.operations, "directory-recorded")
+	store.record("directory-recorded")
 	return store.directoryErr
+}
+
+func (store *attemptMemory) MarkOneSegFinalPublished(context.Context, catalogmodel.ID, time.Time) error {
+	store.record("one-seg-published")
+	return store.publishErr
+}
+
+func (store *attemptMemory) MarkOneSegDirectorySynced(context.Context, catalogmodel.ID, time.Time) error {
+	store.record("one-seg-directory-recorded")
+	return store.directoryErr
+}
+
+func (store *attemptMemory) SetOneSegOutcome(_ context.Context, _ catalogmodel.ID, outcome core.OneSegResult,
+	_ time.Time,
+) error {
+	store.record("one-seg-outcome")
+	store.finalize.OneSeg = &outcome
+	return nil
 }
 
 func (store *attemptMemory) FinishAttempt(_ context.Context, request core.FinishRequest) error {
 	store.finish = request
-	store.operations = append(store.operations, "finished")
+	store.record("finished")
 	return store.finishErr
 }
 
@@ -205,6 +258,317 @@ func TestExecutorPublishesOnlyAfterPlannedEnd(t *testing.T) {
 		t.Fatalf("finish=%+v opens=%d request=%+v cancel=%d close=%d",
 			store.finish, stream.opens, stream.request, lease.cancel, lease.close)
 	}
+}
+
+type lockedClock struct {
+	mu  sync.RWMutex
+	now time.Time
+}
+
+func (clock *lockedClock) Now() time.Time {
+	clock.mu.RLock()
+	defer clock.mu.RUnlock()
+	return clock.now
+}
+
+func (clock *lockedClock) set(value time.Time) {
+	clock.mu.Lock()
+	clock.now = value
+	clock.mu.Unlock()
+}
+
+type concurrentEvents struct {
+	mu     sync.Mutex
+	values []string
+}
+
+func (events *concurrentEvents) add(value string) {
+	events.mu.Lock()
+	events.values = append(events.values, value)
+	events.mu.Unlock()
+}
+
+func (events *concurrentEvents) snapshot() []string {
+	events.mu.Lock()
+	defer events.mu.Unlock()
+	return append([]string(nil), events.values...)
+}
+
+type coordinatedProvider struct {
+	events    *concurrentEvents
+	main      providerstream.Lease
+	oneSeg    providerstream.Lease
+	oneSegErr error
+	mu        sync.Mutex
+	requests  []providerstream.Request
+}
+
+func (stream *coordinatedProvider) OpenStream(_ context.Context,
+	request providerstream.Request,
+) (providerstream.Lease, error) {
+	stream.mu.Lock()
+	stream.requests = append(stream.requests, request)
+	stream.mu.Unlock()
+	stream.events.add("open-" + request.Target.Opaque)
+	if request.Target.Opaque == "1003" {
+		return stream.main, nil
+	}
+	if request.Target.Opaque == "1004" {
+		return stream.oneSeg, stream.oneSegErr
+	}
+	return nil, provider.NewFailure(provider.ReasonNotFound, "test")
+}
+
+type coordinatedLease struct {
+	read   func(context.Context, []byte) (int, providerstream.Terminal, error)
+	cancel atomic.Int32
+	close  atomic.Int32
+}
+
+func (lease *coordinatedLease) Read(ctx context.Context,
+	destination []byte,
+) (int, providerstream.Terminal, error) {
+	return lease.read(ctx, destination)
+}
+
+func (lease *coordinatedLease) Cancel() error { lease.cancel.Add(1); return nil }
+func (lease *coordinatedLease) Close() error  { lease.close.Add(1); return nil }
+
+type concurrentPartial struct {
+	events *concurrentEvents
+	name   string
+}
+
+func (file *concurrentPartial) Write(data []byte) (int, error) {
+	file.events.add("write-" + file.name)
+	return len(data), nil
+}
+
+func (file *concurrentPartial) Sync() error  { file.events.add("sync-" + file.name); return nil }
+func (file *concurrentPartial) Close() error { file.events.add("close-" + file.name); return nil }
+
+func TestExecutorRecordsOneSegAfterMainStartsAndPublishesMainFirst(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	end := start.Add(time.Minute)
+	clock := &lockedClock{now: start}
+	events := &concurrentEvents{}
+	store := &attemptMemory{start: start, end: end, onOperation: events.add}
+	oneSegWritten := make(chan struct{})
+	releaseOneSeg := make(chan struct{})
+	mainLease := &coordinatedLease{read: func(_ context.Context, destination []byte) (int, providerstream.Terminal, error) {
+		<-oneSegWritten
+		copy(destination, bytesOf(0x47, 188))
+		clock.set(end)
+		close(releaseOneSeg)
+		return 188, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
+	}}
+	oneSegLease := &coordinatedLease{read: func(_ context.Context, destination []byte) (int, providerstream.Terminal, error) {
+		copy(destination, bytesOf(0x47, 188))
+		close(oneSegWritten)
+		<-releaseOneSeg
+		return 188, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
+	}}
+	stream := &coordinatedProvider{events: events, main: mainLease, oneSeg: oneSegLease}
+	ids := []catalogmodel.ID{appID(t, 40), appID(t, 41), appID(t, 42), appID(t, 44)}
+	idIndex := 0
+	executor := Executor{
+		Store: store, Stream: stream, Clock: clock, OwnerID: appID(t, 43), Generation: 1,
+		NewID: func() (catalogmodel.ID, error) {
+			if idIndex >= len(ids) {
+				return catalogmodel.ID{}, errors.New("too many ids")
+			}
+			id := ids[idIndex]
+			idIndex++
+			return id, nil
+		},
+		Files: FileOperations{
+			CreatePartial: func(plan core.FilePlan) (PartialFile, error) {
+				name := "main"
+				if strings.Contains(plan.FinalPath, ".oneseg.") {
+					name = "one-seg"
+				}
+				events.add("create-" + name)
+				return &concurrentPartial{events: events, name: name}, nil
+			},
+			LinkFinal: func(plan core.FilePlan) error {
+				events.add("link-" + plan.FinalPath)
+				return nil
+			},
+			SyncDirectory: func(plan core.FilePlan) error {
+				events.add("directory-" + plan.FinalPath)
+				return nil
+			},
+			RemovePartial: func(plan core.FilePlan) error {
+				events.add("remove-" + plan.FinalPath)
+				return nil
+			},
+		},
+		WithDeadline: func(ctx context.Context, _ time.Time) (context.Context, context.CancelFunc) {
+			return context.WithCancel(ctx)
+		},
+		Wait: func(context.Context, time.Duration) error { return nil },
+	}
+	reservation := reservationForExecutor(t, start, time.Minute)
+	reservation.OneSegOutput = &core.OneSegOutput{ProviderServiceLocator: "1004"}
+	result, err := executor.Execute(context.Background(), reservation)
+	if err != nil || result.State != core.AttemptSucceeded || store.finalize.OneSeg == nil ||
+		!store.finalize.OneSeg.Publish || store.finalize.OneSeg.ByteCount != 188 || store.claim.OneSegPlan == nil {
+		t.Fatalf("result=%+v finalize=%+v claim=%+v err=%v", result, store.finalize, store.claim, err)
+	}
+	values := events.snapshot()
+	for _, pair := range [][2]string{
+		{"create-main", "open-1003"}, {"open-1003", "recording"}, {"recording", "create-one-seg"},
+		{"create-one-seg", "open-1004"}, {"directory-recorded", "link-" + store.claim.OneSegPlan.FinalPath},
+		{"one-seg-directory-recorded", "finished"},
+	} {
+		if eventIndex(values, pair[0]) < 0 || eventIndex(values, pair[0]) >= eventIndex(values, pair[1]) {
+			t.Fatalf("order %q < %q events=%v", pair[0], pair[1], values)
+		}
+	}
+	if mainLease.cancel.Load() != 1 || mainLease.close.Load() != 1 ||
+		oneSegLease.cancel.Load() != 1 || oneSegLease.close.Load() != 1 {
+		t.Fatalf("main=%d/%d one_seg=%d/%d", mainLease.cancel.Load(), mainLease.close.Load(),
+			oneSegLease.cancel.Load(), oneSegLease.close.Load())
+	}
+}
+
+func TestExecutorKeepsMainSuccessWhenOneSegOpenFails(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	end := start.Add(time.Minute)
+	clock := &lockedClock{now: start}
+	events := &concurrentEvents{}
+	store := &attemptMemory{start: start, end: end, onOperation: events.add}
+	oneSegOpened := make(chan struct{})
+	mainLease := &coordinatedLease{read: func(_ context.Context, destination []byte) (int, providerstream.Terminal, error) {
+		<-oneSegOpened
+		copy(destination, bytesOf(0x47, 188))
+		clock.set(end)
+		return 188, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
+	}}
+	stream := &coordinatedProvider{
+		events: events, main: mainLease,
+		oneSegErr: provider.NewFailure(provider.ReasonNotFound, "test"),
+	}
+	previous := stream.oneSegErr
+	stream.oneSeg = &coordinatedLease{read: func(context.Context, []byte) (int, providerstream.Terminal, error) {
+		return 0, providerstream.Terminal{}, previous
+	}}
+	originalOpen := stream.OpenStream
+	wrappedStream := providerFunc(func(ctx context.Context, request providerstream.Request) (providerstream.Lease, error) {
+		lease, err := originalOpen(ctx, request)
+		if request.Target.Opaque == "1004" {
+			close(oneSegOpened)
+		}
+		return lease, err
+	})
+	executor := oneSegExecutorForTest(t, store, wrappedStream, clock, events)
+	reservation := reservationForExecutor(t, start, time.Minute)
+	reservation.OneSegOutput = &core.OneSegOutput{ProviderServiceLocator: "1004"}
+	result, err := executor.Execute(context.Background(), reservation)
+	if err != nil || result.State != core.AttemptSucceeded || store.finish.State != core.AttemptSucceeded ||
+		store.finalize.OneSeg == nil || store.finalize.OneSeg.Publish ||
+		store.finalize.OneSeg.Reason != core.ReasonStreamNotFound {
+		t.Fatalf("result=%+v finalize=%+v finish=%+v err=%v", result, store.finalize, store.finish, err)
+	}
+	if eventIndex(events.snapshot(), "one-seg-published") >= 0 {
+		t.Fatalf("ワンセグ失敗後に完成名を公開しました: %v", events.snapshot())
+	}
+}
+
+func TestExecutorJoinsOneSegBeforeFailedMainBecomesTerminal(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	clock := &lockedClock{now: start}
+	events := &concurrentEvents{}
+	store := &attemptMemory{start: start, end: start.Add(time.Minute), onOperation: events.add}
+	oneSegStarted := make(chan struct{})
+	mainLease := &coordinatedLease{read: func(_ context.Context, _ []byte) (int, providerstream.Terminal, error) {
+		<-oneSegStarted
+		return 0, providerstream.Terminal{Done: true, Reason: providerstream.TerminalRejected},
+			provider.NewFailure(provider.ReasonRejected, "test")
+	}}
+	oneSegLease := &coordinatedLease{read: func(ctx context.Context, _ []byte) (int, providerstream.Terminal, error) {
+		close(oneSegStarted)
+		<-ctx.Done()
+		events.add("one-seg-read-stopped")
+		return 0, providerstream.Terminal{Done: true, Reason: providerstream.TerminalCancelled},
+			provider.NewFailure(provider.ReasonCancelled, "test")
+	}}
+	stream := &coordinatedProvider{events: events, main: mainLease, oneSeg: oneSegLease}
+	executor := oneSegExecutorForTest(t, store, stream, clock, events)
+	reservation := reservationForExecutor(t, start, time.Minute)
+	reservation.OneSegOutput = &core.OneSegOutput{ProviderServiceLocator: "1004"}
+	result, err := executor.Execute(context.Background(), reservation)
+	if err != nil || result.State != core.AttemptFailed || result.Reason != core.ReasonStreamUnavailable ||
+		store.finish.OneSeg == nil {
+		t.Fatalf("result=%+v finish=%+v err=%v", result, store.finish, err)
+	}
+	values := events.snapshot()
+	if eventIndex(values, "one-seg-read-stopped") < 0 ||
+		eventIndex(values, "one-seg-read-stopped") >= eventIndex(values, "finished") {
+		t.Fatalf("補助処理の終了前にterminalへ進みました: %v", values)
+	}
+}
+
+type providerFunc func(context.Context, providerstream.Request) (providerstream.Lease, error)
+
+func (open providerFunc) OpenStream(ctx context.Context,
+	request providerstream.Request,
+) (providerstream.Lease, error) {
+	return open(ctx, request)
+}
+
+func oneSegExecutorForTest(t *testing.T, store *attemptMemory, stream providerstream.Provider,
+	clock TimeSource, events *concurrentEvents,
+) Executor {
+	t.Helper()
+	ids := []catalogmodel.ID{appID(t, 60), appID(t, 61), appID(t, 62), appID(t, 63)}
+	index := 0
+	return Executor{
+		Store: store, Stream: stream, Clock: clock, OwnerID: appID(t, 64), Generation: 1,
+		NewID: func() (catalogmodel.ID, error) {
+			if index >= len(ids) {
+				return catalogmodel.ID{}, errors.New("too many ids")
+			}
+			id := ids[index]
+			index++
+			return id, nil
+		},
+		Files: FileOperations{
+			CreatePartial: func(plan core.FilePlan) (PartialFile, error) {
+				name := "main"
+				if strings.Contains(plan.FinalPath, ".oneseg.") {
+					name = "one-seg"
+				}
+				events.add("create-" + name)
+				return &concurrentPartial{events: events, name: name}, nil
+			},
+			LinkFinal: func(plan core.FilePlan) error {
+				events.add("link-" + plan.FinalPath)
+				return nil
+			},
+			SyncDirectory: func(plan core.FilePlan) error {
+				events.add("directory-" + plan.FinalPath)
+				return nil
+			},
+			RemovePartial: func(plan core.FilePlan) error {
+				events.add("remove-" + plan.FinalPath)
+				return nil
+			},
+		},
+		WithDeadline: func(ctx context.Context, _ time.Time) (context.Context, context.CancelFunc) {
+			return context.WithCancel(ctx)
+		},
+		Wait: func(context.Context, time.Duration) error { return nil },
+	}
+}
+
+func eventIndex(values []string, target string) int {
+	for index, value := range values {
+		if value == target {
+			return index
+		}
+	}
+	return -1
 }
 
 func TestExecutorFailsMalformedSelectedStreamWithoutReconnect(t *testing.T) {
