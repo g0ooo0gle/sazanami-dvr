@@ -38,6 +38,17 @@ func TestRoutesMethodsAndSecurityHeaders(t *testing.T) {
 	}
 }
 
+func TestRequestTimeout(t *testing.T) {
+	if got := requestTimeout("/operations/backup"); got != time.Hour {
+		t.Fatalf("backup timeout=%s", got)
+	}
+	for _, path := range []string{"/", "/settings", "/epg", "/operations", "/unknown"} {
+		if got := requestTimeout(path); got != 10*time.Second {
+			t.Fatalf("path=%s timeout=%s", path, got)
+		}
+	}
+}
+
 func TestHostMustBeNumericLoopback(t *testing.T) {
 	handler := newTestHandler(t, &fakeApplication{})
 	accepted := []string{"127.0.0.1", "127.0.0.1:40772", "[::1]:40772"}
