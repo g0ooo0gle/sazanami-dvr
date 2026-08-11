@@ -144,6 +144,10 @@ KonomiTVの録画後設定で、待機、待機からの復帰後再起動、休
 - 所有者だけが読み書きできる録画保存先
 - 録画後の電源動作を使う場合はsystemd。次の予約がある場合は`rtcwake`も必要
 
+## Linuxへの導入と更新
+
+GitHub ReleaseのLinux配布物にはsystemdの設定例を同梱しています。初回導入、更新、旧版への切り戻し、データを残す通常削除は、[Linuxへ導入し、安全に更新・削除する](docs/linux-installation.md)を参照してください。
+
 ## ビルド
 
 ```console
