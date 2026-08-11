@@ -320,6 +320,7 @@ func TestValidateListenAddressAllowsOnlyExplicitLocalIP(t *testing.T) {
 type fakeHistory struct {
 	items []recording.HistoryItem
 	err   error
+	calls atomic.Int32
 }
 
 type fakeLogoCatalog struct {
@@ -369,6 +370,7 @@ func (history *fakeHistory) RecordingHistory(_ context.Context, limit int, befor
 	return result, nil
 }
 func (history *fakeHistory) RecordingHistoryItem(_ context.Context, id int32) (*recording.HistoryItem, error) {
+	history.calls.Add(1)
 	if history.err != nil {
 		return nil, history.err
 	}

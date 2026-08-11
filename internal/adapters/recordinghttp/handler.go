@@ -109,6 +109,8 @@ func (handler *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 		handler.detail(writer, request)
 	case request.URL.Path == "/komorebi/resolver.lua":
 		handler.resolver(writer, request)
+	case request.URL.Path == "/api/xcode":
+		handler.xcode(writer, request)
 	case request.URL.Path == "/legacy/logo.lua":
 		handler.logo(writer, request)
 	case strings.HasPrefix(request.URL.Path, "/recordings/"):
@@ -226,9 +228,16 @@ func (handler *Handler) resolver(writer http.ResponseWriter, request *http.Reque
 	if !readMethod(writer, request) {
 		return
 	}
-	values := request.URL.Query()
-	if len(values) == 0 {
-		writeJSON(writer, request, map[string]any{"ctok": map[string]string{"xcode": "", "view": ""}, "option": []any{}})
+	if request.URL.RawQuery == "" {
+		writeJSONWithLength(writer, request, map[string]any{
+			"ctok":   map[string]string{"xcode": "", "view": ""},
+			"option": []map[string]string{{"id": "10", "name": "オリジナル（変換なし）"}},
+		})
+		return
+	}
+	values, err := url.ParseQuery(request.URL.RawQuery)
+	if err != nil {
+		writeError(writer, http.StatusNotFound, "not-found")
 		return
 	}
 	id, ok := oneID(values)
@@ -247,6 +256,22 @@ func (handler *Handler) resolver(writer http.ResponseWriter, request *http.Reque
 	})
 }
 
+// xcodeは固定Komorebiが送る仮想pathまたは録画番号を検証し、原画質の完成録画だけを返す。
+func (handler *Handler) xcode(writer http.ResponseWriter, request *http.Request) {
+	if !readMethod(writer, request) {
+		return
+	}
+	id, reason := parseXcodeQuery(request.URL.RawQuery)
+	if reason != "" {
+		writeError(writer, http.StatusBadRequest, reason)
+		return
+	}
+	if !singleRange(writer, request) {
+		return
+	}
+	handler.serveFinalRecording(writer, request, id)
+}
+
 func (handler *Handler) stream(writer http.ResponseWriter, request *http.Request) {
 	if !readMethod(writer, request) {
 		return
@@ -255,8 +280,7 @@ func (handler *Handler) stream(writer http.ResponseWriter, request *http.Request
 		writeError(writer, http.StatusBadRequest, "invalid-query")
 		return
 	}
-	if strings.Contains(request.Header.Get("Range"), ",") {
-		writeError(writer, http.StatusRequestedRangeNotSatisfiable, "multiple-ranges-unsupported")
+	if !singleRange(writer, request) {
 		return
 	}
 	id, ok := pathID(request.URL.Path, "/recordings/", ".ts")
@@ -264,6 +288,11 @@ func (handler *Handler) stream(writer http.ResponseWriter, request *http.Request
 		writeError(writer, http.StatusNotFound, "not-found")
 		return
 	}
+	handler.serveFinalRecording(writer, request, id)
+}
+
+// serveFinalRecordingは検証済み録画番号を、二つのURLで共有する完成条件と配信枠から読み出す。
+func (handler *Handler) serveFinalRecording(writer http.ResponseWriter, request *http.Request, id int32) {
 	select {
 	case handler.streams <- struct{}{}:
 		defer func() { <-handler.streams }()
@@ -287,7 +316,7 @@ func (handler *Handler) stream(writer http.ResponseWriter, request *http.Request
 	}
 	defer file.Close()
 	writer.Header().Set("Content-Type", "video/mp2t")
-	http.ServeContent(writer, request, "recording.ts", file.ModTime(), file)
+	http.ServeContent(writer, request, "recording.ts", file.ModTime(), contextReadSeeker{Context: request.Context(), ReadSeeker: file})
 }
 
 func (handler *Handler) thumbnail(writer http.ResponseWriter, request *http.Request) {
@@ -456,6 +485,106 @@ func pathID(path, prefix, suffix string) (int32, bool) {
 	return int32(value), err == nil && value > 0
 }
 
+// parseXcodeQueryは標準URL decode後の仮想pathと互換値を厳密に検証し、host pathを組み立てない。
+func parseXcodeQuery(raw string) (int32, string) {
+	if raw == "" {
+		return 0, "invalid-query"
+	}
+	for _, field := range strings.Split(raw, "&") {
+		if field == "" || strings.HasPrefix(field, "=") {
+			return 0, "invalid-query"
+		}
+	}
+	values, err := url.ParseQuery(raw)
+	if err != nil {
+		return 0, "invalid-query"
+	}
+	for key := range values {
+		switch key {
+		case "fname", "id", "option", "ctok", "ofssec":
+		default:
+			return 0, "invalid-query"
+		}
+	}
+
+	fname, hasFName := values["fname"]
+	rawID, hasID := values["id"]
+	if hasFName == hasID || (hasFName && len(fname) != 1) || (hasID && len(rawID) != 1) {
+		return 0, "invalid-query"
+	}
+	var id int32
+	var ok bool
+	if hasFName {
+		id, ok = xcodeFileID(fname[0])
+	} else {
+		id, ok = canonicalRecordingID(rawID[0])
+	}
+	if !ok {
+		return 0, "invalid-query"
+	}
+
+	option := values["option"]
+	if len(option) != 1 || option[0] != "10" {
+		return 0, "unsupported-option"
+	}
+	if token, exists := values["ctok"]; exists && (len(token) != 1 || token[0] != "") {
+		return 0, "invalid-token"
+	}
+	if offset, exists := values["ofssec"]; exists && (len(offset) != 1 || !validXcodeOffset(offset[0])) {
+		return 0, "invalid-offset"
+	}
+	return id, ""
+}
+
+// xcodeFileIDは公開した仮想pathだけから録画番号を取り出す。
+func xcodeFileID(value string) (int32, bool) {
+	const prefix, suffix = "recordings/", ".ts"
+	if !strings.HasPrefix(value, prefix) || !strings.HasSuffix(value, suffix) {
+		return 0, false
+	}
+	raw := strings.TrimSuffix(strings.TrimPrefix(value, prefix), suffix)
+	if raw == "" || strings.Contains(raw, "/") {
+		return 0, false
+	}
+	return canonicalRecordingID(raw)
+}
+
+// canonicalRecordingIDは表記揺れのない正の32 bit録画番号だけを受ける。
+func canonicalRecordingID(raw string) (int32, bool) {
+	value, err := strconv.ParseInt(raw, 10, 32)
+	return int32(value), err == nil && value > 0 && strconv.FormatInt(value, 10) == raw
+}
+
+// validXcodeOffsetは固定クライアントが送る再生秒を検証する。配信位置には使わない。
+func validXcodeOffset(raw string) bool {
+	value, err := strconv.ParseUint(raw, 10, 32)
+	return err == nil && value <= 86_400 && strconv.FormatUint(value, 10) == raw
+}
+
+// singleRangeは二つの録画URLで同じ複数Range拒否を使う。
+func singleRange(writer http.ResponseWriter, request *http.Request) bool {
+	ranges := request.Header.Values("Range")
+	if len(ranges) > 1 || (len(ranges) == 1 && strings.Contains(ranges[0], ",")) {
+		writeError(writer, http.StatusRequestedRangeNotSatisfiable, "multiple-ranges-unsupported")
+		return false
+	}
+	return true
+}
+
+// contextReadSeekerは途中で取り消された要求の次のfile読出しを止める。
+type contextReadSeeker struct {
+	context.Context
+	io.ReadSeeker
+}
+
+// Readは要求の取消しを確認してから完成fileを読む。
+func (reader contextReadSeeker) Read(data []byte) (int, error) {
+	if err := reader.Context.Err(); err != nil {
+		return 0, err
+	}
+	return reader.ReadSeeker.Read(data)
+}
+
 func readMethod(writer http.ResponseWriter, request *http.Request) bool {
 	if request.Method == http.MethodGet || request.Method == http.MethodHead {
 		return true
@@ -474,6 +603,21 @@ func writeJSON(writer http.ResponseWriter, request *http.Request, value any) {
 	encoder.SetEscapeHTML(true)
 	if err := encoder.Encode(value); err != nil {
 		return
+	}
+}
+
+// writeJSONWithLengthはresolver設定のGETとHEADへ同じ長さを明示する。
+func writeJSONWithLength(writer http.ResponseWriter, request *http.Request, value any) {
+	data, err := json.Marshal(value)
+	if err != nil {
+		writeError(writer, http.StatusServiceUnavailable, "service-unavailable")
+		return
+	}
+	data = append(data, '\n')
+	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+	writer.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	if request.Method != http.MethodHead {
+		_, _ = writer.Write(data)
 	}
 }
 
