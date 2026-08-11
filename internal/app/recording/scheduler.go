@@ -257,6 +257,9 @@ func (scheduler *Scheduler) Run(ctx context.Context) error {
 		plannedEnd := reservation.PlannedEnd()
 		if now.Sub(wakeAt) > lateStartLimit || plannedEnd.Sub(now) < minimumRunTime {
 			if _, err := scheduler.executor.Miss(ctx, *reservation, core.ReasonLateStartExpired); err != nil {
+				if errors.Is(err, core.ErrReservationUnavailable) {
+					continue
+				}
 				return scheduler.stopExecutions(cancelExecutions, completed, active, err)
 			}
 			continue
@@ -271,6 +274,9 @@ func (scheduler *Scheduler) Run(ctx context.Context) error {
 				pendingPower.add(completion.result.PostRecording)
 			default:
 				if _, err := scheduler.executor.Miss(ctx, *reservation, core.ReasonRecordingSlotUnavailable); err != nil {
+					if errors.Is(err, core.ErrReservationUnavailable) {
+						continue
+					}
 					return scheduler.stopExecutions(cancelExecutions, completed, active, err)
 				}
 				continue

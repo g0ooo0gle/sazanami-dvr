@@ -260,6 +260,57 @@ func TestSchedulerReloadsReservationAfterClaimConflict(t *testing.T) {
 	}
 }
 
+func TestSchedulerReloadsLateReservationAfterMissConflict(t *testing.T) {
+	now := time.Date(2026, 8, 12, 2, 0, 0, 0, time.UTC)
+	old := reservationForExecutor(t, now.Add(-10*time.Minute), 20*time.Minute)
+	old.Version = 1
+	current := old
+	current.Version = 2
+	store := &queueStore{items: []core.Reservation{old}, queried: make(chan struct{}, 4)}
+	misses := 0
+	versions := make([]int64, 0, 2)
+	executor := &concurrentSchedulerExecutor{}
+	executor.onMiss = func(reservation core.Reservation, reason core.TerminalReason) error {
+		misses++
+		versions = append(versions, reservation.Version)
+		if reason != core.ReasonLateStartExpired {
+			return errors.New("unexpected late miss reason")
+		}
+		if misses == 1 {
+			store.mu.Lock()
+			store.items = append(store.items, current)
+			store.mu.Unlock()
+			return core.ErrReservationUnavailable
+		}
+		return nil
+	}
+	scheduler, err := NewScheduler(store, executor, &manualScheduleClock{now: now}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+	for range 3 {
+		select {
+		case <-store.queried:
+		case <-time.After(time.Second):
+			cancel()
+			t.Fatal("変更後の遅延予約が再確認されませんでした")
+		}
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	if misses != 2 || len(versions) != 2 || versions[0] != old.Version || versions[1] != current.Version ||
+		len(executor.missed) != 1 || executor.missed[0] != core.ReasonLateStartExpired {
+		t.Fatalf("misses=%d versions=%v results=%v", misses, versions, executor.missed)
+	}
+}
+
 func TestSchedulerUsesPlannedEndForMinimumRemainingTime(t *testing.T) {
 	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
 	reservation := reservationForExecutor(t, start, 4*time.Minute)
@@ -460,6 +511,7 @@ type concurrentSchedulerExecutor struct {
 	started   chan core.Reservation
 	release   chan struct{}
 	onClaim   func(core.Reservation)
+	onMiss    func(core.Reservation, core.TerminalReason) error
 	failAfter <-chan struct{}
 	failID    core.Reservation
 	cancelled int
@@ -516,7 +568,12 @@ func (executor *concurrentSchedulerExecutor) finishConcurrent(cancelled bool) {
 	executor.mu.Unlock()
 }
 
-func (executor *concurrentSchedulerExecutor) Miss(_ context.Context, _ core.Reservation, reason core.TerminalReason) (Result, error) {
+func (executor *concurrentSchedulerExecutor) Miss(_ context.Context, reservation core.Reservation, reason core.TerminalReason) (Result, error) {
+	if executor.onMiss != nil {
+		if err := executor.onMiss(reservation, reason); err != nil {
+			return Result{}, err
+		}
+	}
 	executor.mu.Lock()
 	executor.missed = append(executor.missed, reason)
 	executor.mu.Unlock()
@@ -568,6 +625,63 @@ func TestSchedulerRunsTwoRecordingsAndMissesOneOverLimit(t *testing.T) {
 	if executor.claimed != 2 || executor.maximum != 2 || executor.running != 0 ||
 		len(executor.missed) != 1 || executor.missed[0] != core.ReasonRecordingSlotUnavailable {
 		t.Fatalf("claimed=%d maximum=%d running=%d missed=%v", executor.claimed, executor.maximum, executor.running, executor.missed)
+	}
+}
+
+func TestSchedulerReloadsReservationAfterSlotMissConflict(t *testing.T) {
+	start := time.Date(2026, 8, 12, 3, 0, 0, 0, time.UTC)
+	first := reservationForExecutor(t, start, 10*time.Minute)
+	old := reservationForExecutor(t, start, 10*time.Minute)
+	old.ID = appID(t, 81)
+	old.Version = 1
+	current := old
+	current.Version = 2
+	store := &queueStore{items: []core.Reservation{first, old}, queried: make(chan struct{}, 8)}
+	misses := 0
+	versions := make([]int64, 0, 2)
+	executor := &concurrentSchedulerExecutor{
+		started: make(chan core.Reservation, 1), release: make(chan struct{}),
+	}
+	executor.onMiss = func(reservation core.Reservation, reason core.TerminalReason) error {
+		misses++
+		versions = append(versions, reservation.Version)
+		if reason != core.ReasonRecordingSlotUnavailable {
+			return errors.New("unexpected slot miss reason")
+		}
+		if misses == 1 {
+			store.mu.Lock()
+			store.items = append(store.items, current)
+			store.mu.Unlock()
+			return core.ErrReservationUnavailable
+		}
+		return nil
+	}
+	scheduler, err := NewScheduler(store, executor, &manualScheduleClock{now: start}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+	waitSchedulerStart(t, executor.started)
+	for range 4 {
+		select {
+		case <-store.queried:
+		case <-time.After(time.Second):
+			cancel()
+			t.Fatal("変更後の枠不足予約が再確認されませんでした")
+		}
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	if misses != 2 || len(versions) != 2 || versions[0] != old.Version || versions[1] != current.Version ||
+		len(executor.missed) != 1 ||
+		executor.missed[0] != core.ReasonRecordingSlotUnavailable || executor.cancelled != 1 {
+		t.Fatalf("misses=%d versions=%v results=%v cancelled=%d", misses, versions, executor.missed, executor.cancelled)
 	}
 }
 
