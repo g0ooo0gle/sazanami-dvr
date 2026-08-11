@@ -32,6 +32,8 @@ func (store *Store) CreateReservation(ctx context.Context, reservation recording
 	if store == nil || store.writer == nil || ctx == nil || reservation.ValidateNew() != nil {
 		return recording.Reservation{}, errors.New("sqlite: invalid reservation")
 	}
+	store.reservationPower.Lock()
+	defer store.reservationPower.Unlock()
 	tx, err := store.writer.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
 		return recording.Reservation{}, sanitize("begin-reservation", err)
@@ -175,6 +177,8 @@ func (store *Store) ApplyReservationFollow(ctx context.Context, request recordin
 	if store == nil || store.writer == nil || ctx == nil || request.Validate() != nil {
 		return false, errors.New("sqlite: invalid reservation follow")
 	}
+	store.reservationPower.Lock()
+	defer store.reservationPower.Unlock()
 	tx, err := store.writer.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
 		return false, sanitize("begin-reservation-follow", err)
@@ -309,6 +313,8 @@ func (store *Store) UpdateReservation(ctx context.Context, change recording.Rese
 		now.Location() != time.UTC || now.UnixMilli() < 0 {
 		return errors.New("sqlite: invalid reservation update")
 	}
+	store.reservationPower.Lock()
+	defer store.reservationPower.Unlock()
 	request := change.Request
 	margins := recording.Reservation{Margins: request.Margins}.EffectiveMargins()
 	postAction, postPower := encodePostRecordingModes(request.PostRecording.Mode)
@@ -365,6 +371,8 @@ func (store *Store) StopReservation(ctx context.Context, number int32, now time.
 		now.Location() != time.UTC || now.UnixMilli() < 0 {
 		return recording.StopResult{}, errors.New("sqlite: invalid reservation stop")
 	}
+	store.reservationPower.Lock()
+	defer store.reservationPower.Unlock()
 	tx, err := store.writer.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
 		return recording.StopResult{}, sanitize("begin-reservation-stop", err)
@@ -434,6 +442,8 @@ func (store *Store) CancelReservation(ctx context.Context, number int32, now tim
 		now.Location() != time.UTC || now.UnixMilli() < 0 {
 		return errors.New("sqlite: invalid reservation cancellation")
 	}
+	store.reservationPower.Lock()
+	defer store.reservationPower.Unlock()
 	nowMS := now.UnixMilli()
 	result, err := store.writer.ExecContext(ctx, `UPDATE reservations SET state='FINISHED', version=version+1,
 		updated_at_utc_ms=?, finished_at_utc_ms=?, terminal_reason='CANCELLED_BY_USER' WHERE id=(

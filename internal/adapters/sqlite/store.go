@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync"
 
 	sqlitedriver "github.com/ncruces/go-sqlite3/driver"
 )
@@ -16,10 +17,21 @@ const databaseFilename = "catalog.sqlite3"
 
 // Storeは用途を分離したwriter／reader poolを所有するSQLite adapterである。
 type Store struct {
-	writer    *sql.DB
-	reader    *sql.DB
-	root      string
-	ownerLock *os.File
+	writer           *sql.DB
+	reader           *sql.DB
+	root             string
+	ownerLock        *os.File
+	reservationPower sync.Mutex
+}
+
+// LockPostRecordingPowerDecisionは次予約の最終確認から電源動作開始まで、予約変更を待たせる。
+func (store *Store) LockPostRecordingPowerDecision() {
+	store.reservationPower.Lock()
+}
+
+// UnlockPostRecordingPowerDecisionは待機中の予約変更を再開する。
+func (store *Store) UnlockPostRecordingPowerDecision() {
+	store.reservationPower.Unlock()
 }
 
 func openWriter(ctx context.Context, dataRoot string) (*sql.DB, error) {

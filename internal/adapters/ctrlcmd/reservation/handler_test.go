@@ -334,6 +334,19 @@ func TestReservationPostRecordingSettingsRoundTrip(t *testing.T) {
 }
 
 func TestPostRecordingWireModeMatrixAndPathBoundaries(t *testing.T) {
+	type wireMode struct {
+		suspend uint8
+		reboot  bool
+	}
+	accepted := map[wireMode]recording.PostRecordingMode{
+		{0, false}: recording.PostRecordingDefault,
+		{4, false}: recording.PostRecordingNothing,
+		{1, false}: recording.PostRecordingStandby,
+		{1, true}:  recording.PostRecordingStandbyReboot,
+		{2, false}: recording.PostRecordingSuspend,
+		{2, true}:  recording.PostRecordingSuspendReboot,
+		{3, false}: recording.PostRecordingShutdown,
+	}
 	for rawSuspend := 0; rawSuspend <= 255; rawSuspend++ {
 		suspend := uint8(rawSuspend)
 		for _, reboot := range []bool{false, true} {
@@ -342,7 +355,7 @@ func TestPostRecordingWireModeMatrixAndPathBoundaries(t *testing.T) {
 			writeInputSettingsWire(t, writer, 1, 3, true, 0, 0, 0, 0, recording.OutputSettings{}, "", suspend, reboot)
 			reader, _ := codec.NewReader(body.Bytes(), codec.DefaultLimits())
 			settings, err := decodeSettings(reader)
-			wantMode, wantOK := decodePostRecordingMode(suspend, reboot)
+			wantMode, wantOK := accepted[wireMode{suspend, reboot}]
 			if wantOK && (err != nil || reader.Exact() != nil || settings.postRecording.Mode != wantMode) {
 				t.Fatalf("suspend=%d reboot=%v settings=%+v err=%v", suspend, reboot, settings, err)
 			}

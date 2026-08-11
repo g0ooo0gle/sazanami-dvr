@@ -10,7 +10,13 @@ import (
 	core "github.com/g0ooo0gle/sazanami-dvr/internal/core/recording"
 )
 
+type noOpPostPowerDecision struct{}
+
+func (noOpPostPowerDecision) LockPostRecordingPowerDecision()   {}
+func (noOpPostPowerDecision) UnlockPostRecordingPowerDecision() {}
+
 type queueStore struct {
+	noOpPostPowerDecision
 	mu      sync.Mutex
 	items   []core.Reservation
 	queries int
@@ -106,6 +112,7 @@ func (timer *manualTimer) C() <-chan time.Time { return timer.channel }
 func (timer *manualTimer) Stop() bool          { return true }
 
 type disabledDeadlineStore struct {
+	noOpPostPowerDecision
 	deadline time.Time
 	expired  bool
 	calls    chan struct{}
@@ -292,6 +299,7 @@ func TestSchedulerWaitsForNotificationWithoutPolling(t *testing.T) {
 }
 
 type schedulerErrorStore struct {
+	noOpPostPowerDecision
 	err    error
 	before func()
 }
@@ -338,6 +346,7 @@ func TestSchedulerKeepsDatabaseFailureWhileRunning(t *testing.T) {
 }
 
 type futureStore struct {
+	noOpPostPowerDecision
 	item    core.Reservation
 	queries int
 }
@@ -562,6 +571,7 @@ func TestSchedulerReusesCompletedSlotAfterNotification(t *testing.T) {
 }
 
 type pendingScheduleStore struct {
+	noOpPostPowerDecision
 	mu    sync.Mutex
 	items []core.Reservation
 }
@@ -876,6 +886,113 @@ func TestSchedulerWaitsForAllEightRecordingsBeforePowerAction(t *testing.T) {
 	}
 	if controller.calls != 1 || controller.mode != core.PostRecordingStandby {
 		t.Fatalf("controller=%+v", controller)
+	}
+}
+
+type postPowerDecisionRaceStore struct {
+	decision    sync.Mutex
+	state       sync.Mutex
+	queries     int
+	first       core.Reservation
+	next        *core.Reservation
+	idleRead    chan struct{}
+	staleRead   chan struct{}
+	releaseRead chan struct{}
+}
+
+func (*postPowerDecisionRaceStore) ExpireOneDisabledReservation(context.Context, time.Time) (bool, error) {
+	return false, nil
+}
+
+func (*postPowerDecisionRaceStore) NextDisabledReservationDeadline(context.Context, time.Time) (*time.Time, error) {
+	return nil, nil
+}
+
+func (store *postPowerDecisionRaceStore) NextActiveReservation(context.Context, time.Time) (*core.Reservation, error) {
+	store.state.Lock()
+	store.queries++
+	query := store.queries
+	var next *core.Reservation
+	if query == 1 {
+		copied := store.first
+		next = &copied
+	} else if store.next != nil {
+		copied := *store.next
+		next = &copied
+	}
+	store.state.Unlock()
+	switch query {
+	case 2:
+		close(store.idleRead)
+	case 3:
+		close(store.staleRead)
+		<-store.releaseRead
+	}
+	return next, nil
+}
+
+func (store *postPowerDecisionRaceStore) LockPostRecordingPowerDecision() {
+	store.decision.Lock()
+}
+
+func (store *postPowerDecisionRaceStore) UnlockPostRecordingPowerDecision() {
+	store.decision.Unlock()
+}
+
+func (store *postPowerDecisionRaceStore) add(reservation core.Reservation) {
+	store.LockPostRecordingPowerDecision()
+	defer store.UnlockPostRecordingPowerDecision()
+	store.state.Lock()
+	defer store.state.Unlock()
+	store.next = &reservation
+}
+
+func TestSchedulerRechecksReservationAfterPowerDecisionRace(t *testing.T) {
+	now := time.Date(2026, 8, 10, 3, 0, 0, 0, time.UTC)
+	first := reservationForExecutor(t, now, 10*time.Minute)
+	first.PostRecording.Mode = core.PostRecordingStandby
+	store := &postPowerDecisionRaceStore{
+		first: first, idleRead: make(chan struct{}), staleRead: make(chan struct{}), releaseRead: make(chan struct{}),
+	}
+	executor := &concurrentSchedulerExecutor{started: make(chan core.Reservation, 1), release: make(chan struct{}, 1)}
+	scheduler, err := NewScheduler(store, executor, &manualScheduleClock{now: now}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := &postPowerRecorder{called: make(chan struct{}, 1)}
+	reasons := make(chan string, 1)
+	if err := scheduler.SetPostRecordingPower(controller, func(reason string) { reasons <- reason }); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+	waitSchedulerStart(t, executor.started)
+	<-store.idleRead
+	executor.release <- struct{}{}
+	<-store.staleRead
+	store.add(reservationForExecutor(t, now.Add(5*time.Minute), 10*time.Minute))
+	scheduler.Notify()
+	close(store.releaseRead)
+	select {
+	case reason := <-reasons:
+		if reason != "post-recording-power-too-late" {
+			cancel()
+			t.Fatalf("reason=%s", reason)
+		}
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("追加予約を使った電源判断が行われませんでした")
+	}
+	select {
+	case <-controller.called:
+		cancel()
+		t.Fatal("直前に追加した予約を見落として電源動作が実行されました")
+	default:
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }
 
