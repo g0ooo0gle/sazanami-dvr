@@ -1,4 +1,4 @@
-// Package recordinghttpは録画履歴と完成録画を読み取り専用HTTPで公開する。
+// Package recordinghttpは録画履歴、完成録画、Komorebi向けHTTPを公開する。
 package recordinghttp
 
 import (
@@ -56,7 +56,8 @@ type LogoProvider interface {
 	Logo(context.Context, provider.TuningTarget) ([]byte, error)
 }
 
-// HandlerはNative REST、Komorebi resolver、完成録画配信を固定pathへ振り分ける。
+// Handlerは録画用REST API、Komorebi用API、完成録画とHLS配信を固定パスへ振り分ける。
+// HLSを有効にした場合も、放送選択だけではMirakurunへ接続しない。
 type Handler struct {
 	history     History
 	files       Files
@@ -81,7 +82,7 @@ func NewHandlerWithLogos(history History, files Files, catalog LogoCatalog, logo
 }
 
 // NewHandlerWithLiveは録画配信と局ロゴに、Komorebi向け原画質HLSを加える。
-// cacheはdata root内だけを使い、Provider streamはPOST /api/viewまで開かない。
+// キャッシュはデータ保存先内だけを使い、放送ストリームはPOST /api/viewまで開かない。
 func NewHandlerWithLive(serviceContext context.Context, dataRoot string, history History, files Files,
 	catalog LogoCatalog, logos LogoProvider, live LiveOperations,
 ) (*Handler, error) {
@@ -157,7 +158,7 @@ func (handler *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 	}
 }
 
-// CloseはHLSのworker、timer、cacheを閉じ、すべての終了を待つ。
+// CloseはHLSの配信処理、タイマー、キャッシュを閉じ、すべての終了を待つ。
 // HTTP serverを先に停止して、新しい要求が入らない状態で呼ぶ。
 func (handler *Handler) Close() error {
 	if handler == nil || handler.hls == nil {
