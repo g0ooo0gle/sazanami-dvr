@@ -64,6 +64,7 @@ type Handler struct {
 	placeholder []byte
 	logoCatalog LogoCatalog
 	logos       LogoProvider
+	hls         *hlsSessionController
 }
 
 // NewHandlerは必須依存と同時配信上限を固定し、socketを作らずにhandlerを返す。
@@ -77,6 +78,30 @@ func NewHandlerWithLogos(history History, files Files, catalog LogoCatalog, logo
 		return nil, errors.New("recordinghttp: missing logo dependency")
 	}
 	return newHandler(history, files, catalog, logos)
+}
+
+// NewHandlerWithLiveは録画配信と局ロゴに、Komorebi向け原画質HLSを加える。
+// cacheはdata root内だけを使い、Provider streamはPOST /api/viewまで開かない。
+func NewHandlerWithLive(serviceContext context.Context, dataRoot string, history History, files Files,
+	catalog LogoCatalog, logos LogoProvider, live LiveOperations,
+) (*Handler, error) {
+	if serviceContext == nil || catalog == nil || logos == nil || live == nil {
+		return nil, errors.New("recordinghttp: missing live dependency")
+	}
+	handler, err := newHandler(history, files, catalog, logos)
+	if err != nil {
+		return nil, err
+	}
+	cache, err := openHLSCache(dataRoot, defaultHLSCacheLimits())
+	if err != nil {
+		return nil, errors.New("recordinghttp: hls cache unavailable")
+	}
+	handler.hls, err = newHLSSessionController(serviceContext, live, cache)
+	if err != nil {
+		_ = cache.close()
+		return nil, err
+	}
+	return handler, nil
 }
 
 func newHandler(history History, files Files, catalog LogoCatalog, logos LogoProvider) (*Handler, error) {
@@ -103,6 +128,12 @@ func (handler *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 		return
 	}
 	switch {
+	case handler.hls != nil && request.URL.Path == "/api/TvCast":
+		handler.tvCast(writer, request)
+	case handler.hls != nil && request.URL.Path == "/api/view":
+		handler.view(writer, request)
+	case handler.hls != nil && strings.HasPrefix(request.URL.Path, "/komorebi/live/"):
+		handler.liveSegment(writer, request)
 	case request.URL.Path == "/api/recordings":
 		handler.list(writer, request)
 	case strings.HasPrefix(request.URL.Path, "/api/recordings/"):
@@ -124,6 +155,81 @@ func (handler *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 	default:
 		writeError(writer, http.StatusNotFound, "not-found")
 	}
+}
+
+// CloseはHLSのworker、timer、cacheを閉じ、すべての終了を待つ。
+// HTTP serverを先に停止して、新しい要求が入らない状態で呼ぶ。
+func (handler *Handler) Close() error {
+	if handler == nil || handler.hls == nil {
+		return nil
+	}
+	return handler.hls.close()
+}
+
+func (handler *Handler) tvCast(writer http.ResponseWriter, request *http.Request) {
+	selection, rejection := parseHLSTvCastRequest(request)
+	if rejection == nil {
+		rejection = handler.hls.selectLive(request.Context(), selection)
+	}
+	if rejection != nil {
+		writeHLSRejection(writer, rejection)
+		return
+	}
+	const response = `{"result":true}`
+	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+	writer.Header().Set("Content-Length", strconv.Itoa(len(response)))
+	_, _ = io.WriteString(writer, response)
+}
+
+func (handler *Handler) view(writer http.ResponseWriter, request *http.Request) {
+	view, rejection := parseHLSViewRequest(request)
+	if rejection != nil {
+		writeHLSRejection(writer, rejection)
+		return
+	}
+	if view.operation == hlsViewStart {
+		if rejection = handler.hls.startLive(view); rejection != nil {
+			writeHLSRejection(writer, rejection)
+			return
+		}
+		writer.WriteHeader(http.StatusNoContent)
+		return
+	}
+	playlist, rejection := handler.hls.playlistBytes(request.Context(), view)
+	if rejection != nil {
+		writeHLSRejection(writer, rejection)
+		return
+	}
+	writer.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	writer.Header().Set("Content-Length", strconv.Itoa(len(playlist)))
+	_, _ = writer.Write(playlist)
+}
+
+func (handler *Handler) liveSegment(writer http.ResponseWriter, request *http.Request) {
+	segment, rejection := parseHLSSegmentRequest(request)
+	if rejection != nil {
+		writeHLSRejection(writer, rejection)
+		return
+	}
+	if !singleRange(writer, request) {
+		return
+	}
+	file, rejection := handler.hls.openSegment(segment)
+	if rejection != nil {
+		writeHLSRejection(writer, rejection)
+		return
+	}
+	defer file.Close()
+	writer.Header().Set("Content-Type", "video/mp2t")
+	http.ServeContent(writer, request, "segment.ts", file.ModTime(),
+		contextReadSeeker{Context: request.Context(), ReadSeeker: file})
+}
+
+func writeHLSRejection(writer http.ResponseWriter, rejection *hlsHTTPRejection) {
+	if rejection.allow != "" {
+		writer.Header().Set("Allow", rejection.allow)
+	}
+	writeError(writer, rejection.status, rejection.reason)
 }
 
 func (handler *Handler) logo(writer http.ResponseWriter, request *http.Request) {
