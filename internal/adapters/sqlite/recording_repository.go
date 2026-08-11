@@ -19,7 +19,7 @@ var (
 	// ErrAttemptExistsは対象予約が既に録画処理へ割り当て済みであることを表す。
 	ErrAttemptExists = errors.New("sqlite: recording attempt already exists")
 	// ErrReservationUnavailableは対象予約が存在しないか、既に終了していることを表す。
-	ErrReservationUnavailable = errors.New("sqlite: reservation is not available")
+	ErrReservationUnavailable = recording.ErrReservationUnavailable
 	// ErrAttemptStateは録画処理を要求された状態へ進められないことを表す。
 	ErrAttemptState = errors.New("sqlite: recording attempt state conflict")
 )

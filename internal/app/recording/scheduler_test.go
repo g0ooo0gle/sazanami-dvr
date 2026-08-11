@@ -56,10 +56,14 @@ type schedulerExecutor struct {
 	miss     []core.TerminalReason
 	executed chan struct{}
 	release  <-chan struct{}
+	claim    func(core.Reservation) (core.Attempt, error)
 }
 
 func (executor *schedulerExecutor) Claim(_ context.Context, reservation core.Reservation) (core.Attempt, error) {
 	executor.claimed = append(executor.claimed, reservation)
+	if executor.claim != nil {
+		return executor.claim(reservation)
+	}
 	return core.Attempt{ReservationID: reservation.ID}, nil
 }
 
@@ -210,6 +214,49 @@ func TestSchedulerUsesOneSlotAndLateStartRules(t *testing.T) {
 	if len(executor.execute) != 1 || len(executor.miss) != 2 ||
 		executor.miss[0] != core.ReasonRecordingSlotUnavailable || executor.miss[1] != core.ReasonLateStartExpired {
 		t.Fatalf("execute=%d miss=%v", len(executor.execute), executor.miss)
+	}
+}
+
+func TestSchedulerReloadsReservationAfterClaimConflict(t *testing.T) {
+	start := time.Date(2026, 8, 12, 1, 0, 0, 0, time.UTC)
+	old := reservationForExecutor(t, start, 10*time.Minute)
+	old.Version = 1
+	current := old
+	current.Version = 2
+	store := &queueStore{items: []core.Reservation{old}}
+	claims := 0
+	executor := &schedulerExecutor{clock: &manualScheduleClock{now: start}, executed: make(chan struct{}, 1)}
+	executor.claim = func(reservation core.Reservation) (core.Attempt, error) {
+		claims++
+		if claims == 1 {
+			store.mu.Lock()
+			store.items = append(store.items, current)
+			store.mu.Unlock()
+			return core.Attempt{}, core.ErrReservationUnavailable
+		}
+		return core.Attempt{ReservationID: reservation.ID}, nil
+	}
+	scheduler, err := NewScheduler(store, executor, executor.clock, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+	select {
+	case <-executor.executed:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("変更後の予約が実行されませんでした")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if len(executor.claimed) != 2 || executor.claimed[0].Version != old.Version ||
+		executor.claimed[1].Version != current.Version || len(executor.execute) != 1 ||
+		executor.execute[0].Version != current.Version {
+		t.Fatalf("claimed=%v execute=%v", executor.claimed, executor.execute)
 	}
 }
 
