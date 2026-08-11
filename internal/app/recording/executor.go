@@ -91,6 +91,7 @@ type Executor struct {
 	Wait                 func(context.Context, time.Duration) error
 	PostRecording        func(context.Context, PostRecordingRequest) string
 	ObservePostRecording func(string)
+	FollowExtensionOnly  bool
 }
 
 type streamCopyResult struct {
@@ -155,7 +156,7 @@ func (executor Executor) ExecuteClaimed(ctx context.Context, reservation recordi
 	if err != nil {
 		return executor.finishBeforeRecording(ctx, partial, attempt.ID, recording.ReasonStreamNotFound)
 	}
-	maximumEnd := attempt.PlannedStart.Add(12 * time.Hour)
+	maximumEnd := attempt.PlannedStart.Add(recording.MaxEffectiveDuration)
 	if attempt.PlannedEnd.After(maximumEnd) {
 		maximumEnd = attempt.PlannedEnd
 	}
@@ -211,7 +212,8 @@ func (executor Executor) ExecuteClaimed(ctx context.Context, reservation recordi
 			}
 			plannedEnd, err := executor.Store.RecordingStarted(ctx, attempt.ID, executor.now())
 			if err != nil || plannedEnd.IsZero() || plannedEnd.Location() != time.UTC ||
-				plannedEnd.Before(copyResult.PlannedEnd) || plannedEnd.After(copyResult.MaximumEnd) {
+				!plannedEnd.After(attempt.PlannedStart) || plannedEnd.After(copyResult.MaximumEnd) ||
+				executor.FollowExtensionOnly && plannedEnd.Before(copyResult.PlannedEnd) {
 				_ = lease.Cancel()
 				_ = lease.Close()
 				_ = partial.Close()
@@ -402,8 +404,9 @@ func (executor Executor) copy(ctx context.Context, lease providerstream.Lease, f
 		now := executor.now()
 		if now.Sub(result.LastProgress) >= progressInterval {
 			plannedEnd, err := executor.Store.UpdateRecordingProgress(context.WithoutCancel(ctx), attempt.ID, result.ByteCount, now)
-			if err != nil || plannedEnd.IsZero() || plannedEnd.Location() != time.UTC || plannedEnd.Before(result.PlannedEnd) ||
-				plannedEnd.After(result.MaximumEnd) {
+			if err != nil || plannedEnd.IsZero() || plannedEnd.Location() != time.UTC ||
+				!plannedEnd.After(attempt.PlannedStart) || plannedEnd.After(result.MaximumEnd) ||
+				executor.FollowExtensionOnly && plannedEnd.Before(result.PlannedEnd) {
 				result.Reason = recording.ReasonProcessInterrupted
 				return result
 			}

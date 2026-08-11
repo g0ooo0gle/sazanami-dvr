@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"math"
 	"time"
 
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/catalogmodel"
@@ -218,7 +219,7 @@ func (store *Store) ApplyReservationFollow(ctx context.Context, request recordin
 	}
 	applied := affected(result) == 1
 	if !applied {
-		applied, err = applyActiveRecordingExtension(ctx, tx, request, startMS, durationMS)
+		applied, err = applyActiveRecordingFollow(ctx, tx, request, startMS, durationMS)
 		if err != nil {
 			return false, err
 		}
@@ -232,33 +233,44 @@ func (store *Store) ApplyReservationFollow(ctx context.Context, request recordin
 	return true, nil
 }
 
-// applyActiveRecordingExtensionは実行中の一件だけについて、予約と録画終了時刻を同時に延ばす。
-func applyActiveRecordingExtension(ctx context.Context, tx *sql.Tx, request recording.ReservationFollowRequest,
+// applyActiveRecordingFollowは実行中の一件だけについて、予約時刻と録画終了時刻を同時に更新する。
+func applyActiveRecordingFollow(ctx context.Context, tx *sql.Tx, request recording.ReservationFollowRequest,
 	targetStartMS, targetDurationMS int64,
 ) (bool, error) {
-	var reservationStartMS, reservationDurationSeconds, endMarginSeconds, attemptEndMS int64
+	var reservationStartMS, reservationDurationSeconds, startMarginSeconds, endMarginSeconds int64
+	var attemptStartMS, attemptEndMS int64
 	var attemptID []byte
 	var attemptState recording.AttemptState
-	err := tx.QueryRowContext(ctx, `SELECT r.start_at_utc_ms, r.duration_seconds, r.effective_end_margin_seconds,
-		a.id, a.state, a.planned_end_utc_ms
+	err := tx.QueryRowContext(ctx, `SELECT r.start_at_utc_ms, r.duration_seconds,
+		r.effective_start_margin_seconds, r.effective_end_margin_seconds,
+		a.id, a.state, a.planned_start_utc_ms, a.planned_end_utc_ms
 		FROM reservations r JOIN recording_attempts a ON a.reservation_id=r.id
 		WHERE r.id=? AND r.version=? AND r.state='ACTIVE' AND r.requested_follow=1
 		  AND r.program_revision_id=?`, request.ReservationID.Bytes(), request.ExpectedVersion,
-		request.ExpectedRevisionID.Bytes()).Scan(&reservationStartMS, &reservationDurationSeconds, &endMarginSeconds,
-		&attemptID, &attemptState, &attemptEndMS)
+		request.ExpectedRevisionID.Bytes()).Scan(&reservationStartMS, &reservationDurationSeconds, &startMarginSeconds,
+		&endMarginSeconds, &attemptID, &attemptState, &attemptStartMS, &attemptEndMS)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
 		return false, sanitize("read-active-recording-extension", err)
 	}
-	if reservationStartMS < 0 || reservationDurationSeconds < 1 || targetStartMS != reservationStartMS ||
+	if reservationStartMS < 0 || reservationDurationSeconds < 1 ||
+		reservationDurationSeconds > int64(recording.MaxEffectiveDuration/time.Second) ||
 		targetDurationMS < 60_000 || targetDurationMS > 12*60*60*1_000 || targetDurationMS%1_000 != 0 {
 		return false, nil
 	}
-	targetEndMS := targetStartMS + targetDurationMS + endMarginSeconds*1_000
-	reservationEndMS := reservationStartMS + reservationDurationSeconds*1_000 + endMarginSeconds*1_000
-	if targetEndMS <= attemptEndMS || reservationEndMS != attemptEndMS {
+	targetDurationSeconds := targetDurationMS / 1_000
+	if !validFollowRecordingTime(targetStartMS, targetDurationSeconds, startMarginSeconds, endMarginSeconds) {
+		return false, nil
+	}
+	targetEndMS, targetOK := activeFollowEnd(targetStartMS, targetDurationMS, endMarginSeconds, attemptStartMS)
+	reservationEndMS, reservationOK := activeFollowEnd(reservationStartMS,
+		reservationDurationSeconds*1_000, endMarginSeconds, attemptStartMS)
+	if !targetOK || !reservationOK || reservationEndMS != attemptEndMS {
+		return false, nil
+	}
+	if request.ExtensionOnly && (targetStartMS != reservationStartMS || targetEndMS <= attemptEndMS) {
 		return false, nil
 	}
 	switch attemptState {
@@ -285,10 +297,10 @@ func applyActiveRecordingExtension(ctx context.Context, tx *sql.Tx, request reco
 	if verified != 1 {
 		return false, nil
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE reservations SET program_revision_id=?, duration_seconds=?,
+	result, err := tx.ExecContext(ctx, `UPDATE reservations SET program_revision_id=?, start_at_utc_ms=?, duration_seconds=?,
 		version=version+1, updated_at_utc_ms=? WHERE id=? AND version=? AND state='ACTIVE'
 		AND requested_follow=1 AND program_revision_id=? AND start_at_utc_ms=? AND duration_seconds=?`,
-		request.TargetRevisionID.Bytes(), targetDurationMS/1_000, request.Now.UnixMilli(),
+		request.TargetRevisionID.Bytes(), targetStartMS, targetDurationSeconds, request.Now.UnixMilli(),
 		request.ReservationID.Bytes(), request.ExpectedVersion, request.ExpectedRevisionID.Bytes(),
 		reservationStartMS, reservationDurationSeconds)
 	if err != nil {
@@ -305,6 +317,44 @@ func applyActiveRecordingExtension(ctx context.Context, tx *sql.Tx, request reco
 		return false, sanitize("update-active-recording-end", err)
 	}
 	return affected(result) == 1, nil
+}
+
+// validFollowRecordingTimeは番組時刻を更新しても、保存済み余白の録画時間が有効か確認する。
+func validFollowRecordingTime(startMS, durationSeconds, startMarginSeconds, endMarginSeconds int64) bool {
+	if startMS < 0 || durationSeconds < 1 || startMarginSeconds < -3_600 || startMarginSeconds > 3_600 ||
+		endMarginSeconds < -3_600 || endMarginSeconds > 3_600 {
+		return false
+	}
+	effectiveSeconds := durationSeconds + startMarginSeconds + endMarginSeconds
+	if effectiveSeconds < 1 || effectiveSeconds > int64(recording.MaxEffectiveDuration/time.Second) {
+		return false
+	}
+	marginMS := startMarginSeconds * 1_000
+	if marginMS > 0 {
+		return startMS >= marginMS
+	}
+	return startMS <= math.MaxInt64+marginMS
+}
+
+// activeFollowEndはSQLiteの開始・終了関係を保ち、録画一回の上限内に終了予定を収める。
+func activeFollowEnd(startMS, durationMS, endMarginSeconds, attemptStartMS int64) (int64, bool) {
+	if startMS < 0 || durationMS < 1 || attemptStartMS < 0 || endMarginSeconds < -3_600 || endMarginSeconds > 3_600 ||
+		startMS > math.MaxInt64-durationMS {
+		return 0, false
+	}
+	endMS := startMS + durationMS
+	marginMS := endMarginSeconds * 1_000
+	if (marginMS > 0 && endMS > math.MaxInt64-marginMS) || (marginMS < 0 && endMS < -marginMS) {
+		return 0, false
+	}
+	endMS += marginMS
+	if attemptStartMS == math.MaxInt64 {
+		return 0, false
+	}
+	if endMS <= attemptStartMS {
+		endMS = attemptStartMS + 1
+	}
+	return endMS, endMS-attemptStartMS <= recording.MaxEffectiveDuration.Milliseconds()
 }
 
 // UpdateReservationは変更不可の番組情報を照合し、録画開始前の設定だけを更新する。

@@ -396,15 +396,21 @@ func TestReservationFollowExtendsActiveRecording(t *testing.T) {
 	}
 }
 
-func TestReservationFollowDoesNotShortenShiftOrFinalizeActiveRecording(t *testing.T) {
+func TestReservationFollowReconcilesActiveTimeUnlessExtensionOnlyOrFinalizing(t *testing.T) {
 	cases := []struct {
-		name       string
-		startShift time.Duration
-		duration   time.Duration
-		finalizing bool
+		name          string
+		startShift    time.Duration
+		duration      time.Duration
+		extensionOnly bool
+		finalizing    bool
+		stopRequested bool
+		wantApplied   bool
 	}{
-		{name: "shorter", duration: 20 * time.Minute},
-		{name: "shifted start", startShift: 5 * time.Minute, duration: 35 * time.Minute},
+		{name: "shorter", duration: 20 * time.Minute, stopRequested: true, wantApplied: true},
+		{name: "shifted start", startShift: 5 * time.Minute, duration: 35 * time.Minute, wantApplied: true},
+		{name: "past end", startShift: -6 * time.Hour, duration: time.Minute, wantApplied: true},
+		{name: "extension only shorter", duration: 20 * time.Minute, extensionOnly: true},
+		{name: "extension only shifted", startShift: 5 * time.Minute, duration: 35 * time.Minute, extensionOnly: true},
 		{name: "finalizing", duration: 40 * time.Minute, finalizing: true},
 	}
 	for index, test := range cases {
@@ -435,6 +441,12 @@ func TestReservationFollowDoesNotShortenShiftOrFinalizeActiveRecording(t *testin
 			if _, err := store.RecordingStarted(context.Background(), attemptID, now.Add(2*time.Second)); err != nil {
 				t.Fatal(err)
 			}
+			if test.stopRequested {
+				result, err := store.StopReservation(context.Background(), created.Number, now.Add(3*time.Second))
+				if err != nil || !result.Notify || result.ReservationID != created.ID {
+					t.Fatalf("stop=%+v err=%v", result, err)
+				}
+			}
 			if test.finalizing {
 				if _, err := store.UpdateRecordingProgress(context.Background(), attemptID, 188, now.Add(3*time.Second)); err != nil {
 					t.Fatal(err)
@@ -451,26 +463,79 @@ func TestReservationFollowDoesNotShortenShiftOrFinalizeActiveRecording(t *testin
 			applied, err := store.ApplyReservationFollow(context.Background(), recording.ReservationFollowRequest{
 				ReservationID: created.ID, ExpectedVersion: created.Version,
 				ExpectedRevisionID: created.Program.ProgramRevisionID, TargetRevisionID: target.ProgramRevisionID,
-				Now: now.Add(5 * time.Second),
+				Now: now.Add(5 * time.Second), ExtensionOnly: test.extensionOnly,
 			})
-			if err != nil || applied {
-				t.Fatalf("applied=%v err=%v", applied, err)
+			if err != nil || applied != test.wantApplied {
+				t.Fatalf("applied=%v want=%v err=%v", applied, test.wantApplied, err)
 			}
 			items, err := store.ActiveReservations(context.Background(), 1, 0)
-			if err != nil || len(items) != 1 || items[0].Version != 1 ||
-				items[0].Program.ProgramRevisionID != reservation.Program.ProgramRevisionID ||
-				items[0].Program.Duration != reservation.Program.Duration {
+			if err != nil || len(items) != 1 {
 				t.Fatalf("items=%+v err=%v", items, err)
 			}
-			var endMS int64
-			if err := store.reader.QueryRow(`SELECT planned_end_utc_ms FROM recording_attempts WHERE id=?`,
-				attemptID.Bytes()).Scan(&endMS); err != nil {
+			expectedVersion := int64(1)
+			expectedRevision := reservation.Program.ProgramRevisionID
+			expectedStart := reservation.Program.Start
+			expectedDuration := reservation.Program.Duration
+			expectedEnd := reservation.PlannedEnd()
+			if test.wantApplied {
+				expectedVersion = 2
+				expectedRevision = target.ProgramRevisionID
+				expectedStart = target.Start
+				expectedDuration = target.Duration
+				expectedEnd = target.Start.Add(target.Duration + recording.DefaultEndMargin)
+				if !expectedEnd.After(reservation.PlannedStart()) {
+					expectedEnd = reservation.PlannedStart().Add(time.Millisecond)
+				}
+			}
+			if items[0].Version != expectedVersion || items[0].Program.ProgramRevisionID != expectedRevision ||
+				!items[0].Program.Start.Equal(expectedStart) || items[0].Program.Duration != expectedDuration {
+				t.Fatalf("items=%+v expected_version=%d expected_start=%s expected_duration=%s",
+					items, expectedVersion, expectedStart, expectedDuration)
+			}
+			var startMS, endMS, actualStartMS, stopMS, byteCount int64
+			var partialPath, finalPath string
+			if err := store.reader.QueryRow(`SELECT a.planned_start_utc_ms, a.planned_end_utc_ms,
+				a.actual_start_utc_ms, COALESCE(a.stop_requested_at_utc_ms, -1), a.byte_count,
+				s.relative_partial_path, s.relative_final_path
+				FROM recording_attempts a JOIN recording_segments s ON s.attempt_id=a.id
+				WHERE a.id=?`, attemptID.Bytes()).Scan(&startMS, &endMS, &actualStartMS, &stopMS, &byteCount,
+				&partialPath, &finalPath); err != nil {
 				t.Fatal(err)
 			}
-			if endMS != reservation.PlannedEnd().UnixMilli() {
-				t.Fatalf("end=%d", endMS)
+			expectedBytes := int64(0)
+			if test.finalizing {
+				expectedBytes = 188
+			}
+			expectedStopMS := int64(-1)
+			if test.stopRequested {
+				expectedStopMS = now.Add(3 * time.Second).UnixMilli()
+			}
+			if startMS != reservation.PlannedStart().UnixMilli() || endMS != expectedEnd.UnixMilli() ||
+				actualStartMS != now.Add(2*time.Second).UnixMilli() || stopMS != expectedStopMS ||
+				byteCount != expectedBytes || partialPath != plan.PartialPath || finalPath != plan.FinalPath {
+				t.Fatalf("start=%d end=%d actual_start=%d stop=%d bytes=%d partial=%q final=%q expected_end=%d",
+					startMS, endMS, actualStartMS, stopMS, byteCount, partialPath, finalPath, expectedEnd.UnixMilli())
 			}
 		})
+	}
+}
+
+func TestActiveFollowTimeBounds(t *testing.T) {
+	if !validFollowRecordingTime(3_600_000, 60, 5, 2) ||
+		validFollowRecordingTime(3_600_000, 60, -30, -30) ||
+		!validFollowRecordingTime(3_600_000, 79_200, 3_600, 3_600) ||
+		validFollowRecordingTime(3_600_000, 79_201, 3_600, 3_600) {
+		t.Fatal("実効録画時間の境界判定が一致しません")
+	}
+	if end, ok := activeFollowEnd(0, 999, 0, 1_000); !ok || end != 1_001 {
+		t.Fatalf("clamped end=%d ok=%v", end, ok)
+	}
+	maximum := recording.MaxEffectiveDuration.Milliseconds()
+	if end, ok := activeFollowEnd(1_000, maximum, 0, 1_000); !ok || end != 1_000+maximum {
+		t.Fatalf("maximum end=%d ok=%v", end, ok)
+	}
+	if _, ok := activeFollowEnd(1_000, maximum+1, 0, 1_000); ok {
+		t.Fatal("24時間を超える終了予定を受け入れました")
 	}
 }
 
@@ -501,7 +566,7 @@ func storeFollowRevision(t *testing.T, store *Store, reservation recording.Reser
 	}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.CompleteSync(context.Background(), syncID, startMS+1, 1, 1); err != nil {
+	if err := store.CompleteSync(context.Background(), syncID, reservation.Program.Start.UnixMilli()+2, 1, 1); err != nil {
 		t.Fatal(err)
 	}
 	target, err := store.CurrentFollowTarget(context.Background(), reservation.Program.BackendID,

@@ -251,7 +251,7 @@ func TestExecutorUsesExtendedPlannedEnd(t *testing.T) {
 	}}
 	executor := executorForTest(t, store, &fakeProvider{lease: lease}, clock, false)
 	executor.WithDeadline = func(ctx context.Context, deadline time.Time) (context.Context, context.CancelFunc) {
-		if !deadline.Equal(start.Add(12 * time.Hour)) {
+		if !deadline.Equal(start.Add(core.MaxEffectiveDuration)) {
 			t.Fatalf("deadline=%s", deadline)
 		}
 		return context.WithCancel(ctx)
@@ -289,9 +289,30 @@ func TestExecutorUsesExtensionObservedBeforeRecordingStart(t *testing.T) {
 	}
 }
 
+func TestExecutorStopsSafelyWhenPastEndIsObservedBeforeStreamRead(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	clock := &mutableClock{now: start.Add(10 * time.Second)}
+	store := &attemptMemory{start: start, end: start.Add(time.Minute), startEnd: start.Add(time.Millisecond)}
+	lease := &fakeLease{read: func([]byte) (int, providerstream.Terminal, error) {
+		t.Fatal("終了済みの録画でstreamを読みました")
+		return 0, providerstream.Terminal{}, nil
+	}}
+	stream := &fakeProvider{lease: lease}
+	executor := executorForTest(t, store, stream, clock, false)
+	result, err := executor.Execute(context.Background(), reservationForExecutor(t, start, time.Minute))
+	if err != nil || result.State != core.AttemptFailed || result.Reason != core.ReasonStreamEndedEarly ||
+		store.finish.ByteCount != 0 || stream.opens != 1 || lease.cancel != 1 || lease.close != 1 {
+		t.Fatalf("result=%+v finish=%+v opens=%d cancel=%d close=%d err=%v",
+			result, store.finish, stream.opens, lease.cancel, lease.close, err)
+	}
+	if countString(store.operations, "write") != 0 || countString(store.operations, "progress") != 0 {
+		t.Fatalf("終了済みの録画へ書き込みました: %v", store.operations)
+	}
+}
+
 func TestExecutorRejectsInvalidPlannedEndUpdate(t *testing.T) {
 	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
-	for _, plannedEnd := range []time.Time{start.Add(59 * time.Second), start.Add(12*time.Hour + time.Second)} {
+	for _, plannedEnd := range []time.Time{start, start.Add(core.MaxEffectiveDuration + time.Millisecond)} {
 		t.Run(plannedEnd.Sub(start).String(), func(t *testing.T) {
 			clock := &mutableClock{now: start}
 			store := &attemptMemory{start: start, end: start.Add(time.Minute), progressEnd: plannedEnd}
@@ -308,6 +329,40 @@ func TestExecutorRejectsInvalidPlannedEndUpdate(t *testing.T) {
 				t.Fatalf("result=%+v err=%v", result, err)
 			}
 		})
+	}
+}
+
+func TestExecutorFinishesNormallyAfterPlannedEndShortening(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	clock := &mutableClock{now: start}
+	store := &attemptMemory{start: start, end: start.Add(time.Minute), progressEnd: start.Add(4 * time.Second)}
+	lease := &fakeLease{read: func(destination []byte) (int, providerstream.Terminal, error) {
+		copy(destination, bytesOf(0x47, 188))
+		clock.now = start.Add(progressInterval)
+		return 188, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
+	}}
+	executor := executorForTest(t, store, &fakeProvider{lease: lease}, clock, false)
+	result, err := executor.Execute(context.Background(), reservationForExecutor(t, start, time.Minute))
+	if err != nil || result.State != core.AttemptSucceeded || result.Reason != core.ReasonCompleted ||
+		store.finish.ByteCount != 188 {
+		t.Fatalf("result=%+v finish=%+v err=%v", result, store.finish, err)
+	}
+}
+
+func TestExecutorExtensionOnlyRejectsPlannedEndShortening(t *testing.T) {
+	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	clock := &mutableClock{now: start}
+	store := &attemptMemory{start: start, end: start.Add(time.Minute), progressEnd: start.Add(30 * time.Second)}
+	lease := &fakeLease{read: func(destination []byte) (int, providerstream.Terminal, error) {
+		copy(destination, bytesOf(0x47, 188))
+		clock.now = start.Add(progressInterval)
+		return 188, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
+	}}
+	executor := executorForTest(t, store, &fakeProvider{lease: lease}, clock, false)
+	executor.FollowExtensionOnly = true
+	result, err := executor.Execute(context.Background(), reservationForExecutor(t, start, time.Minute))
+	if err != nil || result.State != core.AttemptPartial || result.Reason != core.ReasonProcessInterrupted {
+		t.Fatalf("result=%+v err=%v", result, err)
 	}
 }
 

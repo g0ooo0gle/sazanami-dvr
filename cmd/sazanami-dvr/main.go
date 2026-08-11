@@ -103,7 +103,7 @@ func runContext(ctx context.Context, arguments []string, stdout, stderr io.Write
 	}
 	if arguments[0] == "recording" {
 		if len(arguments) < 2 || arguments[1] != "serve" {
-			fmt.Fprintf(stderr, "使用方法: sazanami-dvr recording serve --data-root <dir> --recording-root <dir> --channel-map <file> --provider mirakurun --base-url <url> [--http-listen %s] [--max-concurrent-recordings <正の整数>] [--post-recording-script-root <dir>]\n", recordinghttpadapter.DefaultAddress)
+			fmt.Fprintf(stderr, "使用方法: sazanami-dvr recording serve --data-root <dir> --recording-root <dir> --channel-map <file> --provider mirakurun --base-url <url> [--http-listen %s] [--max-concurrent-recordings <正の整数>] [--active-follow-extension-only] [--post-recording-script-root <dir>]\n", recordinghttpadapter.DefaultAddress)
 			return 2
 		}
 		if err := runRecordingCommand(ctx, arguments[2:], stdout, stderr); err != nil {
@@ -140,6 +140,7 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	httpListenAddress := flags.String("http-listen", recordinghttpadapter.DefaultAddress, "loopback、private IPまたは全interfaceのHTTP待受アドレス")
 	refreshInterval := flags.Duration("catalog-refresh-interval", catalogrefresh.DefaultInterval, "番組表を更新する間隔")
 	maximumRecordings := flags.Int("max-concurrent-recordings", recordingapp.DefaultMaximumConcurrentRecordings, "同時録画数（正の整数。省略時はMirakurunの設定台数）")
+	followExtensionOnly := flags.Bool("active-follow-extension-only", false, "録画開始後の番組追従を終了延長だけに限定する")
 	postRecordingRootPath := flags.String("post-recording-script-root", "", "owner-onlyの録画後スクリプトディレクトリ")
 	if err := flags.Parse(arguments); err != nil {
 		return errorsStable("invalid-command-arguments")
@@ -241,6 +242,7 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	executor := recordingapp.Executor{
 		Store: store, Stream: streamAdapter, Files: files, Clock: recordingClock,
 		NewID: catalogmodel.NewID, OwnerID: ownerID, Generation: 1,
+		FollowExtensionOnly: *followExtensionOnly,
 		PostRecording: func(runContext context.Context, request recordingapp.PostRecordingRequest) string {
 			return postRecordingRunner.Run(runContext, request.Script, postrecordingadapter.Environment{
 				RecordingNumber: request.RecordingNumber, RecordingFile: request.FinalPath,
@@ -327,7 +329,7 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 		dataRoot: *dataRoot, channelMap: *channelMap, provider: catalogAdapter,
 		store: store, holder: snapshots, clock: clock,
 		follow: (recordingapp.FollowService{
-			Store: store, Clock: recordingClock, OnUpdated: scheduler.Notify,
+			Store: store, Clock: recordingClock, ExtensionOnly: *followExtensionOnly, OnUpdated: scheduler.Notify,
 		}).Run,
 		automatic: func(evaluationContext context.Context) (autoreservationapp.Result, error) {
 			return (autoreservationapp.Evaluator{

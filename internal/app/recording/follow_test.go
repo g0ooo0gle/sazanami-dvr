@@ -73,10 +73,11 @@ func TestFollowServiceUpdatesOnlyEligibleReservations(t *testing.T) {
 		blocked: map[catalogmodel.ID]bool{blocked.ID: true},
 	}
 	notified := 0
-	result, err := (FollowService{Store: store, Clock: fixedClock{now: now}, OnUpdated: func() { notified++ }}).
+	result, err := (FollowService{Store: store, Clock: fixedClock{now: now}, ExtensionOnly: true,
+		OnUpdated: func() { notified++ }}).
 		Run(context.Background())
 	if err != nil || result != (FollowResult{Evaluated: 4, Updated: 1, Unchanged: 2, Blocked: 1}) ||
-		len(store.applied) != 2 || notified != 1 {
+		len(store.applied) != 2 || !store.applied[0].ExtensionOnly || !store.applied[1].ExtensionOnly || notified != 1 {
 		t.Fatalf("result=%+v applied=%d notified=%d err=%v", result, len(store.applied), notified, err)
 	}
 }

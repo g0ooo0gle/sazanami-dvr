@@ -574,6 +574,28 @@ func TestRecordingServeValidatesCatalogRefreshIntervalBeforeOpeningRoots(t *test
 	}
 }
 
+func TestRecordingServeAcceptsExtensionOnlyFollowFlagBeforeOpeningRoots(t *testing.T) {
+	base := []string{
+		"recording", "serve", "--data-root", "/private/not-for-output",
+		"--recording-root", "/private/not-for-output/recordings",
+		"--channel-map", "/private/not-for-output/channels.json", "--provider", "mirakurun",
+		"--base-url", "http://127.0.0.1:40773", "--listen", "127.0.0.1:4510",
+	}
+	var output, diagnostic bytes.Buffer
+	arguments := append(append([]string(nil), base...), "--active-follow-extension-only")
+	if code := runContext(context.Background(), arguments, &output, &diagnostic); code != 1 ||
+		!strings.Contains(diagnostic.String(), "current-database-required") || strings.Contains(diagnostic.String(), "/private") {
+		t.Fatalf("code=%d diagnostic=%q", code, diagnostic.String())
+	}
+	output.Reset()
+	diagnostic.Reset()
+	arguments = append(append([]string(nil), base...), "--active-follow-extension-only=invalid")
+	if code := runContext(context.Background(), arguments, &output, &diagnostic); code != 1 ||
+		!strings.Contains(diagnostic.String(), "invalid-command-arguments") || strings.Contains(diagnostic.String(), "/private") {
+		t.Fatalf("code=%d diagnostic=%q", code, diagnostic.String())
+	}
+}
+
 func TestRecordingServeValidatesConcurrentRecordingLimitBeforeOpeningRoots(t *testing.T) {
 	var tunerCalls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {

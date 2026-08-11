@@ -30,11 +30,12 @@ func (result FollowResult) String() string {
 		result.Evaluated, result.Updated, result.Unchanged, result.Blocked)
 }
 
-// FollowServiceは追従対象予約を番号順に読み、録画開始前の予約だけを直列で更新する。
+// FollowServiceは追従対象予約を番号順に読み、完成済み番組表の時刻へ直列で更新する。
 type FollowService struct {
-	Store     FollowStore
-	Clock     Clock
-	OnUpdated func()
+	Store         FollowStore
+	Clock         Clock
+	ExtensionOnly bool
+	OnUpdated     func()
 }
 
 // Runは最新の完成済み番組表を使い、最大16,384件の有効予約を追従させる。
@@ -78,6 +79,7 @@ func (service FollowService) Run(ctx context.Context) (FollowResult, error) {
 				ReservationID: reservation.ID, ExpectedVersion: reservation.Version,
 				ExpectedRevisionID: reservation.Program.ProgramRevisionID,
 				TargetRevisionID:   target.ProgramRevisionID, Now: now,
+				ExtensionOnly: service.ExtensionOnly,
 			})
 			if err != nil {
 				return result, errors.New("recording: apply reservation follow")
