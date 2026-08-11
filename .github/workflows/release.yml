@@ -36,6 +36,7 @@ jobs:
       - name: tagと製品versionを照合
         run: |
           version=${GITHUB_REF_NAME#v}
+          printf '%s\n' "$version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
           test "$GITHUB_REF_NAME" = "v$version"
           test "$(go run ./cmd/sazanami-dvr --version)" = "sazanami-dvr $version"
 

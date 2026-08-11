@@ -32,12 +32,16 @@ import (
 )
 
 func TestVersion(t *testing.T) {
-	var output, diagnostic bytes.Buffer
-	if code := run([]string{"--version"}, &output, &diagnostic); code != 0 {
-		t.Fatalf("code=%d err=%q", code, diagnostic.String())
-	}
-	if got, want := output.String(), "sazanami-dvr 0.0.29\n"; got != want {
-		t.Fatalf("version=%q want=%q", got, want)
+	for _, argument := range []string{"--version", "-version", "version"} {
+		t.Run(argument, func(t *testing.T) {
+			var output, diagnostic bytes.Buffer
+			if code := run([]string{argument}, &output, &diagnostic); code != 0 {
+				t.Fatalf("code=%d err=%q", code, diagnostic.String())
+			}
+			if got, want := output.String(), "sazanami-dvr 0.1.0\n"; got != want {
+				t.Fatalf("version=%q want=%q", got, want)
+			}
+		})
 	}
 }
 
