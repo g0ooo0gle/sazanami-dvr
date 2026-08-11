@@ -31,7 +31,7 @@ type OutputSettings struct {
 }
 
 // OneSegOutputは予約時点で固定したワンセグサービスと保存先である。
-// 接続先はprovider固有の文字列として扱い、domainでは内容を解釈しない。
+// 接続先は正規化済みの正の10進文字列として保持し、数値IDを予約の主キーには使わない。
 type OneSegOutput struct {
 	ProviderServiceLocator string
 	Output                 OutputSettings

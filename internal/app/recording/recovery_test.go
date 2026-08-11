@@ -2,6 +2,7 @@ package recording
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -234,6 +235,32 @@ func TestRecoveryReconcilesHistoricalSuccessAndIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestCompletedAvailabilityRejectsUnsafeMissingFile(t *testing.T) {
+	observation := core.FileObservation{Unsafe: true}
+	availability, reason := completedAvailability(376, observation)
+	if availability != core.AvailabilityMismatched || reason != core.ReasonFileIntegrityMismatch {
+		t.Fatalf("availability=%s reason=%s", availability, reason)
+	}
+	segment := core.RecoverySegment{
+		State: core.SegmentFinalized, Availability: core.AvailabilityFinal, ByteCount: 376,
+	}
+	availability, reason = settledOneSegAvailability(segment, observation)
+	if availability != core.AvailabilityMismatched || reason != core.ReasonFileIntegrityMismatch {
+		t.Fatalf("one_seg_availability=%s reason=%s", availability, reason)
+	}
+}
+
+func TestCompletedAvailabilityDistinguishesMissingAndLeftoverPartial(t *testing.T) {
+	availability, reason := completedAvailability(376, core.FileObservation{})
+	if availability != core.AvailabilityMissing || reason != core.ReasonFileMissing {
+		t.Fatalf("missing availability=%s reason=%s", availability, reason)
+	}
+	availability, reason = completedAvailability(376, core.FileObservation{Partial: regularFact(376)})
+	if availability != core.AvailabilityMismatched || reason != core.ReasonFileIntegrityMismatch {
+		t.Fatalf("partial availability=%s reason=%s", availability, reason)
+	}
+}
+
 func TestRecoveryFinalizesMainBeforeOneSeg(t *testing.T) {
 	item := recoveryItem(t, core.AttemptFinalizing)
 	item.FileSynced = true
@@ -254,6 +281,38 @@ func TestRecoveryFinalizesMainBeforeOneSeg(t *testing.T) {
 	if !equalStrings(memory.operations, want) || len(memory.finish) != 1 ||
 		memory.finish[0].State != core.AttemptSucceeded || memory.finish[0].OneSeg != nil {
 		t.Fatalf("operations=%v finish=%+v", memory.operations, memory.finish)
+	}
+}
+
+func TestRecoveryFinalizesMainBeforeInspectingOneSeg(t *testing.T) {
+	item := recoveryItem(t, core.AttemptFinalizing)
+	item.FileSynced = true
+	item.FinalizationToken = appID(t, 59)
+	addOneSegRecovery(t, &item, core.SegmentPartial, core.AvailabilityPartial)
+	item.OneSeg.FileSynced = true
+	memory := recoveryMemory{
+		item: item, observation: core.FileObservation{Partial: regularFact(376)},
+		oneSegObservation: core.FileObservation{Partial: regularFact(376)},
+	}
+	recovery := recoveryForTest(&memory)
+	recovery.Files.Inspect = func(plan core.FilePlan) (core.FileObservation, error) {
+		if plan == memory.item.OneSeg.Plan {
+			memory.operations = append(memory.operations, "one-inspect")
+			return core.FileObservation{}, errors.New("test")
+		}
+		memory.operations = append(memory.operations, "inspect")
+		return memory.observation, nil
+	}
+	if err := recovery.Run(context.Background()); err == nil || err.Error() != "recording: inspect one-seg recovery file" {
+		t.Fatalf("err=%v", err)
+	}
+	want := []string{
+		"inspect", "link", "published", "directory-sync", "remove", "directory-sync", "directory-recorded",
+		"one-inspect",
+	}
+	if !equalStrings(memory.operations, want) || len(memory.finish) != 0 || !memory.item.DirectorySynced {
+		t.Fatalf("operations=%v finish=%+v directory_synced=%t",
+			memory.operations, memory.finish, memory.item.DirectorySynced)
 	}
 }
 

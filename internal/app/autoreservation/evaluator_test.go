@@ -230,6 +230,51 @@ func TestEvaluatorCreatesOneSegReservationFromSupportedProfile(t *testing.T) {
 	}
 }
 
+func TestEvaluatorNormalizesEmptyOneSegFolderWhenDisabled(t *testing.T) {
+	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+	rule := storedRule(1, autoreservation.SearchCondition{Enabled: true})
+	rule.Recording.PartialFolders = []autoreservation.Folder{{}}
+	store := &evaluationStore{rules: []autoreservation.Rule{rule}, seen: make(map[catalogmodel.ID]struct{})}
+	result, err := (Evaluator{
+		Store: store, Catalog: evaluationCatalog{programs: []catalogmodel.CurrentProgram{
+			currentProgram(1, now.Add(time.Hour), "番組", "", catalogmodel.FreeYes),
+		}}, Clock: fixedClock{now},
+		NewID:       func() (catalogmodel.ID, error) { return catalogmodel.ID{10}, nil },
+		IsDuplicate: func(error) bool { return false },
+	}).Run(context.Background())
+	if err != nil || result.Created != 1 || result.UnavailableRules != 0 || result.OneSegUnavailableRules != 0 ||
+		len(store.created) != 1 || store.created[0].OneSegOutput != nil {
+		t.Fatalf("result=%+v created=%+v err=%v", result, store.created, err)
+	}
+}
+
+func TestAutomaticOneSegOutputSettingsNormalizesNoopFolderProfiles(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		mode    uint8
+		folders []autoreservation.Folder
+		enabled bool
+	}{
+		{name: "disabled empty vector", mode: 0},
+		{name: "enabled empty vector", mode: 1, enabled: true},
+		{name: "disabled canonical noop", mode: 0, folders: []autoreservation.Folder{{
+			Writer: "Write_Default.dll", Name: "RecName_Macro.dll",
+		}}},
+		{name: "enabled canonical noop", mode: 1, folders: []autoreservation.Folder{{
+			Writer: "Write_Default.dll", Name: "RecName_Macro.dll",
+		}}, enabled: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			output, supported := automaticOneSegOutputSettings(autoreservation.RecordingSettings{
+				PartialMode: test.mode, PartialFolders: test.folders,
+			})
+			if !supported || (output != nil) != test.enabled || output != nil && *output != (recording.OutputSettings{}) {
+				t.Fatalf("output=%+v supported=%t", output, supported)
+			}
+		})
+	}
+}
+
 func TestEvaluatorKeepsUnsupportedOneSegRulesWithoutCreatingReservation(t *testing.T) {
 	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
 	rules := make([]autoreservation.Rule, 0, 4)

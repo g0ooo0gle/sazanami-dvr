@@ -417,22 +417,26 @@ func automaticOutputSettings(settings autoreservation.RecordingSettings) (record
 
 // automaticOneSegOutputSettingsは保存済みのワンセグ設定を、単発予約と同じ実行可能範囲へ変換する。
 func automaticOneSegOutputSettings(settings autoreservation.RecordingSettings) (*recording.OutputSettings, bool) {
-	switch settings.PartialMode {
-	case 0:
-		return nil, len(settings.PartialFolders) == 0
-	case 1:
-	default:
+	if settings.PartialMode > 1 || len(settings.PartialFolders) > 1 {
 		return nil, false
 	}
-	if len(settings.PartialFolders) == 0 {
-		return &recording.OutputSettings{}, true
+	output := recording.OutputSettings{}
+	if len(settings.PartialFolders) == 1 {
+		var supported bool
+		output, supported = automaticOneSegFolder(settings.PartialFolders[0])
+		if !supported {
+			return nil, false
+		}
 	}
-	if len(settings.PartialFolders) != 1 {
-		return nil, false
+	if settings.PartialMode == 0 {
+		return nil, output == (recording.OutputSettings{})
 	}
-	folder := settings.PartialFolders[0]
+	return &output, true
+}
+
+func automaticOneSegFolder(folder autoreservation.Folder) (recording.OutputSettings, bool) {
 	if folder.Writer != "" && folder.Writer != "Write_Default.dll" {
-		return nil, false
+		return recording.OutputSettings{}, false
 	}
 	const plugin = "RecName_Macro.dll"
 	template := ""
@@ -441,13 +445,13 @@ func automaticOneSegOutputSettings(settings autoreservation.RecordingSettings) (
 	case strings.HasPrefix(folder.Name, plugin+"?") && len(folder.Name) > len(plugin)+1:
 		template = folder.Name[len(plugin)+1:]
 	default:
-		return nil, false
+		return recording.OutputSettings{}, false
 	}
 	output := recording.OutputSettings{Folder: folder.Path, Template: template}
 	if output.Validate() != nil {
-		return nil, false
+		return recording.OutputSettings{}, false
 	}
-	return &output, true
+	return output, true
 }
 
 func matchService(services []autoreservation.ServiceRange, request recording.ReservationRequest) bool {

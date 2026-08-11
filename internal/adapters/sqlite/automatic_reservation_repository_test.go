@@ -168,7 +168,8 @@ func TestDisableAutomaticReservationOnlyBeforeRecordingStarts(t *testing.T) {
 		created := createAutomatic(t, store)
 		now := created.CreatedAt.Add(time.Minute)
 		if _, err := store.ClaimRecording(context.Background(), recording.ClaimRequest{
-			ReservationID: created.ID, AttemptID: testID(t, 211), SegmentID: testID(t, 212),
+			ReservationID: created.ID, ReservationVersion: created.Version,
+			AttemptID: testID(t, 211), SegmentID: testID(t, 212),
 			OwnerID: testID(t, 213), OwnerGeneration: 1, Now: now,
 			Plan: recording.FilePlan{PartialPath: "automatic/started.ts.partial", FinalPath: "automatic/started.ts"},
 		}); err != nil {

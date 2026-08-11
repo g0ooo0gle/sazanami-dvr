@@ -319,14 +319,86 @@ func validateMigrationSource(ctx context.Context, database *sql.DB, inspection I
 	if inspection.CurrentVersion != 12 || inspection.TargetVersion != 13 {
 		return nil
 	}
+	if err := validateSchemaTwelveOrdinals(ctx, database); err != nil {
+		return err
+	}
+	if err := validateSchemaTwelveShape(ctx, database); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateSchemaTwelveOrdinals(ctx context.Context, database *sql.DB) error {
 	var unsupported int
-	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM recording_segments WHERE ordinal<>0`).Scan(&unsupported); err != nil {
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM recording_segments
+		WHERE ordinal IS NULL OR typeof(ordinal)<>'integer' OR ordinal<>0`).Scan(&unsupported); err != nil {
 		return errors.New("sqlite: inspect recording segments before migration")
 	}
 	if unsupported != 0 {
 		return errors.New("sqlite: unsupported recording segment before migration")
 	}
 	return nil
+}
+
+type schemaObject struct {
+	kind, name, table, statement string
+}
+
+// validateSchemaTwelveShapeは移行履歴だけでなく、第12版の表、制約、index、triggerを照合する。
+func validateSchemaTwelveShape(ctx context.Context, database *sql.DB) error {
+	expected, err := sql.Open("sqlite3", "file:sazanami-schema-twelve?mode=memory&cache=private&_pragma=foreign_keys(1)")
+	if err != nil {
+		return errors.New("sqlite: prepare expected migration schema")
+	}
+	expected.SetMaxOpenConns(1)
+	defer expected.Close()
+	migrations, err := embeddedMigrations()
+	if err != nil || len(migrations) < 12 {
+		return errors.New("sqlite: prepare expected migration schema")
+	}
+	for _, item := range migrations[:12] {
+		if _, err := expected.ExecContext(ctx, item.content); err != nil {
+			return errors.New("sqlite: prepare expected migration schema")
+		}
+	}
+	want, err := readSchemaObjects(ctx, expected)
+	if err != nil {
+		return errors.New("sqlite: read expected migration schema")
+	}
+	got, err := readSchemaObjects(ctx, database)
+	if err != nil {
+		return errors.New("sqlite: read migration source schema")
+	}
+	if len(got) != len(want) {
+		return errors.New("sqlite: migration source schema mismatch")
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			return errors.New("sqlite: migration source schema mismatch")
+		}
+	}
+	return nil
+}
+
+func readSchemaObjects(ctx context.Context, database *sql.DB) ([]schemaObject, error) {
+	rows, err := database.QueryContext(ctx, `SELECT type, name, tbl_name, sql FROM sqlite_schema
+		WHERE name NOT LIKE 'sqlite_%' AND sql IS NOT NULL ORDER BY type, name, tbl_name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	objects := make([]schemaObject, 0, 64)
+	for rows.Next() {
+		var object schemaObject
+		if err := rows.Scan(&object.kind, &object.name, &object.table, &object.statement); err != nil {
+			return nil, err
+		}
+		objects = append(objects, object)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return objects, nil
 }
 
 // migrateは空DBだけを、全pending migrationを1 transactionにまとめてCURRENTへ進める。

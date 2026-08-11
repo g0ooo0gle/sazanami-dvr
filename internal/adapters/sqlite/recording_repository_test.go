@@ -435,7 +435,8 @@ func TestReservationFollowExtendsActiveRecording(t *testing.T) {
 				t.Fatal(err)
 			}
 			claim := recording.ClaimRequest{
-				ReservationID: created.ID, AttemptID: attemptID, SegmentID: testID(t, byte(140+index)),
+				ReservationID: created.ID, ReservationVersion: created.Version,
+				AttemptID: attemptID, SegmentID: testID(t, byte(140+index)),
 				OwnerID: testID(t, byte(150+index)), OwnerGeneration: 1,
 				Now: reservation.CreatedAt.Add(time.Minute), Plan: plan,
 			}
@@ -521,7 +522,8 @@ func TestReservationFollowReconcilesActiveTimeUnlessExtensionOnlyOrFinalizing(t 
 			}
 			now := reservation.CreatedAt.Add(time.Minute)
 			claim := recording.ClaimRequest{
-				ReservationID: created.ID, AttemptID: attemptID, SegmentID: testID(t, byte(180+index)),
+				ReservationID: created.ID, ReservationVersion: created.Version,
+				AttemptID: attemptID, SegmentID: testID(t, byte(180+index)),
 				OwnerID: testID(t, byte(190+index)), OwnerGeneration: 1, Now: now, Plan: plan,
 			}
 			if _, err := store.ClaimRecording(context.Background(), claim); err != nil {
@@ -896,7 +898,8 @@ func TestRecordingAttemptLifecycle(t *testing.T) {
 	plan := recording.FilePlan{PartialPath: "2026/08/attempt.ts.partial", FinalPath: "2026/08/attempt.ts"}
 	now := reservation.CreatedAt.Add(time.Minute)
 	claim := recording.ClaimRequest{
-		ReservationID: reservation.ID, AttemptID: testID(t, 118), SegmentID: testID(t, 119),
+		ReservationID: reservation.ID, ReservationVersion: created.Version,
+		AttemptID: testID(t, 118), SegmentID: testID(t, 119),
 		OwnerID: testID(t, 120), OwnerGeneration: 1, Now: now, Plan: plan,
 	}
 	attempt, err := store.ClaimRecording(context.Background(), claim)
@@ -1034,13 +1037,20 @@ func TestRecordingAttemptLifecycle(t *testing.T) {
 func TestOneSegClaimCreatesTwoSegmentsAtomically(t *testing.T) {
 	_, store := openMigratedStore(t)
 	reservation := reservationForTest(t, store)
-	if _, err := store.CreateReservation(context.Background(), reservation); err != nil {
+	reservation.OneSegOutput = &recording.OneSegOutput{ProviderServiceLocator: "1004"}
+	created, err := store.CreateReservation(context.Background(), reservation)
+	if err != nil {
 		t.Fatal(err)
 	}
 	mainPlan := recording.FilePlan{PartialPath: "2026/08/main.ts.partial", FinalPath: "2026/08/main.ts"}
-	oneSegPlan := recording.FilePlan{PartialPath: "2026/08/main.oneseg.ts.partial", FinalPath: "2026/08/main.oneseg.ts"}
+	attemptID := testID(t, 200)
+	oneSegPlan, err := recording.NewOneSegFilePlan(created, attemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	request := recording.ClaimRequest{
-		ReservationID: reservation.ID, AttemptID: testID(t, 200), SegmentID: testID(t, 201),
+		ReservationID: reservation.ID, ReservationVersion: created.Version,
+		AttemptID: attemptID, SegmentID: testID(t, 201),
 		OneSegSegmentID: testID(t, 202), OwnerID: testID(t, 203), OwnerGeneration: 1,
 		Now: reservation.CreatedAt.Add(time.Minute), Plan: mainPlan, OneSegPlan: &oneSegPlan,
 	}
@@ -1072,15 +1082,121 @@ func TestOneSegClaimCreatesTwoSegmentsAtomically(t *testing.T) {
 	}
 }
 
+func TestOneSegClaimRequiresCurrentReservationSnapshot(t *testing.T) {
+	t.Run("enabled reservation requires auxiliary", func(t *testing.T) {
+		_, store := openMigratedStore(t)
+		reservation := reservationForTest(t, store)
+		reservation.OneSegOutput = &recording.OneSegOutput{ProviderServiceLocator: "1004"}
+		created, err := store.CreateReservation(context.Background(), reservation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := recording.ClaimRequest{
+			ReservationID: created.ID, ReservationVersion: created.Version,
+			AttemptID: testID(t, 220), SegmentID: testID(t, 221),
+			OwnerID: testID(t, 222), OwnerGeneration: 1, Now: created.CreatedAt.Add(time.Minute),
+			Plan: recording.FilePlan{PartialPath: "2026/08/main.ts.partial", FinalPath: "2026/08/main.ts"},
+		}
+		if _, err := store.ClaimRecording(context.Background(), request); !errors.Is(err, ErrReservationUnavailable) {
+			t.Fatalf("err=%v", err)
+		}
+		assertNoRecordingAttempt(t, store, request.AttemptID)
+	})
+
+	t.Run("disabled reservation rejects auxiliary", func(t *testing.T) {
+		_, store := openMigratedStore(t)
+		reservation := reservationForTest(t, store)
+		created, err := store.CreateReservation(context.Background(), reservation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		oneSegPlan := recording.FilePlan{
+			PartialPath: "2026/08/main.oneseg.ts.partial", FinalPath: "2026/08/main.oneseg.ts",
+		}
+		request := recording.ClaimRequest{
+			ReservationID: created.ID, ReservationVersion: created.Version,
+			AttemptID: testID(t, 223), SegmentID: testID(t, 224), OneSegSegmentID: testID(t, 225),
+			OwnerID: testID(t, 226), OwnerGeneration: 1, Now: created.CreatedAt.Add(time.Minute),
+			Plan:       recording.FilePlan{PartialPath: "2026/08/main.ts.partial", FinalPath: "2026/08/main.ts"},
+			OneSegPlan: &oneSegPlan,
+		}
+		if _, err := store.ClaimRecording(context.Background(), request); !errors.Is(err, ErrReservationUnavailable) {
+			t.Fatalf("err=%v", err)
+		}
+		assertNoRecordingAttempt(t, store, request.AttemptID)
+	})
+
+	t.Run("changed reservation rejects stale version and plan", func(t *testing.T) {
+		_, store := openMigratedStore(t)
+		reservation := reservationForTest(t, store)
+		reservation.OneSegOutput = &recording.OneSegOutput{ProviderServiceLocator: "1004"}
+		created, err := store.CreateReservation(context.Background(), reservation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		attemptID := testID(t, 227)
+		oldPlan, err := recording.NewOneSegFilePlan(created, attemptID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		settings := recording.OutputSettings{Folder: "mobile"}
+		changeRequest := reservationRequestForTest(created)
+		changeRequest.OneSegOutput = &settings
+		if err := store.UpdateReservation(context.Background(), recording.ReservationChange{
+			Number: created.Number, Request: changeRequest,
+			ResolvedOneSegOutput: &recording.OneSegOutput{ProviderServiceLocator: "1005", Output: settings},
+		}, created.CreatedAt.Add(time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+		claim := recording.ClaimRequest{
+			ReservationID: created.ID, ReservationVersion: created.Version,
+			AttemptID: attemptID, SegmentID: testID(t, 228), OneSegSegmentID: testID(t, 229),
+			OwnerID: testID(t, 230), OwnerGeneration: 1, Now: created.CreatedAt.Add(2 * time.Minute),
+			Plan:       recording.FilePlan{PartialPath: "2026/08/main.ts.partial", FinalPath: "2026/08/main.ts"},
+			OneSegPlan: &oldPlan,
+		}
+		if _, err := store.ClaimRecording(context.Background(), claim); !errors.Is(err, ErrReservationUnavailable) {
+			t.Fatalf("stale version err=%v", err)
+		}
+		current, err := store.ActiveReservations(context.Background(), 1, 0)
+		if err != nil || len(current) != 1 {
+			t.Fatalf("reservations=%+v err=%v", current, err)
+		}
+		claim.ReservationVersion = current[0].Version
+		if _, err := store.ClaimRecording(context.Background(), claim); !errors.Is(err, ErrReservationUnavailable) {
+			t.Fatalf("stale plan err=%v", err)
+		}
+		assertNoRecordingAttempt(t, store, claim.AttemptID)
+	})
+}
+
+func assertNoRecordingAttempt(t *testing.T, store *Store, attemptID catalogmodel.ID) {
+	t.Helper()
+	var count int
+	if err := store.reader.QueryRow(`SELECT count(*) FROM recording_attempts WHERE id=?`, attemptID.Bytes()).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("attempts=%d", count)
+	}
+}
+
 func TestOneSegLifecycleKeepsMainByteCountAndSettlesBothSegments(t *testing.T) {
 	_, store := openMigratedStore(t)
 	reservation := reservationForTest(t, store)
-	if _, err := store.CreateReservation(context.Background(), reservation); err != nil {
+	reservation.OneSegOutput = &recording.OneSegOutput{ProviderServiceLocator: "1004"}
+	created, err := store.CreateReservation(context.Background(), reservation)
+	if err != nil {
 		t.Fatal(err)
 	}
-	oneSegPlan := recording.FilePlan{PartialPath: "2026/08/main.oneseg.ts.partial", FinalPath: "2026/08/main.oneseg.ts"}
+	attemptID := testID(t, 212)
+	oneSegPlan, err := recording.NewOneSegFilePlan(created, attemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	request := recording.ClaimRequest{
-		ReservationID: reservation.ID, AttemptID: testID(t, 212), SegmentID: testID(t, 213),
+		ReservationID: reservation.ID, ReservationVersion: created.Version,
+		AttemptID: attemptID, SegmentID: testID(t, 213),
 		OneSegSegmentID: testID(t, 214), OwnerID: testID(t, 215), OwnerGeneration: 1,
 		Now:        reservation.CreatedAt.Add(time.Minute),
 		Plan:       recording.FilePlan{PartialPath: "2026/08/main.ts.partial", FinalPath: "2026/08/main.ts"},
@@ -1118,6 +1234,12 @@ func TestOneSegLifecycleKeepsMainByteCountAndSettlesBothSegments(t *testing.T) {
 	}
 	if err := store.MarkDirectorySynced(context.Background(), request.AttemptID, now.Add(8*time.Second)); err != nil {
 		t.Fatal(err)
+	}
+	beforeOneSeg, err := store.RecoveryAttempts(context.Background(), recording.MaxRecoveryPage, catalogmodel.ID{})
+	if err != nil || len(beforeOneSeg) != 1 || beforeOneSeg[0].State != recording.AttemptFinalizing ||
+		beforeOneSeg[0].SegmentState != recording.SegmentFinalized ||
+		beforeOneSeg[0].Availability != recording.AvailabilityFinal || beforeOneSeg[0].OneSeg == nil {
+		t.Fatalf("before one-seg recovery=%+v err=%v", beforeOneSeg, err)
 	}
 	if err := store.MarkOneSegFinalPublished(context.Background(), request.AttemptID, now.Add(9*time.Second)); err != nil {
 		t.Fatal(err)
@@ -1201,7 +1323,8 @@ func TestRecoveryRejectsMissingMainAndUnsupportedOrdinal(t *testing.T) {
 				t.Fatal(err)
 			}
 			claim := recording.ClaimRequest{
-				ReservationID: reservation.ID, AttemptID: testID(t, 217), SegmentID: testID(t, 218),
+				ReservationID: reservation.ID, ReservationVersion: 1,
+				AttemptID: testID(t, 217), SegmentID: testID(t, 218),
 				OwnerID: testID(t, 219), OwnerGeneration: 1, Now: reservation.CreatedAt.Add(time.Minute),
 				Plan: recording.FilePlan{PartialPath: "2026/08/corrupt.ts.partial", FinalPath: "2026/08/corrupt.ts"},
 			}
@@ -1217,19 +1340,59 @@ func TestRecoveryRejectsMissingMainAndUnsupportedOrdinal(t *testing.T) {
 	}
 }
 
+func TestRecoveryRejectsCrossColumnRecordingPathConflict(t *testing.T) {
+	_, store := openMigratedStore(t)
+	reservation := reservationForTest(t, store)
+	reservation.OneSegOutput = &recording.OneSegOutput{ProviderServiceLocator: "1004"}
+	created, err := store.CreateReservation(context.Background(), reservation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attemptID := testID(t, 231)
+	oneSegPlan, err := recording.NewOneSegFilePlan(created, attemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := recording.ClaimRequest{
+		ReservationID: created.ID, ReservationVersion: created.Version,
+		AttemptID: attemptID, SegmentID: testID(t, 232), OneSegSegmentID: testID(t, 233),
+		OwnerID: testID(t, 234), OwnerGeneration: 1, Now: created.CreatedAt.Add(time.Minute),
+		Plan:       recording.FilePlan{PartialPath: "2026/08/main.ts.partial", FinalPath: "2026/08/main.ts"},
+		OneSegPlan: &oneSegPlan,
+	}
+	if _, err := store.ClaimRecording(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.writer.Exec(`UPDATE recording_segments SET relative_partial_path=?
+		WHERE attempt_id=? AND ordinal=1`, claim.Plan.FinalPath, claim.AttemptID.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecoveryAttempts(context.Background(), recording.MaxRecoveryPage,
+		catalogmodel.ID{}); err == nil || err.Error() != "sqlite: recording recovery path conflict" {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 func TestOneSegClaimSecondInsertFailureRollsBackAttempt(t *testing.T) {
 	_, store := openMigratedStore(t)
 	reservation := reservationForTest(t, store)
-	if _, err := store.CreateReservation(context.Background(), reservation); err != nil {
+	reservation.OneSegOutput = &recording.OneSegOutput{ProviderServiceLocator: "1004"}
+	created, err := store.CreateReservation(context.Background(), reservation)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.writer.Exec(`CREATE TRIGGER fail_one_seg_segment BEFORE INSERT ON recording_segments
 		WHEN NEW.ordinal=1 BEGIN SELECT RAISE(ABORT, 'test failure'); END`); err != nil {
 		t.Fatal(err)
 	}
-	oneSegPlan := recording.FilePlan{PartialPath: "2026/08/aux.ts.partial", FinalPath: "2026/08/aux.ts"}
+	attemptID := testID(t, 204)
+	oneSegPlan, err := recording.NewOneSegFilePlan(created, attemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	request := recording.ClaimRequest{
-		ReservationID: reservation.ID, AttemptID: testID(t, 204), SegmentID: testID(t, 205),
+		ReservationID: reservation.ID, ReservationVersion: created.Version,
+		AttemptID: attemptID, SegmentID: testID(t, 205),
 		OneSegSegmentID: testID(t, 206), OwnerID: testID(t, 207), OwnerGeneration: 1,
 		Now:        reservation.CreatedAt.Add(time.Minute),
 		Plan:       recording.FilePlan{PartialPath: "2026/08/main.ts.partial", FinalPath: "2026/08/main.ts"},
@@ -1257,7 +1420,8 @@ func TestSchemaRejectsRecordingSegmentOrdinalTwo(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := recording.ClaimRequest{
-		ReservationID: reservation.ID, AttemptID: testID(t, 208), SegmentID: testID(t, 209),
+		ReservationID: reservation.ID, ReservationVersion: 1,
+		AttemptID: testID(t, 208), SegmentID: testID(t, 209),
 		OwnerID: testID(t, 210), OwnerGeneration: 1, Now: reservation.CreatedAt.Add(time.Minute),
 		Plan: recording.FilePlan{PartialPath: "2026/08/main.ts.partial", FinalPath: "2026/08/main.ts"},
 	}
@@ -1281,7 +1445,8 @@ func TestRecordingAttemptCanFinishWithoutOpeningStream(t *testing.T) {
 	}
 	now := reservation.CreatedAt.Add(time.Minute)
 	claim := recording.ClaimRequest{
-		ReservationID: reservation.ID, AttemptID: testID(t, 122), SegmentID: testID(t, 123),
+		ReservationID: reservation.ID, ReservationVersion: 1,
+		AttemptID: testID(t, 122), SegmentID: testID(t, 123),
 		OwnerID: testID(t, 124), OwnerGeneration: 1, Now: now,
 		Plan: recording.FilePlan{PartialPath: "2026/08/missed.ts.partial", FinalPath: "2026/08/missed.ts"},
 	}
@@ -1324,7 +1489,8 @@ func TestUserStopIsPersistedIdempotentlyAndPublishesOnlyItsPartialRecording(t *t
 	now := reservation.CreatedAt.Add(time.Minute)
 	plan := recording.FilePlan{PartialPath: "2026/08/stopped.ts.partial", FinalPath: "2026/08/stopped.ts"}
 	claim := recording.ClaimRequest{
-		ReservationID: created.ID, AttemptID: testID(t, 131), SegmentID: testID(t, 132),
+		ReservationID: created.ID, ReservationVersion: created.Version,
+		AttemptID: testID(t, 131), SegmentID: testID(t, 132),
 		OwnerID: testID(t, 133), OwnerGeneration: 1, Now: now, Plan: plan,
 	}
 	if _, err := store.ClaimRecording(context.Background(), claim); err != nil {
@@ -1405,7 +1571,8 @@ func TestConcurrentUserStopRequestsConvergeOnOneTimestamp(t *testing.T) {
 	}
 	now := reservation.CreatedAt.Add(time.Minute)
 	claim := recording.ClaimRequest{
-		ReservationID: created.ID, AttemptID: testID(t, 136), SegmentID: testID(t, 137),
+		ReservationID: created.ID, ReservationVersion: created.Version,
+		AttemptID: testID(t, 136), SegmentID: testID(t, 137),
 		OwnerID: testID(t, 138), OwnerGeneration: 1, Now: now,
 		Plan: recording.FilePlan{PartialPath: "2026/08/concurrent.ts.partial", FinalPath: "2026/08/concurrent.ts"},
 	}
@@ -1485,12 +1652,14 @@ func TestRecordingClaimRaceOpensOnlyOneAttempt(t *testing.T) {
 	now := reservation.CreatedAt.Add(time.Minute)
 	requests := []recording.ClaimRequest{
 		{
-			ReservationID: reservation.ID, AttemptID: testID(t, 140), SegmentID: testID(t, 141),
+			ReservationID: reservation.ID, ReservationVersion: 1,
+			AttemptID: testID(t, 140), SegmentID: testID(t, 141),
 			OwnerID: testID(t, 142), OwnerGeneration: 1, Now: now,
 			Plan: recording.FilePlan{PartialPath: "2026/08/race-a.ts.partial", FinalPath: "2026/08/race-a.ts"},
 		},
 		{
-			ReservationID: reservation.ID, AttemptID: testID(t, 143), SegmentID: testID(t, 144),
+			ReservationID: reservation.ID, ReservationVersion: 1,
+			AttemptID: testID(t, 143), SegmentID: testID(t, 144),
 			OwnerID: testID(t, 145), OwnerGeneration: 1, Now: now,
 			Plan: recording.FilePlan{PartialPath: "2026/08/race-b.ts.partial", FinalPath: "2026/08/race-b.ts"},
 		},

@@ -240,6 +240,12 @@ func TestAutomaticReservationOutputIsBoundedAndRedacted(t *testing.T) {
 			Rules: 2, Programs: 3, Matched: 4, Created: 5, Duplicates: 6, RecordedTitleMatches: 7,
 			UnavailableRules: 8, ForcedTunerUnavailableRules: 3, LimitReached: true,
 		}, wantOutput: completed + "automatic_reservation_unavailable reason=forced-tuner-not-supported-by-provider rules=3\n"},
+		{name: "one-seg", result: autoreservationapp.Result{
+			Rules: 2, Programs: 3, Matched: 4, Created: 5, Duplicates: 6, RecordedTitleMatches: 7,
+			UnavailableRules: 8, OneSegUnavailableRules: 2, OneSegUnresolvedPrograms: 3, LimitReached: true,
+		}, wantOutput: completed +
+			"automatic_reservation_unavailable reason=one-seg-profile-unsupported rules=2\n" +
+			"automatic_reservation_unavailable reason=one-seg-service-unresolved programs=3\n"},
 		{name: "failure", result: autoreservationapp.Result{ForcedTunerUnavailableRules: 3},
 			err:            errors.New("private program and path"),
 			wantDiagnostic: "automatic_reservation result=failed reason=evaluation-failed duration_ms=8\n"},

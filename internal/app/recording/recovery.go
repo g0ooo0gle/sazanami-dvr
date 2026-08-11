@@ -53,20 +53,16 @@ func (recovery Recovery) Run(ctx context.Context) error {
 			if err != nil {
 				return errors.New("recording: inspect recovery file")
 			}
-			var oneSegObservation *core.FileObservation
-			if item.OneSeg != nil {
-				observation, inspectErr := recovery.Files.Inspect(item.OneSeg.Plan)
-				if inspectErr != nil {
-					return errors.New("recording: inspect one-seg recovery file")
-				}
-				oneSegObservation = &observation
-			}
 			switch item.State {
 			case core.AttemptSucceeded, core.AttemptPartial:
-				err = recovery.reconcileSuccess(ctx, item, mainObservation, oneSegObservation)
+				err = recovery.reconcileSuccess(ctx, item, mainObservation)
 			case core.AttemptFinalizing:
-				err = recovery.recoverFinalizing(ctx, item, mainObservation, oneSegObservation)
+				err = recovery.recoverFinalizing(ctx, item, mainObservation)
 			default:
+				oneSegObservation, inspectErr := recovery.inspectOneSeg(item)
+				if inspectErr != nil {
+					return inspectErr
+				}
 				err = recovery.finishInterrupted(ctx, item, mainObservation, oneSegObservation)
 			}
 			if err != nil {
@@ -78,6 +74,17 @@ func (recovery Recovery) Run(ctx context.Context) error {
 		}
 		after = items[len(items)-1].ID
 	}
+}
+
+func (recovery Recovery) inspectOneSeg(item core.RecoveryItem) (*core.FileObservation, error) {
+	if item.OneSeg == nil {
+		return nil, nil
+	}
+	observation, err := recovery.Files.Inspect(item.OneSeg.Plan)
+	if err != nil {
+		return nil, errors.New("recording: inspect one-seg recovery file")
+	}
+	return &observation, nil
 }
 
 func (recovery Recovery) finishInterrupted(ctx context.Context, item core.RecoveryItem,
@@ -134,9 +141,13 @@ func oneSegInterruptedResult(segment core.RecoverySegment, observation core.File
 }
 
 func (recovery Recovery) recoverFinalizing(ctx context.Context, item core.RecoveryItem,
-	mainObservation core.FileObservation, oneSegObservation *core.FileObservation,
+	mainObservation core.FileObservation,
 ) error {
 	failure, err := recovery.recoverMainFinalization(ctx, item, mainObservation)
+	if err != nil {
+		return err
+	}
+	oneSegObservation, err := recovery.inspectOneSeg(item)
 	if err != nil {
 		return err
 	}
@@ -385,7 +396,7 @@ func oneSegMismatch(byteCount int64) core.OneSegResult {
 }
 
 func (recovery Recovery) reconcileSuccess(ctx context.Context, item core.RecoveryItem,
-	mainObservation core.FileObservation, oneSegObservation *core.FileObservation,
+	mainObservation core.FileObservation,
 ) error {
 	availability, reason := completedAvailability(item.ByteCount, mainObservation)
 	if item.Availability != availability || item.IntegrityReason != reason {
@@ -394,6 +405,10 @@ func (recovery Recovery) reconcileSuccess(ctx context.Context, item core.Recover
 		}
 	}
 	if item.OneSeg != nil {
+		oneSegObservation, err := recovery.inspectOneSeg(item)
+		if err != nil {
+			return err
+		}
 		if err := recovery.reconcileSettledOneSeg(ctx, item.ID, *item.OneSeg, *oneSegObservation, true); err != nil {
 			return err
 		}
@@ -426,9 +441,14 @@ func (recovery Recovery) reconcileSettledOneSeg(ctx context.Context, attemptID c
 
 func completedAvailability(byteCount int64, observation core.FileObservation) (core.Availability, core.TerminalReason) {
 	switch {
+	case observation.Unsafe || invalidFact(observation.Partial) || invalidFact(observation.Final):
+		return core.AvailabilityMismatched, core.ReasonFileIntegrityMismatch
 	case !observation.Final.Exists:
+		if observation.Partial.Exists {
+			return core.AvailabilityMismatched, core.ReasonFileIntegrityMismatch
+		}
 		return core.AvailabilityMissing, core.ReasonFileMissing
-	case observation.Unsafe || invalidFact(observation.Final) || observation.Final.Size != byteCount || observation.Partial.Exists:
+	case observation.Final.Size != byteCount || observation.Partial.Exists:
 		return core.AvailabilityMismatched, core.ReasonFileIntegrityMismatch
 	default:
 		return core.AvailabilityFinal, ""

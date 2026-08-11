@@ -641,19 +641,38 @@ func (store *Store) ClaimRecording(ctx context.Context, request recording.ClaimR
 	}
 	defer tx.Rollback()
 
-	var state recording.ReservationState
-	var startMS, durationSeconds, enabled, startMarginSeconds, endMarginSeconds int64
-	err = tx.QueryRowContext(ctx, `SELECT state, start_at_utc_ms, duration_seconds, enabled,
-		effective_start_margin_seconds, effective_end_margin_seconds FROM reservations WHERE id=?`,
-		request.ReservationID.Bytes()).Scan(&state, &startMS, &durationSeconds, &enabled, &startMarginSeconds, &endMarginSeconds)
+	reservation, err := scanReservation(tx.QueryRowContext(ctx, `SELECT r.id, m.reserve_id, r.version, r.state,
+		r.program_instance_id, r.program_revision_id, r.backend_instance_id, r.provider_service_locator,
+		r.tuning_target, r.network_id, r.transport_stream_id, r.service_id, r.event_id, r.title,
+		r.station_name, r.start_at_utc_ms, r.duration_seconds, r.requested_priority, r.requested_follow,
+		r.effective_follow, r.created_at_utc_ms, r.updated_at_utc_ms, r.enabled, r.use_default_margins,
+		r.effective_start_margin_seconds, r.effective_end_margin_seconds, r.output_folder, r.output_template,
+		r.component_mode, r.post_action_mode, r.post_power_mode, r.post_script_path,
+		o.provider_service_locator, o.output_folder, o.output_template
+		FROM reservations r JOIN ctrlcmd_reservation_ids m ON m.reservation_id=r.id
+		LEFT JOIN reservation_oneseg_outputs o ON o.reservation_id=r.id WHERE r.id=?`,
+		request.ReservationID.Bytes()))
 	if errors.Is(err, sql.ErrNoRows) {
 		return recording.Attempt{}, ErrReservationUnavailable
 	}
 	if err != nil {
 		return recording.Attempt{}, sanitize("read-recording-reservation", err)
 	}
-	if state != recording.ReservationActive || enabled != 1 {
+	if reservation.State != recording.ReservationActive || reservation.Disabled ||
+		reservation.Version != request.ReservationVersion {
 		return recording.Attempt{}, ErrReservationUnavailable
+	}
+	if (reservation.OneSegOutput == nil) != (request.OneSegPlan == nil) {
+		return recording.Attempt{}, ErrReservationUnavailable
+	}
+	if reservation.OneSegOutput != nil {
+		expected, planErr := recording.NewOneSegFilePlan(reservation, request.AttemptID)
+		if planErr != nil {
+			return recording.Attempt{}, errors.New("sqlite: corrupt one-seg file plan")
+		}
+		if expected != *request.OneSegPlan {
+			return recording.Attempt{}, ErrReservationUnavailable
+		}
 	}
 	var existing int
 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM recording_attempts WHERE reservation_id=?`,
@@ -677,6 +696,11 @@ func (store *Store) ClaimRecording(ctx context.Context, request recording.ClaimR
 	if pathConflict != 0 {
 		return recording.Attempt{}, errors.New("sqlite: recording path conflict")
 	}
+	startMS := reservation.Program.Start.UnixMilli()
+	durationSeconds := int64(reservation.Program.Duration / time.Second)
+	margins := reservation.EffectiveMargins()
+	startMarginSeconds := int64(margins.Start / time.Second)
+	endMarginSeconds := int64(margins.End / time.Second)
 	plannedStartMS := startMS - startMarginSeconds*1_000
 	endMS := startMS + (durationSeconds+endMarginSeconds)*1_000
 	if startMS < 0 || durationSeconds < 1 || plannedStartMS < 0 || endMS <= plannedStartMS || endMS-plannedStartMS > int64((24*time.Hour)/time.Millisecond) {

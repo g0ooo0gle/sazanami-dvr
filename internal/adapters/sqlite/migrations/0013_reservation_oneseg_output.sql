@@ -18,14 +18,14 @@ CREATE TABLE reservation_oneseg_outputs (
 
 CREATE TRIGGER recording_segments_oneseg_ordinal_insert
 BEFORE INSERT ON recording_segments
-WHEN NEW.ordinal NOT IN (0, 1)
+WHEN NEW.ordinal IS NULL OR typeof(NEW.ordinal)<>'integer' OR NEW.ordinal NOT IN (0, 1)
 BEGIN
     SELECT RAISE(ABORT, 'recording segment ordinal outside supported range');
 END;
 
 CREATE TRIGGER recording_segments_oneseg_ordinal_update
 BEFORE UPDATE OF ordinal ON recording_segments
-WHEN NEW.ordinal NOT IN (0, 1)
+WHEN NEW.ordinal IS NULL OR typeof(NEW.ordinal)<>'integer' OR NEW.ordinal NOT IN (0, 1)
 BEGIN
     SELECT RAISE(ABORT, 'recording segment ordinal outside supported range');
 END;

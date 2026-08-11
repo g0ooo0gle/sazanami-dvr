@@ -396,21 +396,23 @@ func (plan FilePlan) Validate() error {
 
 // ClaimRequestは一つの予約へ録画処理と最大二つのファイル計画を同時に割り当てる。
 type ClaimRequest struct {
-	ReservationID   catalogmodel.ID
-	AttemptID       catalogmodel.ID
-	SegmentID       catalogmodel.ID
-	OwnerID         catalogmodel.ID
-	OwnerGeneration int64
-	Now             time.Time
-	Plan            FilePlan
-	OneSegSegmentID catalogmodel.ID
-	OneSegPlan      *FilePlan
+	ReservationID      catalogmodel.ID
+	ReservationVersion int64
+	AttemptID          catalogmodel.ID
+	SegmentID          catalogmodel.ID
+	OwnerID            catalogmodel.ID
+	OwnerGeneration    int64
+	Now                time.Time
+	Plan               FilePlan
+	OneSegSegmentID    catalogmodel.ID
+	OneSegPlan         *FilePlan
 }
 
 // ValidateはDBへ録画所有権を保存できる値かを検証する。
 func (request ClaimRequest) Validate() error {
 	zero := catalogmodel.ID{}
-	if request.ReservationID == zero || request.AttemptID == zero || request.SegmentID == zero || request.OwnerID == zero ||
+	if request.ReservationID == zero || request.ReservationVersion < 1 || request.AttemptID == zero ||
+		request.SegmentID == zero || request.OwnerID == zero ||
 		request.OwnerGeneration < 1 || request.Now.IsZero() || request.Now.Location() != time.UTC || request.Now.UnixMilli() < 0 ||
 		request.Plan.Validate() != nil {
 		return errors.New("recording: invalid claim request")
