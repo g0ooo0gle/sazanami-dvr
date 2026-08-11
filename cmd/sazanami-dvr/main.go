@@ -283,6 +283,11 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 		return errorsStable("live-manager-invalid")
 	}
 	defer liveManager.CloseAll()
+	hlsLiveManager, err := liverelay.NewManager(snapshots, liveStreamAdapter)
+	if err != nil {
+		return errorsStable("live-manager-invalid")
+	}
+	defer hlsLiveManager.CloseAll()
 	router, err := ctrlcmdruntime.NewRecordingRouterWithLive(snapshots, reservations, automaticRules, store, liveManager,
 		logoAdapter, ctrlcmdruntime.SystemClock{}, codec.DefaultLimits())
 	if err != nil {
@@ -302,10 +307,12 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	defer listener.Close()
 	serviceContext, serviceCancel := context.WithCancel(ctx)
 	defer serviceCancel()
-	httpHandler, err := recordinghttpadapter.NewHandlerWithLogos(store, recordingHTTPFiles{root: recordingRoot}, snapshots, logoAdapter)
+	httpHandler, err := recordinghttpadapter.NewHandlerWithLive(serviceContext, *dataRoot, store,
+		recordingHTTPFiles{root: recordingRoot}, snapshots, logoAdapter, recordingHTTPLive{manager: hlsLiveManager})
 	if err != nil {
 		return errorsStable("recording-http-handler-invalid")
 	}
+	defer httpHandler.Close()
 	httpServer := recordinghttpadapter.NewServer(*httpListenAddress, httpHandler)
 	httpServer.BaseContext = func(net.Listener) context.Context { return serviceContext }
 	httpListener, err := (&net.ListenConfig{}).Listen(startupContext, "tcp", *httpListenAddress)
@@ -366,11 +373,13 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	case <-ctx.Done():
 	}
 	serviceCancel()
-	liveManager.CloseAll()
 	_ = listener.Close()
 	shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	_ = httpServer.Shutdown(shutdownContext)
 	shutdownCancel()
+	hlsCloseErr := httpHandler.Close()
+	hlsLiveManager.CloseAll()
+	liveManager.CloseAll()
 	_ = httpListener.Close()
 	shutdown := time.NewTimer(30 * time.Second)
 	defer shutdown.Stop()
@@ -400,6 +409,9 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	}
 	if httpErr != nil {
 		return errorsStable("recording-http-listen-failed")
+	}
+	if hlsCloseErr != nil {
+		return errorsStable("recording-hls-shutdown-failed")
 	}
 	return nil
 }
@@ -442,6 +454,38 @@ func (files recordingHTTPFiles) OpenFinal(plan corerecording.FilePlan, size int6
 		return nil, errors.New("recording file root unavailable")
 	}
 	return files.root.OpenFinal(plan, size)
+}
+
+// recordingHTTPLiveはHTTPアダプターの放送指定をライブ管理の型へ変換する。
+// CtrlCmd用とは別のManagerを使うが、Mirakurunへの同時4接続枠は共有する。
+type recordingHTTPLive struct{ manager *liverelay.Manager }
+
+// SelectはHTTPで指定された放送をHLS用のライブ管理へ登録する。
+// この段階ではMirakurunの放送ストリームを開かない。
+func (live recordingHTTPLive) Select(ctx context.Context, service recordinghttpadapter.LiveService,
+	networkTVID int32,
+) (int32, error) {
+	if live.manager == nil {
+		return 0, errorsStable("live-manager-invalid")
+	}
+	return live.manager.Select(ctx, liverelay.Service{
+		NetworkID: service.NetworkID, TransportStreamID: service.TransportStreamID, ServiceID: service.ServiceID,
+	}, networkTVID)
+}
+
+// Openは登録済みの放送ストリームをHLS配信のために開く。
+func (live recordingHTTPLive) Open(ctx context.Context, processID int32) (recordinghttpadapter.LiveStream, error) {
+	if live.manager == nil {
+		return nil, errorsStable("live-manager-invalid")
+	}
+	return live.manager.Open(ctx, processID)
+}
+
+// Closeは指定したHLSライブを終了し、共有している接続枠を解放する。
+func (live recordingHTTPLive) Close(networkTVID int32) {
+	if live.manager != nil {
+		live.manager.Close(networkTVID)
+	}
 }
 
 func recordingListenScope(address string) string {
