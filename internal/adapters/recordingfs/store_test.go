@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -172,8 +173,13 @@ func TestOpenFinalChecksPublishedFileAndExpectedSize(t *testing.T) {
 	if err != nil || !bytes.Equal(got, data) {
 		t.Fatalf("bytes=%d err=%v", len(got), err)
 	}
+	fd := file.file.Fd()
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
+	}
+	var stat syscall.Stat_t
+	if err := syscall.Fstat(int(fd), &stat); !errors.Is(err, syscall.EBADF) {
+		t.Fatalf("完成fileのdescriptorが閉じていません: %v", err)
 	}
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
@@ -181,11 +187,38 @@ func TestOpenFinalChecksPublishedFileAndExpectedSize(t *testing.T) {
 	if _, err := root.OpenFinal(plan, 189); err == nil {
 		t.Fatal("size mismatch accepted")
 	}
-	if err := os.Chmod(filepath.Join(rootPath, filepath.FromSlash(plan.FinalPath)), 0o644); err != nil {
+	finalPath := filepath.Join(rootPath, filepath.FromSlash(plan.FinalPath))
+	linkPath := finalPath + ".link"
+	if err := os.Link(finalPath, linkPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := root.OpenFinal(plan, 188); err == nil {
+		t.Fatal("hard linkを持つ完成fileが受理されました")
+	}
+	if err := os.Remove(linkPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(finalPath, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := root.OpenFinal(plan, 188); err == nil {
 		t.Fatal("unsafe mode accepted")
+	}
+}
+
+func TestValidRegularInfoRejectsDifferentOwner(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "recording.ts")
+	if err := os.WriteFile(path, bytes.Repeat([]byte{0x47}, 188), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat := *info.Sys().(*syscall.Stat_t)
+	stat.Uid++
+	if validRegularInfo(fileInfoWithStat{FileInfo: info, stat: &stat}, 1) {
+		t.Fatal("所有者が異なる完成file情報が受理されました")
 	}
 }
 
@@ -278,3 +311,10 @@ func fileID(t *testing.T, marker byte) catalogmodel.ID {
 	}
 	return id
 }
+
+type fileInfoWithStat struct {
+	os.FileInfo
+	stat *syscall.Stat_t
+}
+
+func (info fileInfoWithStat) Sys() any { return info.stat }

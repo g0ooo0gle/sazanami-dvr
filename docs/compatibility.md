@@ -74,6 +74,7 @@ Android TV向けKomorebiは、KonomiTV経由の接続とEDCB直接接続の両�
 | 完成録画の詳細 | CtrlCmd 2024 | Android上で確認済み | 一覧から選んだ一件の詳細取得に成功 |
 | 再生URLの取得 | HTTP resolver | Android上で確認済み | 絶対パスを含まない仮想URLから再生を開始 |
 | 元のTSの直接再生とシーク | HTTP GET／HEAD／Range | Android上で確認済み | 再生開始と30秒送りに成功。終了後の接続は0本。Range要求の自動テスト、同時8件、完成状態、権限、所有者、サイズの再確認も実施 |
+| HTTP APIで元のTSを再生 | `/api/xcode` option 10 | 自動確認済み | EDCB直接接続で、録画再生方法として「HTTP API」を選ぶ場合。原画質一件だけを表示し、既存の完成条件とRange配信を使用。Android画面は未確認 |
 | 代替画像、空チャプター、最小タイル情報 | HTTP | 自動確認済み | 一覧を壊さないための最小応答。実サムネイルではない |
 | 局ロゴ | HTTP | 実通信確認済み | `/legacy/logo.lua`でKonomiTV経路と同じPNGを取得。Android TV画面は未確認 |
 | LANからの直接接続 | CtrlCmd／HTTP | 自動確認済み | CtrlCmdはIPv4全interfaceが既定。HTTPは端末内が既定で、private IPまたは全interfaceを明示可能 |
@@ -81,7 +82,7 @@ Android TV向けKomorebiは、KonomiTV経由の接続とEDCB直接接続の両�
 | Android上の一覧、詳細、再生、30秒送り | Komorebi 1.1.0-beta6 | 確認済み | 公式APKから一続きで操作。Android TV実機と長時間再生は未確認 |
 | Android上の主画面ライブ | Komorebi 1.1.0-beta6 | 確認済み | 「優先ソース」で`EDCB (ダイレクトストリーミング)`を選ぶ。Android TV実機は未確認 |
 | Android上の二画面ライブ | Komorebi 1.1.0-beta6 | 確認済み | 主画面2接続、二画面4接続、右画面終了後2接続、全画面終了後0接続を確認。右画面終了時にKomorebiが入力元エラーを1件記録したが、主画面は継続し接続も解放 |
-| 画質変換、キャスト | HTTP | 未対応 | 後続版で操作ごとに追加する |
+| 画質変換、HLS、キャスト | HTTP | 未対応 | 原画質の完成録画だけを返し、未対応の画質を表示しない。後続版で操作ごとに追加する |
 
 Komorebiの接続設定は[Komorebi接続手順](komorebi-setup.md)にまとめています。ライブ視聴元の初期値は
 動画変換経路のため、Sazanami DVRを使う場合は直接配信へ変更してください。二画面の操作手順と終了時の
