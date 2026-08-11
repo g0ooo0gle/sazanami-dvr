@@ -103,8 +103,10 @@ func TestAutomaticRuleCommandsRoundTrip(t *testing.T) {
 	changed := rule
 	changed.Number = 1
 	changed.Search.Keyword = "変更"
+	changed.Recording.TunerID = 9
 	response = handleRequest(t, handler, requestForRule(t, CommandChange, changed, limits))
-	if response.Code != resultSuccess || operations.changed.Number != 1 || operations.changed.Search.Keyword != "変更" {
+	if response.Code != resultSuccess || operations.changed.Number != 1 || operations.changed.Search.Keyword != "変更" ||
+		operations.changed.Recording.TunerID != 9 {
 		t.Fatalf("change response=%+v changed=%+v", response, operations.changed)
 	}
 	response = handleRequest(t, handler, deleteRequest(t, 1, limits))

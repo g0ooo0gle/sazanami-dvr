@@ -38,6 +38,7 @@ type Result struct {
 	Matched, Created, Duplicates int
 	RecordedTitleMatches         int
 	UnavailableRules             int
+	ForcedTunerUnavailableRules  int
 	LimitReached                 bool
 }
 
@@ -57,6 +58,7 @@ type preparedRule struct {
 	matcher     autoreservation.ProgramMatcher
 	skip        bool
 	unavailable bool
+	forcedTuner bool
 	post        recording.PostRecordingSettings
 }
 
@@ -84,6 +86,9 @@ func (evaluator Evaluator) Run(ctx context.Context) (Result, error) {
 		prepared[index] = prepareRule(rule, evaluator.ValidatePostRecordingScript)
 		if prepared[index].unavailable {
 			result.UnavailableRules++
+			if prepared[index].forcedTuner {
+				result.ForcedTunerUnavailableRules++
+			}
 		}
 	}
 	recordedTitles, err := loadRecordedTitleIndex(ctx, evaluator.Store, prepared)
@@ -271,8 +276,13 @@ func prepareRule(rule autoreservation.Rule, validateScript func(string) error) p
 		prepared.skip = true
 		return prepared
 	}
+	if settings.TunerID != 0 {
+		prepared.unavailable = true
+		prepared.forcedTuner = true
+		return prepared
+	}
 	if (settings.Mode != 1 && settings.Mode != 5) || settings.Exact ||
-		settings.Continue || settings.PartialMode != 0 || settings.TunerID != 0 || len(settings.PartialFolders) != 0 {
+		settings.Continue || settings.PartialMode != 0 || len(settings.PartialFolders) != 0 {
 		prepared.unavailable = true
 		return prepared
 	}

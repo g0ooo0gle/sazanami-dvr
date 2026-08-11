@@ -151,6 +151,22 @@ func TestAddAcceptsBasicSettingsAndRejectsUnsupportedMode(t *testing.T) {
 	}
 }
 
+func TestAddRejectsForcedTunerWithoutPartialAcceptance(t *testing.T) {
+	operations := &fakeOperations{}
+	request := reservationRequestSettingsWithTuner(t, CommandAdd, Version, 0, 1, 3, true,
+		0, 0, 0, 1, 0, recording.OutputSettings{}, recording.PostRecordingSettings{}, nil, 7)
+	var response bytes.Buffer
+	if err := (Handler{Operations: operations, Limits: codec.DefaultLimits()}).Handle(
+		context.Background(), request, &response,
+	); err != nil {
+		t.Fatal(err)
+	}
+	frame, err := codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
+	if err != nil || frame.Code != ResultFailure || len(operations.added) != 0 {
+		t.Fatalf("frame=%+v added=%+v err=%v", frame, operations.added, err)
+	}
+}
+
 func TestAddAcceptsDisabledAndMarginBoundariesAtomically(t *testing.T) {
 	operations := &fakeOperations{}
 	handler := Handler{Operations: operations, Limits: codec.DefaultLimits()}
@@ -912,6 +928,15 @@ func reservationRequestSettingsWithFileNames(t *testing.T, command int32, versio
 	recordingMode, priority uint8, follow bool, useMargins uint8, startMargin, endMargin int32, count int,
 	serviceMode uint32, output recording.OutputSettings, post recording.PostRecordingSettings, fileNames []string,
 ) []byte {
+	return reservationRequestSettingsWithTuner(t, command, version, reserveID, recordingMode, priority, follow,
+		useMargins, startMargin, endMargin, count, serviceMode, output, post, fileNames, 0)
+}
+
+func reservationRequestSettingsWithTuner(t *testing.T, command int32, version uint16, reserveID int32,
+	recordingMode, priority uint8, follow bool, useMargins uint8, startMargin, endMargin int32, count int,
+	serviceMode uint32, output recording.OutputSettings, post recording.PostRecordingSettings, fileNames []string,
+	tunerID uint32,
+) []byte {
 	t.Helper()
 	var itemBody bytes.Buffer
 	item, err := codec.NewWriter(&itemBody, codec.DefaultLimits())
@@ -954,8 +979,8 @@ func reservationRequestSettingsWithFileNames(t *testing.T, command int32, versio
 	if err := item.SystemTime(start); err != nil {
 		t.Fatal(err)
 	}
-	writeInputSettingsWithPostRecording(t, item, recordingMode, priority, follow, useMargins, startMargin, endMargin,
-		serviceMode, output, post)
+	writeInputSettingsWithPostRecordingAndTuner(t, item, recordingMode, priority, follow, useMargins, startMargin,
+		endMargin, serviceMode, output, post, tunerID)
 	if err := item.I32(0); err != nil {
 		t.Fatal(err)
 	}
@@ -1003,17 +1028,33 @@ func writeInputSettingsWithPostRecording(t *testing.T, writer *codec.Writer, mod
 	useMargins uint8, startMargin, endMargin int32, serviceMode uint32, output recording.OutputSettings,
 	post recording.PostRecordingSettings,
 ) {
+	writeInputSettingsWithPostRecordingAndTuner(t, writer, mode, priority, follow, useMargins, startMargin, endMargin,
+		serviceMode, output, post, 0)
+}
+
+func writeInputSettingsWithPostRecordingAndTuner(t *testing.T, writer *codec.Writer, mode, priority uint8,
+	follow bool, useMargins uint8, startMargin, endMargin int32, serviceMode uint32, output recording.OutputSettings,
+	post recording.PostRecordingSettings, tunerID uint32,
+) {
 	suspend, reboot, ok := encodePostRecordingMode(post.Mode)
 	if !ok {
 		t.Fatalf("invalid post recording mode: %d", post.Mode)
 	}
-	writeInputSettingsWire(t, writer, mode, priority, follow, useMargins, startMargin, endMargin, serviceMode,
-		output, post.Script, suspend, reboot)
+	writeInputSettingsWireWithTuner(t, writer, mode, priority, follow, useMargins, startMargin, endMargin, serviceMode,
+		output, post.Script, suspend, reboot, tunerID)
 }
 
 func writeInputSettingsWire(t *testing.T, writer *codec.Writer, mode, priority uint8, follow bool,
 	useMargins uint8, startMargin, endMargin int32, serviceMode uint32, output recording.OutputSettings,
 	batch string, suspend uint8, reboot bool,
+) {
+	writeInputSettingsWireWithTuner(t, writer, mode, priority, follow, useMargins, startMargin, endMargin, serviceMode,
+		output, batch, suspend, reboot, 0)
+}
+
+func writeInputSettingsWireWithTuner(t *testing.T, writer *codec.Writer, mode, priority uint8, follow bool,
+	useMargins uint8, startMargin, endMargin int32, serviceMode uint32, output recording.OutputSettings,
+	batch string, suspend uint8, reboot bool, tunerID uint32,
 ) {
 	t.Helper()
 	var folder bytes.Buffer
@@ -1061,7 +1102,7 @@ func writeInputSettingsWire(t *testing.T, writer *codec.Writer, mode, priority u
 	_ = settingsWriter.I32(endMargin)
 	_ = settingsWriter.U8(0)
 	_ = settingsWriter.U8(0)
-	_ = settingsWriter.U32(0)
+	_ = settingsWriter.U32(tunerID)
 	writeTestVector(t, settingsWriter, nil, 0)
 	if err := writer.I32(int32(4 + body.Len())); err != nil {
 		t.Fatal(err)
