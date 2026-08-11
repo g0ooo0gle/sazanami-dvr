@@ -503,6 +503,19 @@ func TestRecordingServeRefreshesCatalogWithoutOpeningStreamBeforeReservationTime
 		cancel()
 		t.Fatalf("history status=%d body=%s read=%v close=%v", httpResponse.StatusCode, responseBytes, readErr, closeErr)
 	}
+	tvCastResponse, err := http.Get("http://" + httpAddress + "/api/TvCast?id=1-2-3&n=0&json=1&ctok=")
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	tvCastBody, readErr := io.ReadAll(tvCastResponse.Body)
+	closeErr = tvCastResponse.Body.Close()
+	if readErr != nil || closeErr != nil || tvCastResponse.StatusCode != http.StatusOK ||
+		string(tvCastBody) != `{"result":true}` || streamCalls.Load() != 0 {
+		cancel()
+		t.Fatalf("TvCast status=%d body=%q streams=%d read=%v close=%v",
+			tvCastResponse.StatusCode, tvCastBody, streamCalls.Load(), readErr, closeErr)
+	}
 	cancel()
 	select {
 	case code := <-done:
