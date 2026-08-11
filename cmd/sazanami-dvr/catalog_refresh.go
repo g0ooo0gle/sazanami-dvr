@@ -107,6 +107,10 @@ func observeAutomaticReservation(stdout, stderr io.Writer) func(autoreservationa
 		fmt.Fprintf(stdout, "automatic_reservation result=completed rules=%d programs=%d matched=%d created=%d duplicates=%d recorded_title_matches=%d unavailable_rules=%d limit_reached=%t duration_ms=%d\n",
 			result.Rules, result.Programs, result.Matched, result.Created, result.Duplicates, result.RecordedTitleMatches,
 			result.UnavailableRules, result.LimitReached, duration.Milliseconds())
+		if result.ForcedTunerUnavailableRules > 0 {
+			fmt.Fprintf(stdout, "automatic_reservation_unavailable reason=forced-tuner-not-supported-by-provider rules=%d\n",
+				result.ForcedTunerUnavailableRules)
+		}
 	}
 }
 

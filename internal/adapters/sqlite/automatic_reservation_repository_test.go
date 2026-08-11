@@ -27,7 +27,7 @@ func TestAutomaticRuleRoundTripAndDelete(t *testing.T) {
 		Recording: autoreservation.RecordingSettings{
 			Mode: 1, Priority: 4, Follow: true, ServiceMode: 16, Batch: "after.bat",
 			Folders:     []autoreservation.Folder{{Path: "recordings", Writer: "Write_Default.dll", Name: "name"}},
-			StartMargin: &startMargin, EndMargin: &endMargin,
+			StartMargin: &startMargin, EndMargin: &endMargin, TunerID: 7,
 		},
 	}
 	created, err := store.CreateAutomaticRule(context.Background(), rule)
@@ -36,16 +36,20 @@ func TestAutomaticRuleRoundTripAndDelete(t *testing.T) {
 	}
 	items, err := store.AutomaticRules(context.Background(), autoreservation.MaxPage, 0)
 	if err != nil || len(items) != 1 || items[0].Search.Keyword != rule.Search.Keyword ||
-		items[0].Recording.StartMargin == nil || *items[0].Recording.StartMargin != startMargin {
+		items[0].Recording.StartMargin == nil || *items[0].Recording.StartMargin != startMargin ||
+		items[0].Recording.TunerID != 7 {
 		t.Fatalf("items=%+v err=%v", items, err)
 	}
 	changedSearch := rule.Search
 	changedSearch.Keyword = "変更"
-	if err := store.UpdateAutomaticRule(context.Background(), 1, changedSearch, rule.Recording, 11); err != nil {
+	changedRecording := rule.Recording
+	changedRecording.TunerID = 9
+	if err := store.UpdateAutomaticRule(context.Background(), 1, changedSearch, changedRecording, 11); err != nil {
 		t.Fatal(err)
 	}
 	items, err = store.AutomaticRules(context.Background(), 1, 0)
-	if err != nil || len(items) != 1 || items[0].Version != 2 || items[0].Search.Keyword != "変更" {
+	if err != nil || len(items) != 1 || items[0].Version != 2 || items[0].Search.Keyword != "変更" ||
+		items[0].Recording.TunerID != 9 {
 		t.Fatalf("changed=%+v err=%v", items, err)
 	}
 	if err := store.Close(); err != nil {
@@ -57,7 +61,7 @@ func TestAutomaticRuleRoundTripAndDelete(t *testing.T) {
 	}
 	defer reopened.Close()
 	items, err = reopened.AutomaticRules(context.Background(), 1, 0)
-	if err != nil || len(items) != 1 || items[0].Search.Keyword != "変更" {
+	if err != nil || len(items) != 1 || items[0].Search.Keyword != "変更" || items[0].Recording.TunerID != 9 {
 		t.Fatalf("restarted=%+v err=%v", items, err)
 	}
 	if err := reopened.DeleteAutomaticRule(context.Background(), 1); err != nil {

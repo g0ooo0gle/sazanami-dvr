@@ -133,12 +133,58 @@ func TestEvaluatorCreatesOnceAndSkipsUnavailableRule(t *testing.T) {
 	}
 	result, err := evaluator.Run(context.Background())
 	if err != nil || result.Rules != 2 || result.Programs != 2 || result.Comparisons != 3 ||
-		result.UnavailableRules != 1 || result.Matched != 1 || result.Created != 1 || len(store.created) != 1 {
+		result.UnavailableRules != 1 || result.ForcedTunerUnavailableRules != 0 || result.Matched != 1 ||
+		result.Created != 1 || len(store.created) != 1 {
 		t.Fatalf("result=%+v created=%d err=%v", result, len(store.created), err)
 	}
 	result, err = evaluator.Run(context.Background())
 	if err != nil || result.Created != 0 || result.Duplicates != 1 || len(store.created) != 1 {
 		t.Fatalf("second=%+v created=%d err=%v", result, len(store.created), err)
+	}
+}
+
+func TestEvaluatorCountsForcedTunerRulesFirst(t *testing.T) {
+	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+	supported := storedRule(1, autoreservation.SearchCondition{Enabled: true})
+	forced := storedRule(2, autoreservation.SearchCondition{Enabled: true})
+	forced.Recording.TunerID = 7
+	forcedWithInvalidSearch := storedRule(3, autoreservation.SearchCondition{Enabled: true, Regex: true, Keyword: "["})
+	forcedWithInvalidSearch.Recording.TunerID = 8
+	otherUnavailable := storedRule(4, autoreservation.SearchCondition{Enabled: true})
+	otherUnavailable.Recording.Exact = true
+	disabledForced := storedRule(5, autoreservation.SearchCondition{Enabled: false})
+	disabledForced.Recording.TunerID = 9
+	store := &evaluationStore{rules: []autoreservation.Rule{
+		supported, forced, forcedWithInvalidSearch, otherUnavailable, disabledForced,
+	}, seen: make(map[catalogmodel.ID]struct{})}
+	result, err := (Evaluator{
+		Store: store, Catalog: evaluationCatalog{programs: []catalogmodel.CurrentProgram{
+			currentProgram(1, now.Add(time.Hour), "番組", "", catalogmodel.FreeYes),
+		}}, Clock: fixedClock{now},
+		NewID:       func() (catalogmodel.ID, error) { return catalogmodel.ID{10}, nil },
+		IsDuplicate: func(error) bool { return false },
+	}).Run(context.Background())
+	if err != nil || result.UnavailableRules != 3 || result.ForcedTunerUnavailableRules != 2 ||
+		result.Matched != 1 || result.Created != 1 || len(store.created) != 1 {
+		t.Fatalf("result=%+v created=%d err=%v", result, len(store.created), err)
+	}
+}
+
+func TestEvaluatorDoesNotCreateForMatchingForcedTunerRule(t *testing.T) {
+	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+	rule := storedRule(1, autoreservation.SearchCondition{Enabled: true})
+	rule.Recording.TunerID = 7
+	store := &evaluationStore{rules: []autoreservation.Rule{rule}, seen: make(map[catalogmodel.ID]struct{})}
+	result, err := (Evaluator{
+		Store: store, Catalog: evaluationCatalog{programs: []catalogmodel.CurrentProgram{
+			currentProgram(1, now.Add(time.Hour), "番組", "", catalogmodel.FreeYes),
+		}}, Clock: fixedClock{now},
+		NewID:       func() (catalogmodel.ID, error) { return catalogmodel.ID{10}, nil },
+		IsDuplicate: func(error) bool { return false },
+	}).Run(context.Background())
+	if err != nil || result.Matched != 0 || result.Created != 0 || result.UnavailableRules != 1 ||
+		result.ForcedTunerUnavailableRules != 1 || len(store.created) != 0 {
+		t.Fatalf("result=%+v created=%d err=%v", result, len(store.created), err)
 	}
 }
 
