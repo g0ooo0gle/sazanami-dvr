@@ -166,9 +166,10 @@ type ReservationFollowRequest struct {
 	ExpectedRevisionID catalogmodel.ID
 	TargetRevisionID   catalogmodel.ID
 	Now                time.Time
+	ExtensionOnly      bool
 }
 
-// Validateは一回の録画開始前追従に必要な値が揃っているかを検証する。
+// Validateは一回の番組時刻追従に必要な値が揃っているかを検証する。
 func (request ReservationFollowRequest) Validate() error {
 	zeroID := catalogmodel.ID{}
 	if request.ReservationID == zeroID || request.ExpectedRevisionID == zeroID || request.TargetRevisionID == zeroID ||
