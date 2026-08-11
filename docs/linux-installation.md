@@ -12,10 +12,10 @@
 |---|---|---|
 | 版ごとの配布物 | `/opt/sazanami-dvr/<version>/` | 削除する |
 | 実行ファイルのリンク | `/usr/local/bin/sazanami-dvr` | 削除する |
-| 設定 | `/etc/sazanami-dvr/` | 残す |
-| DB、バックアップ、既定録画先 | `/var/lib/sazanami-dvr/` | 残す |
+| 環境設定 | `/etc/sazanami-dvr/` | 残す |
+| チャンネル設定、DB、バックアップ、既定録画先 | `/var/lib/sazanami-dvr/` | 残す |
 
-設定、DB、録画、バックアップを消すのは、末尾の「すべてのデータを明示的にpurgeする」だけです。
+環境設定、チャンネル設定、DB、録画、バックアップを消すのは、末尾の「すべてのデータを明示的にpurgeする」だけです。
 
 ## 初回導入
 
@@ -87,7 +87,7 @@ CtrlCmdは信頼できるLANから接続するための設定です。同じPC�
 ```console
 sudo install -o root -g sazanami-dvr -m 0640 \
   ./channels.json \
-  /etc/sazanami-dvr/channels.json
+  /var/lib/sazanami-dvr/channels.json
 ```
 
 ### 5. DBと番組表を明示的に準備する
@@ -115,7 +115,7 @@ sudo -u sazanami-dvr /usr/local/bin/sazanami-dvr catalog sync \
 
 sudo -u sazanami-dvr /usr/local/bin/sazanami-dvr ctrlcmd validate \
   --data-root /var/lib/sazanami-dvr \
-  --channel-map /etc/sazanami-dvr/channels.json
+  --channel-map /var/lib/sazanami-dvr/channels.json
 ```
 
 ## サービスを起動する
@@ -167,7 +167,25 @@ sudo -u sazanami-dvr /usr/local/bin/sazanami-dvr db backup \
   --data-root /var/lib/sazanami-dvr
 ```
 
-成功時に表示された`backup_id`を、更新が完了するまで手元へ控えます。次に、新版を旧版とは別のディレクトリへ展開します。
+成功時に表示された`backup_id`を、更新が完了するまで手元へ控えます。
+
+v0.1.1の標準設定から更新する場合、環境設定は自動で書き換わりません。`SAZANAMI_CHANNEL_MAP`が旧配置を指している場合だけ、サービスを停止したまま次を実行します。すでにデータ保存先の直下を指している場合は、この手順を飛ばしてください。
+
+```console
+sudo install -o root -g sazanami-dvr -m 0640 \
+  /etc/sazanami-dvr/channels.json \
+  /var/lib/sazanami-dvr/channels.json
+
+sudoedit /etc/sazanami-dvr/sazanami-dvr.env
+```
+
+環境設定の該当行を次の値へ変更します。新版の起動を確認するまで、コピー元のファイルは削除しないでください。
+
+```ini
+SAZANAMI_CHANNEL_MAP=/var/lib/sazanami-dvr/channels.json
+```
+
+次に、新版を旧版とは別のディレクトリへ展開します。
 
 ```console
 sudo install -d -o root -g root -m 0755 /opt/sazanami-dvr/<new-version>
@@ -245,7 +263,7 @@ sudo systemctl status sazanami-dvr.service
 
 ## 通常のアンインストールではデータを残す
 
-通常削除は、サービスと配布物だけを外します。設定、DB、録画、バックアップ、専用利用者は残ります。
+通常削除は、サービスと配布物だけを外します。環境設定、チャンネル設定、DB、録画、バックアップ、専用利用者は残ります。
 
 ```console
 sudo systemctl disable --now sazanami-dvr.service
