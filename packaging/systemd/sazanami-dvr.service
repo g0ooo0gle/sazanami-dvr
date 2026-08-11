@@ -1,0 +1,21 @@
+[Unit]
+Description=Sazanami DVR recording service
+Documentation=https://github.com/g0ooo0gle/sazanami-dvr/blob/main/docs/linux-installation.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=sazanami-dvr
+Group=sazanami-dvr
+EnvironmentFile=/etc/sazanami-dvr/sazanami-dvr.env
+# 同時録画数は指定せず、Sazanami DVRの起動時判定を使います。
+ExecStart=/usr/local/bin/sazanami-dvr recording serve --data-root ${SAZANAMI_DATA_ROOT} --recording-root ${SAZANAMI_RECORDING_ROOT} --channel-map ${SAZANAMI_CHANNEL_MAP} --provider mirakurun --base-url ${SAZANAMI_MIRAKURUN_URL} --listen ${SAZANAMI_CTRLCMD_LISTEN} --http-listen ${SAZANAMI_RECORDING_HTTP_LISTEN}
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=2min
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -41,6 +41,38 @@ jobs:
       - name: 依存fileを確認
         run: go mod verify
 
+      - name: systemd設定を確認
+        run: |
+          unit=packaging/systemd/sazanami-dvr.service
+          env_file=packaging/systemd/sazanami-dvr.env.example
+          test -f "$unit"
+          test -f "$env_file"
+          test -f docs/linux-installation.md
+          test "$(grep -c '^ExecStart=' "$unit")" -eq 1
+          grep -qx 'Restart=on-failure' "$unit"
+          grep -qx 'RestartSec=5s' "$unit"
+          grep -qx 'KillSignal=SIGTERM' "$unit"
+          grep -qx 'TimeoutStopSec=2min' "$unit"
+          grep -qx 'UMask=0077' "$unit"
+          ! grep -Eq '^ExecStart(Pre|Post)=' "$unit"
+          ! grep -Fq 'db migrate' "$unit"
+          grep -qx 'SAZANAMI_CTRLCMD_LISTEN=0.0.0.0:4520' "$env_file"
+          grep -qx 'SAZANAMI_RECORDING_HTTP_LISTEN=127.0.0.1:4521' "$env_file"
+          grep -qx 'SAZANAMI_WEBUI_LISTEN=127.0.0.1:4522' "$env_file"
+          test "$(grep -c '^SAZANAMI_' "$env_file")" -eq 7
+          grep -Fq '${SAZANAMI_CTRLCMD_LISTEN}' "$unit"
+          grep -Fq '${SAZANAMI_RECORDING_HTTP_LISTEN}' "$unit"
+          ! grep -Fq -- '--max-concurrent-recordings' "$unit"
+          ! grep -Fq -- '--max-concurrent-recordings' "$env_file"
+          grep -Fx 'ExecStart=' docs/linux-installation.md
+          grep -Fq -- '--max-concurrent-recordings 2' docs/linux-installation.md
+          grep -Fq 'GET /api/tuners' docs/linux-installation.md
+          go build -trimpath -o "$RUNNER_TEMP/sazanami-dvr-systemd-verify" ./cmd/sazanami-dvr
+          sudo useradd --system --user-group --home-dir /var/lib/sazanami-dvr --shell /usr/sbin/nologin sazanami-dvr
+          sudo install -D -m 0755 "$RUNNER_TEMP/sazanami-dvr-systemd-verify" /usr/local/bin/sazanami-dvr
+          sudo install -D -m 0600 "$env_file" /etc/sazanami-dvr/sazanami-dvr.env
+          sudo systemd-analyze verify "$unit"
+
       - name: unit testを実行
         run: go test -count=1 ./...
 

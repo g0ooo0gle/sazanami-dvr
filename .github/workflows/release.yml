@@ -56,7 +56,21 @@ jobs:
               go build -trimpath -ldflags "-s -w -X main.productCommit=$GITHUB_SHA" \
               -o "dist/$package/sazanami-dvr" ./cmd/sazanami-dvr
             cp LICENSE README.md THIRD_PARTY_NOTICES.md "dist/$package/"
+            cp -R docs packaging "dist/$package/"
+            for required_file in sazanami-dvr LICENSE README.md THIRD_PARTY_NOTICES.md \
+              docs/linux-installation.md \
+              packaging/systemd/sazanami-dvr.service \
+              packaging/systemd/sazanami-dvr.env.example; do
+              test -f "dist/$package/$required_file"
+            done
             tar -C dist -czf "dist/$package.tar.gz" "$package"
+            tar -tzf "dist/$package.tar.gz" > "$RUNNER_TEMP/$package.list"
+            for required_file in sazanami-dvr LICENSE README.md THIRD_PARTY_NOTICES.md \
+              docs/linux-installation.md \
+              packaging/systemd/sazanami-dvr.service \
+              packaging/systemd/sazanami-dvr.env.example; do
+              grep -Fx "$package/$required_file" "$RUNNER_TEMP/$package.list"
+            done
             rm -r "dist/$package"
           done
           cd dist
