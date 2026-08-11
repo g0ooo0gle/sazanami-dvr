@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -337,10 +338,62 @@ func TestStreamUsesExplicitConcurrentLimitAndReusesSlot(t *testing.T) {
 	}
 }
 
-func TestStreamRejectsConcurrentLimitOutsideProfile(t *testing.T) {
-	for _, maximum := range []int{0, maximumConcurrentStreams + 1} {
+func TestStreamOpensNineIndependentRequests(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		writer.Header().Set("Content-Type", "video/MP2T")
+		writer.WriteHeader(http.StatusOK)
+		writer.(http.Flusher).Flush()
+		<-request.Context().Done()
+	}))
+	defer server.Close()
+	adapter, err := NewStreamWithLimit(server.URL, 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leases := make([]providerstream.Lease, 0, 9)
+	for index := range 9 {
+		request := validStreamRequest(fmt.Sprint(1000 + index))
+		request.CorrelationID = fmt.Sprintf("recording-%d", index)
+		lease, err := adapter.OpenStream(context.Background(), request)
+		if err != nil {
+			t.Fatalf("index=%d error=%v", index, err)
+		}
+		leases = append(leases, lease)
+	}
+	over := validStreamRequest("2000")
+	over.CorrelationID = "recording-over"
+	if _, err := adapter.OpenStream(context.Background(), over); !provider.IsReason(err, provider.ReasonRejected) {
+		t.Fatalf("上限超過error=%v", err)
+	}
+	if requests.Load() != 9 || adapter.active != 9 {
+		t.Fatalf("requests=%d active=%d", requests.Load(), adapter.active)
+	}
+	for _, lease := range leases {
+		_ = lease.Cancel()
+		_ = lease.Close()
+	}
+	if adapter.active != 0 {
+		t.Fatalf("active=%d", adapter.active)
+	}
+}
+
+func TestStreamAcceptsAnyPositiveConcurrentLimit(t *testing.T) {
+	for _, maximum := range []int{-1, 0} {
 		if _, err := NewStreamWithLimit("http://127.0.0.1:9", maximum); !provider.IsReason(err, provider.ReasonInternal) {
 			t.Fatalf("maximum=%d err=%v", maximum, err)
+		}
+	}
+	for _, maximum := range []int{9, 20, 1_000_000_000} {
+		adapter, err := NewStreamWithLimit("http://127.0.0.1:9", maximum)
+		if err != nil {
+			t.Fatalf("maximum=%d err=%v", maximum, err)
+		}
+		transport := adapter.client.Transport.(*http.Transport)
+		if adapter.active != 0 || transport.MaxConnsPerHost != maximum || transport.MaxIdleConnsPerHost != maximum {
+			t.Fatalf("maximum=%d active=%d transport=%d/%d", maximum, adapter.active,
+				transport.MaxConnsPerHost, transport.MaxIdleConnsPerHost)
 		}
 	}
 }

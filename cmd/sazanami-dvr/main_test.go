@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/provider/fake"
+	mirakurunadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/provider/mirakurun"
 	recordinghttpadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/recordinghttp"
 	sqliteadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/sqlite"
 	webuiadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/webui"
@@ -404,10 +405,15 @@ func TestRecordingServeRefreshesCatalogWithoutOpeningStreamBeforeReservationTime
 		t.Fatal(err)
 	}
 	recordingRoot := filepath.Join(t.TempDir(), "recordings")
-	var catalogCalls, streamCalls atomic.Int32
+	var tunerCalls, catalogCalls, streamCalls atomic.Int32
 	var calledOnce sync.Once
 	catalogCalled := make(chan struct{})
 	providerServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/api/tuners" {
+			tunerCalls.Add(1)
+			writeCommandJSON(writer, `[{},{}]`)
+			return
+		}
 		if strings.HasSuffix(request.URL.Path, "/stream") {
 			streamCalls.Add(1)
 			return
@@ -441,13 +447,13 @@ func TestRecordingServeRefreshesCatalogWithoutOpeningStreamBeforeReservationTime
 		cancel()
 		t.Fatal("起動直後の番組表更新が始まりませんでした")
 	}
-	if catalogCalls.Load() == 0 || streamCalls.Load() != 0 {
+	if tunerCalls.Load() != 1 || catalogCalls.Load() == 0 || streamCalls.Load() != 0 {
 		cancel()
-		t.Fatalf("catalog=%d stream=%d", catalogCalls.Load(), streamCalls.Load())
+		t.Fatalf("tuners=%d catalog=%d stream=%d", tunerCalls.Load(), catalogCalls.Load(), streamCalls.Load())
 	}
-	if !strings.Contains(output.String(), "max_concurrent_recordings=1") {
+	if !strings.Contains(output.String(), "max_concurrent_recordings=2 max_concurrent_source=mirakurun") {
 		cancel()
-		t.Fatalf("既定同時録画数が出力されませんでした: %q", output.String())
+		t.Fatalf("Mirakurunのチューナー数が出力されませんでした: %q", output.String())
 	}
 	connection, err := net.DialTimeout("tcp", address, time.Second)
 	if err != nil {
@@ -569,13 +575,22 @@ func TestRecordingServeValidatesCatalogRefreshIntervalBeforeOpeningRoots(t *test
 }
 
 func TestRecordingServeValidatesConcurrentRecordingLimitBeforeOpeningRoots(t *testing.T) {
+	var tunerCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		tunerCalls.Add(1)
+		if request.Method != http.MethodGet || request.URL.Path != "/api/tuners" || request.Header.Get("Accept") != "application/json" {
+			t.Errorf("request=%s %s accept=%q", request.Method, request.URL.Path, request.Header.Get("Accept"))
+		}
+		writeCommandJSON(writer, `[{}]`)
+	}))
+	defer server.Close()
 	base := []string{
 		"recording", "serve", "--data-root", "/private/not-for-output",
 		"--recording-root", "/private/not-for-output/recordings",
 		"--channel-map", "/private/not-for-output/channels.json", "--provider", "mirakurun",
-		"--base-url", "http://127.0.0.1:40773", "--listen", "127.0.0.1:4510",
+		"--base-url", server.URL, "--listen", "127.0.0.1:4510",
 	}
-	for _, maximum := range []string{"-1", "0", "9"} {
+	for _, maximum := range []string{"-1", "0"} {
 		var output, diagnostic bytes.Buffer
 		arguments := append(append([]string(nil), base...), "--max-concurrent-recordings", maximum)
 		code := runContext(context.Background(), arguments, &output, &diagnostic)
@@ -584,7 +599,10 @@ func TestRecordingServeValidatesConcurrentRecordingLimitBeforeOpeningRoots(t *te
 			t.Fatalf("maximum=%q code=%d diagnostic=%q", maximum, code, diagnostic.String())
 		}
 	}
-	for _, maximum := range []string{"1", "2", "8"} {
+	if tunerCalls.Load() != 0 {
+		t.Fatalf("不正な明示値で%d回接続しました", tunerCalls.Load())
+	}
+	for _, maximum := range []string{"1", "8", "9", "19", "20", "21", "1000000000"} {
 		var output, diagnostic bytes.Buffer
 		arguments := append(append([]string(nil), base...), "--max-concurrent-recordings", maximum)
 		code := runContext(context.Background(), arguments, &output, &diagnostic)
@@ -592,6 +610,14 @@ func TestRecordingServeValidatesConcurrentRecordingLimitBeforeOpeningRoots(t *te
 			strings.Contains(diagnostic.String(), "/private") {
 			t.Fatalf("maximum=%q code=%d diagnostic=%q", maximum, code, diagnostic.String())
 		}
+		if maximum == "20" || maximum == "21" || maximum == "1000000000" {
+			if strings.Count(diagnostic.String(), "注意: 同時録画数が20件以上です") != 1 {
+				t.Fatalf("maximum=%q warning=%q", maximum, diagnostic.String())
+			}
+		}
+	}
+	if tunerCalls.Load() != 0 {
+		t.Fatalf("正常な明示値で%d回接続しました", tunerCalls.Load())
 	}
 	var output, diagnostic bytes.Buffer
 	arguments := append(append([]string(nil), base...), "--max-concurrent-recordings", "not-a-number")
@@ -599,6 +625,73 @@ func TestRecordingServeValidatesConcurrentRecordingLimitBeforeOpeningRoots(t *te
 	if code != 1 || !strings.Contains(diagnostic.String(), "invalid-command-arguments") ||
 		strings.Contains(diagnostic.String(), "/private") {
 		t.Fatalf("non-number code=%d diagnostic=%q", code, diagnostic.String())
+	}
+	for _, invalid := range [][]string{
+		append(append([]string(nil), base...), "--max-concurrent-recordings", "999999999999999999999999"),
+		append(append([]string(nil), base...), "unexpected"),
+	} {
+		output.Reset()
+		diagnostic.Reset()
+		if code := runContext(context.Background(), invalid, &output, &diagnostic); code != 1 || tunerCalls.Load() != 0 {
+			t.Fatalf("arguments=%v code=%d requests=%d diagnostic=%q", invalid[len(base):], code, tunerCalls.Load(), diagnostic.String())
+		}
+	}
+	output.Reset()
+	diagnostic.Reset()
+	if code := runContext(context.Background(), base, &output, &diagnostic); code != 1 ||
+		!strings.Contains(diagnostic.String(), "current-database-required") || tunerCalls.Load() != 1 {
+		t.Fatalf("auto code=%d requests=%d diagnostic=%q", code, tunerCalls.Load(), diagnostic.String())
+	}
+}
+
+func TestSelectRecordingMaximumWarnsFallsBackAndHonorsCancellation(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		writeCommandJSON(writer, "["+strings.Repeat("{},", 20)+"{}]")
+	}))
+	defer server.Close()
+	adapter, err := mirakurunadapter.New(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer adapter.CloseIdleConnections()
+	var diagnostic bytes.Buffer
+	maximum, source, err := selectRecordingMaximum(context.Background(), adapter, 1, false, &diagnostic)
+	if err != nil || maximum != 21 || source != "mirakurun" || calls.Load() != 1 ||
+		strings.Count(diagnostic.String(), "注意: 同時録画数が20件以上です") != 1 {
+		t.Fatalf("maximum=%d source=%s calls=%d diagnostic=%q err=%v", maximum, source, calls.Load(), diagnostic.String(), err)
+	}
+
+	diagnostic.Reset()
+	maximum, source, err = selectRecordingMaximum(context.Background(), adapter, 20, true, &diagnostic)
+	if err != nil || maximum != 20 || source != "explicit" || calls.Load() != 1 ||
+		strings.Count(diagnostic.String(), "注意: 同時録画数が20件以上です") != 1 {
+		t.Fatalf("explicit maximum=%d source=%s calls=%d diagnostic=%q err=%v", maximum, source, calls.Load(), diagnostic.String(), err)
+	}
+
+	fallbackServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writeCommandJSON(writer, `[]`)
+	}))
+	defer fallbackServer.Close()
+	fallbackAdapter, err := mirakurunadapter.New(fallbackServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fallbackAdapter.CloseIdleConnections()
+	diagnostic.Reset()
+	maximum, source, err = selectRecordingMaximum(context.Background(), fallbackAdapter, 1, false, &diagnostic)
+	if err != nil || maximum != 1 || source != "fallback" ||
+		strings.Count(diagnostic.String(), "tuner-count-fallback") != 1 || strings.Contains(diagnostic.String(), fallbackServer.URL) {
+		t.Fatalf("fallback maximum=%d source=%s diagnostic=%q err=%v", maximum, source, diagnostic.String(), err)
+	}
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	diagnostic.Reset()
+	if _, _, err := selectRecordingMaximum(cancelled, adapter, 1, false, &diagnostic); err == nil ||
+		err.Error() != "recording-startup-cancelled" || calls.Load() != 1 {
+		t.Fatalf("cancel error=%v calls=%d diagnostic=%q", err, calls.Load(), diagnostic.String())
 	}
 }
 

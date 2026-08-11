@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"math"
 	"mime"
 	"net"
 	"net/http"
@@ -22,6 +23,7 @@ import (
 
 const (
 	versionBodyLimit  = int64(64 * 1024)
+	tunersBodyLimit   = int64(1024 * 1024)
 	servicesBodyLimit = int64(16 * 1024 * 1024)
 	programsBodyLimit = int64(256 * 1024 * 1024)
 	headerLimit       = int64(64 * 1024)
@@ -30,6 +32,7 @@ const (
 type operationLimits struct {
 	connectHeader time.Duration
 	version       time.Duration
+	tuners        time.Duration
 	services      time.Duration
 	programs      time.Duration
 }
@@ -37,6 +40,7 @@ type operationLimits struct {
 var productionLimits = operationLimits{
 	connectHeader: 5 * time.Second,
 	version:       5 * time.Second,
+	tuners:        5 * time.Second,
 	services:      30 * time.Second,
 	programs:      5 * time.Minute,
 }
@@ -49,6 +53,7 @@ type Adapter struct {
 	identity   [32]byte
 	limits     operationLimits
 	versionCap int64
+	tunerCap   int64
 	serviceCap int64
 	programCap int64
 	provenance provider.Provenance
@@ -73,7 +78,7 @@ func newAdapter(baseURL string, limits operationLimits) (*Adapter, error) {
 	if err != nil {
 		return nil, err
 	}
-	if limits.connectHeader <= 0 || limits.version <= 0 || limits.services <= 0 || limits.programs <= 0 {
+	if limits.connectHeader <= 0 || limits.version <= 0 || limits.tuners <= 0 || limits.services <= 0 || limits.programs <= 0 {
 		return nil, provider.NewFailure(provider.ReasonInternal, "invalid-http-limits")
 	}
 	dialer := &net.Dialer{Timeout: limits.connectHeader, KeepAlive: 30 * time.Second}
@@ -103,7 +108,7 @@ func newAdapter(baseURL string, limits operationLimits) (*Adapter, error) {
 	}
 	return &Adapter{
 		base: base, client: client, identity: sha256.Sum256([]byte(normalized)), limits: limits,
-		versionCap: versionBodyLimit, serviceCap: servicesBodyLimit, programCap: programsBodyLimit,
+		versionCap: versionBodyLimit, tunerCap: tunersBodyLimit, serviceCap: servicesBodyLimit, programCap: programsBodyLimit,
 		provenance: provenance,
 	}, nil
 }
@@ -139,6 +144,42 @@ func (adapter *Adapter) ObserveVersion(ctx context.Context) (VersionObservation,
 		return VersionObservation{}, operation.failure(err)
 	}
 	return result, nil
+}
+
+// ObserveTunerCountは/api/tunersを逐次検証し、JSON objectの件数だけを返す。
+// fieldの内容から空き台数や対応放送種別を推測せず、応答全体も保持しない。
+func (adapter *Adapter) ObserveTunerCount(ctx context.Context) (int, error) {
+	if adapter == nil {
+		return 0, provider.NewFailure(provider.ReasonInternal, "nil-adapter")
+	}
+	defer adapter.CloseIdleConnections()
+	operation, err := adapter.open(ctx, "/api/tuners", adapter.tunerCap, adapter.limits.tuners)
+	if err != nil {
+		return 0, err
+	}
+	if err := operation.beginArray(); err != nil {
+		return 0, operation.failure(err)
+	}
+	count := 0
+	for operation.decoder.More() {
+		if count == math.MaxInt {
+			return 0, operation.failure(provider.NewFailure(provider.ReasonOverLimit, "tuner-count-overflow"))
+		}
+		if err := decodeTuner(operation.decoder); err != nil {
+			return 0, operation.failure(err)
+		}
+		count++
+	}
+	if err := operation.finishArray(); err != nil {
+		return 0, operation.failure(err)
+	}
+	if count == 0 {
+		return 0, operation.failure(provider.NewFailure(provider.ReasonMalformed, "tuner-list-empty"))
+	}
+	if err := operation.close(); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 // OpenServicesは/api/services相当を開き、最大256件ずつ返すcursorを生成する。

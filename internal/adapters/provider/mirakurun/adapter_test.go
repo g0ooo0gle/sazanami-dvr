@@ -234,7 +234,8 @@ func TestContentTypeAndBodyCaps(t *testing.T) {
 }
 
 func TestDeadlineDisconnectAndCancel(t *testing.T) {
-	short := operationLimits{connectHeader: 25 * time.Millisecond, version: 25 * time.Millisecond, services: 25 * time.Millisecond, programs: 25 * time.Millisecond}
+	short := operationLimits{connectHeader: 25 * time.Millisecond, version: 25 * time.Millisecond, tuners: 25 * time.Millisecond,
+		services: 25 * time.Millisecond, programs: 25 * time.Millisecond}
 	t.Run("slow header", func(t *testing.T) {
 		server := newCatalogServer(t, func(writer http.ResponseWriter, _ *http.Request) {
 			time.Sleep(100 * time.Millisecond)

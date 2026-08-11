@@ -718,10 +718,26 @@ func TestSchedulerCancelsSiblingAfterExecutionError(t *testing.T) {
 
 func TestSchedulerRejectsConcurrentBounds(t *testing.T) {
 	clock := &manualScheduleClock{now: time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)}
-	for _, maximum := range []int{0, MaximumConcurrentRecordings + 1} {
+	for _, maximum := range []int{-1, 0} {
 		if _, err := NewScheduler(&queueStore{}, &schedulerExecutor{clock: clock}, clock, maximum); err == nil {
 			t.Fatalf("maximum=%dが受理されました", maximum)
 		}
+	}
+}
+
+func TestSchedulerLargeLimitDoesNotPreallocate(t *testing.T) {
+	clock := &manualScheduleClock{now: time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)}
+	scheduler, err := NewScheduler(&queueStore{}, &schedulerExecutor{clock: clock}, clock, 1_000_000_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cap(scheduler.wake) != maximumWakeSize || len(scheduler.stops.items) != 0 {
+		t.Fatalf("wake=%d stops=%d", cap(scheduler.wake), len(scheduler.stops.items))
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := scheduler.Run(ctx); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -746,8 +762,8 @@ func (controller *postPowerRecorder) Execute(_ context.Context, mode core.PostRe
 	return PostRecordingPowerResult{Reason: controller.reason}
 }
 
-func TestPostRecordingPowerCandidateCombinesAtMostEightRecordings(t *testing.T) {
-	for count := 1; count <= MaximumConcurrentRecordings; count++ {
+func TestPostRecordingPowerCandidateCombinesTwentyOneRecordings(t *testing.T) {
+	for count := 1; count <= 21; count++ {
 		candidate := postRecordingPowerCandidate{}
 		for range count {
 			candidate.add(core.PostRecordingStandby)
@@ -825,9 +841,9 @@ func TestSchedulerPostRecordingPowerSetupAndAdapterReason(t *testing.T) {
 	}
 }
 
-func TestSchedulerWaitsForAllEightRecordingsBeforePowerAction(t *testing.T) {
+func TestSchedulerWaitsForAllNineRecordingsBeforePowerAction(t *testing.T) {
 	start := time.Date(2026, 8, 10, 2, 0, 0, 0, time.UTC)
-	items := make([]core.Reservation, MaximumConcurrentRecordings)
+	items := make([]core.Reservation, 9)
 	for index := range items {
 		items[index] = reservationForExecutor(t, start, 10*time.Minute)
 		items[index].ID = appID(t, byte(100+index))
@@ -863,7 +879,7 @@ func TestSchedulerWaitsForAllEightRecordingsBeforePowerAction(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatal("七件の完了を確認できませんでした")
+			t.Fatal("先行する録画の完了を確認できませんでした")
 		}
 		time.Sleep(time.Millisecond)
 	}
