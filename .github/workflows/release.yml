@@ -53,9 +53,20 @@ jobs:
           for arch in amd64 arm64; do
             package="sazanami-dvr_${version}_linux_${arch}"
             mkdir -p "dist/$package"
+            binary="dist/$package/sazanami-dvr"
             CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
               go build -trimpath -ldflags "-s -w -X main.productCommit=$GITHUB_SHA" \
-              -o "dist/$package/sazanami-dvr" ./cmd/sazanami-dvr
+              -o "$binary" ./cmd/sazanami-dvr
+            build_info=$(go version -m "$binary")
+            printf '%s\n' "$build_info" | grep -Eq "^[[:space:]]+mod[[:space:]]+github\\.com/g0ooo0gle/sazanami-dvr[[:space:]]+v${version}[[:space:]]*$"
+            for required_setting in \
+              "vcs.revision=$GITHUB_SHA" \
+              "vcs.modified=false" \
+              "CGO_ENABLED=0" \
+              "GOOS=linux" \
+              "GOARCH=$arch"; do
+              printf '%s\n' "$build_info" | grep -Fq "$required_setting"
+            done
             cp LICENSE README.md THIRD_PARTY_NOTICES.md "dist/$package/"
             cp -R docs packaging "dist/$package/"
             for required_file in sazanami-dvr LICENSE README.md THIRD_PARTY_NOTICES.md \
