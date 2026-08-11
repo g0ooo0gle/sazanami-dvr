@@ -1160,6 +1160,61 @@ func TestOneSegLifecycleKeepsMainByteCountAndSettlesBothSegments(t *testing.T) {
 	if err := rows.Err(); err != nil || index != 2 || attemptBytes != 376 {
 		t.Fatalf("segments=%d attempt_bytes=%d err=%v", index, attemptBytes, err)
 	}
+	recoveryItems, err := store.RecoveryAttempts(context.Background(), recording.MaxRecoveryPage, catalogmodel.ID{})
+	if err != nil || len(recoveryItems) != 1 || recoveryItems[0].OneSeg == nil ||
+		recoveryItems[0].OneSeg.Plan != oneSegPlan || recoveryItems[0].OneSeg.ByteCount != 188 ||
+		recoveryItems[0].OneSeg.State != recording.SegmentFinalized ||
+		recoveryItems[0].OneSeg.Availability != recording.AvailabilityFinal ||
+		!recoveryItems[0].OneSeg.FileSynced || !recoveryItems[0].OneSeg.FinalPublished ||
+		!recoveryItems[0].OneSeg.DirectorySynced {
+		t.Fatalf("recovery=%+v err=%v", recoveryItems, err)
+	}
+}
+
+func TestRecoveryRejectsMissingMainAndUnsupportedOrdinal(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		corrupt func(*testing.T, *Store, catalogmodel.ID)
+	}{
+		{name: "missing main", corrupt: func(t *testing.T, store *Store, attemptID catalogmodel.ID) {
+			t.Helper()
+			if _, err := store.writer.Exec(`DELETE FROM recording_segments WHERE attempt_id=? AND ordinal=0`,
+				attemptID.Bytes()); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "ordinal two", corrupt: func(t *testing.T, store *Store, attemptID catalogmodel.ID) {
+			t.Helper()
+			if _, err := store.writer.Exec(`DROP TRIGGER recording_segments_oneseg_ordinal_update`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.writer.Exec(`UPDATE recording_segments SET ordinal=2 WHERE attempt_id=? AND ordinal=0`,
+				attemptID.Bytes()); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, store := openMigratedStore(t)
+			reservation := reservationForTest(t, store)
+			if _, err := store.CreateReservation(context.Background(), reservation); err != nil {
+				t.Fatal(err)
+			}
+			claim := recording.ClaimRequest{
+				ReservationID: reservation.ID, AttemptID: testID(t, 217), SegmentID: testID(t, 218),
+				OwnerID: testID(t, 219), OwnerGeneration: 1, Now: reservation.CreatedAt.Add(time.Minute),
+				Plan: recording.FilePlan{PartialPath: "2026/08/corrupt.ts.partial", FinalPath: "2026/08/corrupt.ts"},
+			}
+			if _, err := store.ClaimRecording(context.Background(), claim); err != nil {
+				t.Fatal(err)
+			}
+			test.corrupt(t, store, claim.AttemptID)
+			if _, err := store.RecoveryAttempts(context.Background(), recording.MaxRecoveryPage,
+				catalogmodel.ID{}); err == nil {
+				t.Fatal("破損したsegment集合を復旧対象として受理しました")
+			}
+		})
+	}
 }
 
 func TestOneSegClaimSecondInsertFailureRollsBackAttempt(t *testing.T) {
