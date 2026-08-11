@@ -35,7 +35,7 @@ sazanami-dvr recording serve \
   --channel-map <channel-map> \
   --provider mirakurun \
   --base-url <mirakurun-url> \
-  --http-listen 127.0.0.1:40773
+  --http-listen 127.0.0.1:4521
 ```
 
 起動時は、次の順に確認します。
@@ -54,7 +54,7 @@ CtrlCmdは既定でIPv4の全interfaceに待ち受けます。Android TVなど�
 ```text
 sazanami-dvr recording serve \
   <ほかの引数> \
-  --http-listen 0.0.0.0:40773
+  --http-listen 0.0.0.0:4521
 ```
 
 この接続口には認証とTLSがありません。信頼できる宅内LANだけで使い、インターネットへ直接公開しないでください。起動ログには実際のIPを出さず、端末内待受かLAN待受かだけを表示します。

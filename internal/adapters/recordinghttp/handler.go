@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	DefaultAddress = "127.0.0.1:40773"
+	DefaultAddress = "127.0.0.1:4521"
 	defaultLimit   = 50
 	maximumLimit   = 100
 	maximumStreams = 8

@@ -45,6 +45,7 @@ var (
 const (
 	databaseReadTimeout        = 10 * time.Second
 	databaseMaintenanceTimeout = time.Hour
+	defaultWebUIAddress        = "127.0.0.1:4522"
 )
 
 func main() {
@@ -69,7 +70,7 @@ func runContext(ctx context.Context, arguments []string, stdout, stderr io.Write
 	}
 	if arguments[0] == "ui" {
 		if len(arguments) < 2 || arguments[1] != "serve" {
-			fmt.Fprintln(stderr, "使用方法: sazanami-dvr ui serve --data-root <dir> [--listen 127.0.0.1:40772]")
+			fmt.Fprintf(stderr, "使用方法: sazanami-dvr ui serve --data-root <dir> [--listen %s]\n", defaultWebUIAddress)
 			return 2
 		}
 		if err := runUICommand(ctx, arguments[2:], stdout, stderr); err != nil {
@@ -102,7 +103,7 @@ func runContext(ctx context.Context, arguments []string, stdout, stderr io.Write
 	}
 	if arguments[0] == "recording" {
 		if len(arguments) < 2 || arguments[1] != "serve" {
-			fmt.Fprintln(stderr, "使用方法: sazanami-dvr recording serve --data-root <dir> --recording-root <dir> --channel-map <file> --provider mirakurun --base-url <url> [--http-listen 127.0.0.1:40773] [--max-concurrent-recordings 1] [--post-recording-script-root <dir>]")
+			fmt.Fprintf(stderr, "使用方法: sazanami-dvr recording serve --data-root <dir> --recording-root <dir> --channel-map <file> --provider mirakurun --base-url <url> [--http-listen %s] [--max-concurrent-recordings 1] [--post-recording-script-root <dir>]\n", recordinghttpadapter.DefaultAddress)
 			return 2
 		}
 		if err := runRecordingCommand(ctx, arguments[2:], stdout, stderr); err != nil {
@@ -410,7 +411,7 @@ func writeCtrlCmdLANNotice(destination io.Writer, address string) {
 	if recordingListenScope(address) == "loopback" {
 		return
 	}
-	fmt.Fprintln(destination, "注意: CtrlCmdは認証なしでLANへ公開されています。インターネットへ直接公開しないでください。狭く使う場合は --listen 127.0.0.1:4510 を指定します。")
+	fmt.Fprintln(destination, "注意: CtrlCmdは認証なしでLANへ公開されています。インターネットへ直接公開しないでください。狭く使う場合は --listen 127.0.0.1:4520 を指定します。")
 }
 
 func runCtrlCmdCommand(ctx context.Context, command string, arguments []string, stdout, stderr io.Writer) error {
@@ -570,7 +571,7 @@ func runUICommand(ctx context.Context, arguments []string, stdout, stderr io.Wri
 	flags := flag.NewFlagSet("ui serve", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	dataRoot := flags.String("data-root", "", "owner-onlyのデータディレクトリ")
-	listenAddress := flags.String("listen", "127.0.0.1:40772", "numeric loopbackの待受アドレス")
+	listenAddress := flags.String("listen", defaultWebUIAddress, "numeric loopbackの待受アドレス")
 	if err := flags.Parse(arguments); err != nil {
 		return errorsStable("invalid-command-arguments")
 	}

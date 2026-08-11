@@ -22,7 +22,7 @@ sazanami-dvr db status  --data-root <data-root>
 sazanami-dvr ui serve --data-root <data-root>
 ```
 
-ブラウザーで`http://127.0.0.1:40772/`を開きます。Mirakurunなどが40772番ポートを使っている場合は、別のポートを指定します。
+ブラウザーで`http://127.0.0.1:4522/`を開きます。4522番ポートを別のプロセスが使っている場合は、別のポートを指定します。
 
 ```console
 sazanami-dvr ui serve --data-root <data-root> --listen 127.0.0.1:40800

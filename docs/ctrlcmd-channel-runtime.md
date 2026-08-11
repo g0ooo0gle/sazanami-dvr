@@ -54,9 +54,9 @@ sazanami-dvr ctrlcmd serve \
   --channel-map <data-root>/channels.json
 ```
 
-起動前に`validate`と同じ検査を行い、すべて成功した場合だけ`0.0.0.0:4510`で待受を始めます。認証とTLSはないため、インターネットへ直接公開しないでください。
+起動前に`validate`と同じ検査を行い、すべて成功した場合だけ`0.0.0.0:4520`で待受を始めます。認証とTLSはないため、インターネットへ直接公開しないでください。
 
-待受先には、numeric loopback、numeric private IP、`0.0.0.0`、`::`と、1〜65,535のポートを指定できます。ホスト名、link-local、multicast、global IPは指定できません。同じPCだけに絞る場合は`--listen 127.0.0.1:4510`を追加します。
+待受先には、numeric loopback、numeric private IP、`0.0.0.0`、`::`と、1〜65,535のポートを指定できます。ホスト名、link-local、multicast、global IPは指定できません。同じPCだけに絞る場合は`--listen 127.0.0.1:4520`を追加します。
 
 停止するには`SIGINT`または`SIGTERM`を送ります。受付済みの処理が期限内に終わるのを待ってから、DBのロックを解放します。
 
