@@ -59,9 +59,18 @@ jobs:
           grep -qx 'SAZANAMI_CTRLCMD_LISTEN=0.0.0.0:4520' "$env_file"
           grep -qx 'SAZANAMI_RECORDING_HTTP_LISTEN=127.0.0.1:4521' "$env_file"
           grep -qx 'SAZANAMI_WEBUI_LISTEN=127.0.0.1:4522' "$env_file"
+          grep -qx 'SAZANAMI_DATA_ROOT=/var/lib/sazanami-dvr' "$env_file"
+          grep -qx 'SAZANAMI_CHANNEL_MAP=/var/lib/sazanami-dvr/channels.json' "$env_file"
+          data_root=$(sed -n 's/^SAZANAMI_DATA_ROOT=//p' "$env_file")
+          channel_map=$(sed -n 's/^SAZANAMI_CHANNEL_MAP=//p' "$env_file")
+          test "$(dirname -- "$channel_map")" = "$data_root"
           test "$(grep -c '^SAZANAMI_' "$env_file")" -eq 7
           grep -Fq '${SAZANAMI_CTRLCMD_LISTEN}' "$unit"
           grep -Fq '${SAZANAMI_RECORDING_HTTP_LISTEN}' "$unit"
+          grep -Fq '${SAZANAMI_CHANNEL_MAP}' "$unit"
+          grep -Fq -- "--channel-map $channel_map" docs/linux-installation.md
+          test "$(awk 'index($0, "/etc/sazanami-dvr/channels.json") { count++ } END { print count + 0 }' docs/linux-installation.md)" -eq 1
+          test "$(awk '/^## 新しい版へ更新する$/ { update = 1 } /^## 以前の版へ切り戻す$/ { update = 0 } update && index($0, "/etc/sazanami-dvr/channels.json") { count++ } END { print count + 0 }' docs/linux-installation.md)" -eq 1
           ! grep -Fq -- '--max-concurrent-recordings' "$unit"
           ! grep -Fq -- '--max-concurrent-recordings' "$env_file"
           grep -Fx 'ExecStart=' docs/linux-installation.md
