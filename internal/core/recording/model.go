@@ -36,6 +36,8 @@ const (
 var (
 	// ErrFinalExistsは完成ファイル名が既に使われており、上書きしなかったことを表す。
 	ErrFinalExists = errors.New("recording: final file already exists")
+	// ErrReservationUnavailableは予約が存在しないか、終了または読出し後の変更により確保できないことを表す。
+	ErrReservationUnavailable = errors.New("recording: reservation is not available")
 )
 
 // ReservationStateは一回限りの予約が実行前か終了済みかを表す。

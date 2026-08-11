@@ -278,6 +278,9 @@ func (scheduler *Scheduler) Run(ctx context.Context) error {
 		}
 		attempt, err := scheduler.executor.Claim(executionContext, *reservation)
 		if err != nil {
+			if errors.Is(err, core.ErrReservationUnavailable) {
+				continue
+			}
 			return scheduler.stopExecutions(cancelExecutions, completed, active, err)
 		}
 		recordingContext, cancelRecording := context.WithCancel(executionContext)
