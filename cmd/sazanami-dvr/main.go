@@ -452,10 +452,12 @@ func (files recordingHTTPFiles) OpenFinal(plan corerecording.FilePlan, size int6
 	return files.root.OpenFinal(plan, size)
 }
 
-// recordingHTTPLiveはHTTP adapterの小さい型をライブ管理の型へ変換する。
-// CtrlCmd用とは別のManagerを使うが、Provider adapterの同時4接続枠は共有する。
+// recordingHTTPLiveはHTTPアダプターの放送指定をライブ管理の型へ変換する。
+// CtrlCmd用とは別のManagerを使うが、Mirakurunへの同時4接続枠は共有する。
 type recordingHTTPLive struct{ manager *liverelay.Manager }
 
+// SelectはHTTPで指定された放送をHLS用のライブ管理へ登録する。
+// この段階ではMirakurunの放送ストリームを開かない。
 func (live recordingHTTPLive) Select(ctx context.Context, service recordinghttpadapter.LiveService,
 	networkTVID int32,
 ) (int32, error) {
@@ -467,6 +469,7 @@ func (live recordingHTTPLive) Select(ctx context.Context, service recordinghttpa
 	}, networkTVID)
 }
 
+// Openは登録済みの放送ストリームをHLS配信のために開く。
 func (live recordingHTTPLive) Open(ctx context.Context, processID int32) (recordinghttpadapter.LiveStream, error) {
 	if live.manager == nil {
 		return nil, errorsStable("live-manager-invalid")
@@ -474,6 +477,7 @@ func (live recordingHTTPLive) Open(ctx context.Context, processID int32) (record
 	return live.manager.Open(ctx, processID)
 }
 
+// Closeは指定したHLSライブを終了し、共有している接続枠を解放する。
 func (live recordingHTTPLive) Close(networkTVID int32) {
 	if live.manager != nil {
 		live.manager.Close(networkTVID)
