@@ -173,6 +173,9 @@ KonomiTVの録画後設定で、待機、待機からの復帰後再起動、休
 
 GitHub ReleaseのLinux配布物にはsystemdの設定例を同梱しています。初回導入、更新、旧版への切り戻し、データを残す通常削除は、[Linuxへ導入し、安全に更新・削除する](docs/linux-installation.md)を参照してください。
 
+Docker ComposeでSazanami DVRと固定KonomiTVを別serviceとして導入する場合は、
+[Docker Composeで導入する](docs/docker-compose.md)を参照してください。既存のsystemd導入も引き続き利用できます。
+
 v0.1.2からv0.2.0へ更新すると、DB形式が第12版から第13版へ変わります。サービスを停止し、v0.1.2でバックアップを作ってIDを控えてから、v0.2.0の`db migrate`を実行してください。v0.1.2へ戻す場合は、v0.2.0の`db restore`で更新前のバックアップを復元してから旧版を起動します。詳しい手順は上記の導入・更新ガイドを参照してください。
 
 ## ビルド

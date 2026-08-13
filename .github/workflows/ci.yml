@@ -108,3 +108,80 @@ jobs:
             CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
               go build -trimpath -o "$RUNNER_TEMP/sazanami-dvr-$os-$arch" ./cmd/sazanami-dvr
           done
+
+  container:
+    name: Container構成を確認
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: sourceを取得
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: QEMUを準備
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          platforms: arm64
+
+      - name: Buildxを準備
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Compose構成を確認
+        run: |
+          compose_json="$RUNNER_TEMP/compose.json"
+          docker compose --env-file packaging/compose/.env.example \
+            -f packaging/compose/compose.yaml config --format json > "$compose_json"
+          python3 - "$compose_json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as source:
+              document = json.load(source)
+          services = document["services"]
+          assert set(services) == {"sazanami", "konomitv"}
+          for name in services:
+              service = services[name]
+              assert service["network_mode"] == "host"
+              assert service["user"] == "1000:1000"
+              assert service["cap_drop"] == ["ALL"]
+              assert "no-new-privileges:true" in service["security_opt"]
+              assert service.get("privileged") is not True
+              assert not service.get("devices")
+              for volume in service["volumes"]:
+                  assert volume["source"] != "/"
+                  assert "docker.sock" not in volume["source"]
+          sazanami = services["sazanami"]
+          assert sazanami["read_only"] is True
+          assert sazanami["healthcheck"]["test"][-1] == "http://127.0.0.1:4521/api/recordings?limit=1"
+          konomitv = services["konomitv"]
+          assert konomitv["platform"] == "linux/amd64"
+          assert konomitv["build"]["context"].endswith("#0a32188274b81c1e7bed642474b208bd2a543a6b")
+          recording_mount = next(item for item in konomitv["volumes"] if item["target"] == "/host-rootfs/recordings")
+          assert recording_mount["read_only"] is True
+          assert all(item["target"] != "/host-rootfs" for item in konomitv["volumes"])
+          PY
+          sh -n packaging/compose/prepare.sh
+          grep -qx "    edcb_url: 'tcp://127.0.0.1:4520/'" packaging/compose/konomitv.yaml.example
+          grep -qx "    port: 7200" packaging/compose/konomitv.yaml.example
+          grep -qx "        - '/recordings'" packaging/compose/konomitv.yaml.example
+
+      - name: Sazanami imageを確認
+        run: |
+          version=$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"\([^"]*\)"/\1/p' cmd/sazanami-dvr/main.go)
+          test -n "$version"
+          image=sazanami-dvr:ci
+          docker buildx build --platform linux/amd64 --load \
+            --build-arg "VERSION=$version" \
+            --build-arg "VCS_REF=$GITHUB_SHA" \
+            --tag "$image" .
+          test "$(docker image inspect --format '{{.Config.User}}' "$image")" = "10001:10001"
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$image")" = "$version"
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")" = "$GITHUB_SHA"
+          test "$(docker run --rm "$image" --version)" = "sazanami-dvr $version"
+          docker run --rm --entrypoint /bin/sh "$image" -c \
+            'test -r /etc/ssl/certs/ca-certificates.crt && test -r /usr/share/zoneinfo/Asia/Tokyo && test -r /usr/share/licenses/sazanami-dvr/LICENSE'
+          docker buildx build --platform linux/amd64,linux/arm64 \
+            --build-arg "VERSION=$version" \
+            --build-arg "VCS_REF=$GITHUB_SHA" \
+            --provenance=false --sbom=false \
+            --output "type=oci,dest=$RUNNER_TEMP/sazanami-dvr.oci.tar" .
+          tar -tf "$RUNNER_TEMP/sazanami-dvr.oci.tar" | grep -Fx index.json
