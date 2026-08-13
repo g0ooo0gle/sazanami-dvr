@@ -15,6 +15,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write
+      packages: write
     env:
       GOTOOLCHAIN: local
     steps:
@@ -32,6 +33,14 @@ jobs:
         run: |
           go version
           test "$(go env GOVERSION)" = "go1.26.5"
+
+      - name: QEMUを準備
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          platforms: arm64
+
+      - name: Buildxを準備
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: tagと製品versionを照合
         run: |
@@ -71,22 +80,58 @@ jobs:
             cp -R docs packaging "dist/$package/"
             for required_file in sazanami-dvr LICENSE README.md THIRD_PARTY_NOTICES.md \
               docs/linux-installation.md \
+              docs/docker-compose.md \
               packaging/systemd/sazanami-dvr.service \
-              packaging/systemd/sazanami-dvr.env.example; do
+              packaging/systemd/sazanami-dvr.env.example \
+              packaging/compose/compose.yaml \
+              packaging/compose/.env.example \
+              packaging/compose/konomitv.yaml.example \
+              packaging/compose/prepare.sh; do
               test -f "dist/$package/$required_file"
             done
             tar -C dist -czf "dist/$package.tar.gz" "$package"
             tar -tzf "dist/$package.tar.gz" > "$RUNNER_TEMP/$package.list"
             for required_file in sazanami-dvr LICENSE README.md THIRD_PARTY_NOTICES.md \
               docs/linux-installation.md \
+              docs/docker-compose.md \
               packaging/systemd/sazanami-dvr.service \
-              packaging/systemd/sazanami-dvr.env.example; do
+              packaging/systemd/sazanami-dvr.env.example \
+              packaging/compose/compose.yaml \
+              packaging/compose/.env.example \
+              packaging/compose/konomitv.yaml.example \
+              packaging/compose/prepare.sh; do
               grep -Fx "$package/$required_file" "$RUNNER_TEMP/$package.list"
             done
             rm -r "dist/$package"
           done
           cd dist
           sha256sum ./*.tar.gz > SHA256SUMS
+
+      - name: Sazanami OCI imageを公開
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          image="ghcr.io/g0ooo0gle/sazanami-dvr:v$version"
+          metadata="$RUNNER_TEMP/image-metadata.json"
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker buildx build --platform linux/amd64,linux/arm64 \
+            --build-arg "VERSION=$version" \
+            --build-arg "VCS_REF=$GITHUB_SHA" \
+            --provenance=mode=max --sbom=true \
+            --metadata-file "$metadata" \
+            --tag "$image" --push .
+          digest=$(python3 - "$metadata" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as source:
+              print(json.load(source)["containerimage.digest"])
+          PY
+          )
+          printf '%s\n' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
+          printf '%s@%s\n' "$image" "$digest" > dist/OCI_IMAGE
+          docker buildx imagetools inspect "$image@$digest"
 
       - name: GitHub Releaseを作成
         env:
@@ -97,4 +142,4 @@ jobs:
           case "$version" in
             0.*) options+=(--prerelease) ;;
           esac
-          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS "${options[@]}"
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS dist/OCI_IMAGE "${options[@]}"

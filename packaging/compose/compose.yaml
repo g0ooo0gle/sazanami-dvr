@@ -1,0 +1,115 @@
+name: sazanami-dvr
+
+services:
+  sazanami:
+    image: ${SAZANAMI_IMAGE:?SAZANAMI_IMAGEを設定してください}
+    pull_policy: missing
+    user: ${HOST_UID:?HOST_UIDを設定してください}:${HOST_GID:?HOST_GIDを設定してください}
+    network_mode: host
+    init: true
+    read_only: true
+    restart: unless-stopped
+    stop_grace_period: 2m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    volumes:
+      - type: bind
+        source: ${SAZANAMI_DATA_DIR:?SAZANAMI_DATA_DIRを設定してください}
+        target: /var/lib/sazanami-dvr
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${RECORDING_DIR:?RECORDING_DIRを設定してください}
+        target: /var/lib/sazanami-dvr-recordings
+        bind:
+          create_host_path: false
+    command:
+      - recording
+      - serve
+      - --data-root
+      - /var/lib/sazanami-dvr
+      - --recording-root
+      - /var/lib/sazanami-dvr-recordings
+      - --channel-map
+      - /var/lib/sazanami-dvr/channels.json
+      - --provider
+      - mirakurun
+      - --base-url
+      - ${MIRAKURUN_URL:?MIRAKURUN_URLを設定してください}
+      - --listen
+      - 127.0.0.1:4520
+      - --http-listen
+      - 127.0.0.1:4521
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - -q
+        - -T
+        - "3"
+        - -O
+        - /dev/null
+        - http://127.0.0.1:4521/api/recordings?limit=1
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  konomitv:
+    image: ${KONOMITV_IMAGE:?KONOMITV_IMAGEを設定してください}
+    pull_policy: never
+    platform: linux/amd64
+    build:
+      context: ${KONOMITV_BUILD_CONTEXT:?KONOMITV_BUILD_CONTEXTを設定してください}
+      dockerfile: Dockerfile
+    user: ${HOST_UID:?HOST_UIDを設定してください}:${HOST_GID:?HOST_GIDを設定してください}
+    network_mode: host
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 2m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      HOME: /code/server/data/home
+      TZ: ${TZ:-Asia/Tokyo}
+      XDG_CACHE_HOME: /code/server/data/cache
+    tmpfs:
+      - /tmp
+    depends_on:
+      sazanami:
+        condition: service_healthy
+        restart: true
+    volumes:
+      - type: bind
+        source: ${KONOMITV_CONFIG_FILE:?KONOMITV_CONFIG_FILEを設定してください}
+        target: /code/config.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${KONOMITV_DATA_DIR:?KONOMITV_DATA_DIRを設定してください}
+        target: /code/server/data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${KONOMITV_LOG_DIR:?KONOMITV_LOG_DIRを設定してください}
+        target: /code/server/logs
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${RECORDING_DIR:?RECORDING_DIRを設定してください}
+        target: /host-rootfs/recordings
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${CAPTURE_DIR:?CAPTURE_DIRを設定してください}
+        target: /host-rootfs/captures
+        bind:
+          create_host_path: false

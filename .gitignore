@@ -10,3 +10,11 @@ coverage.out
 .DS_Store
 .idea/
 *.iml
+
+# Docker Composeの実dataと秘密設定
+/packaging/compose/.env
+/packaging/compose/config/
+/packaging/compose/data/
+/packaging/compose/logs/
+/packaging/compose/recordings/
+/packaging/compose/captures/
