@@ -255,7 +255,9 @@ func (scheduler *Scheduler) Run(ctx context.Context) error {
 			continue
 		}
 		plannedEnd := reservation.PlannedEnd()
-		if now.Sub(wakeAt) > lateStartLimit || plannedEnd.Sub(now) < minimumRunTime {
+		freshInProgress := !reservation.CreatedAt.IsZero() && !reservation.CreatedAt.Before(wakeAt) &&
+			!reservation.CreatedAt.After(now) && now.Sub(reservation.CreatedAt) <= lateStartLimit
+		if (!freshInProgress && now.Sub(wakeAt) > lateStartLimit) || plannedEnd.Sub(now) < minimumRunTime {
 			if _, err := scheduler.executor.Miss(ctx, *reservation, core.ReasonLateStartExpired); err != nil {
 				if errors.Is(err, core.ErrReservationUnavailable) {
 					continue

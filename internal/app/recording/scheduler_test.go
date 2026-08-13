@@ -217,6 +217,62 @@ func TestSchedulerUsesOneSlotAndLateStartRules(t *testing.T) {
 	}
 }
 
+func TestSchedulerStartsOnlyFreshInProgressReservations(t *testing.T) {
+	now := time.Date(2026, 8, 13, 15, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name      string
+		createdAt func(core.Reservation) time.Time
+		wantRun   bool
+	}{
+		{name: "created now", createdAt: func(core.Reservation) time.Time { return now }, wantRun: true},
+		{name: "five minutes old", createdAt: func(core.Reservation) time.Time { return now.Add(-5 * time.Minute) }, wantRun: true},
+		{name: "over five minutes old", createdAt: func(core.Reservation) time.Time { return now.Add(-5*time.Minute - time.Millisecond) }},
+		{name: "created before planned start", createdAt: func(value core.Reservation) time.Time { return value.PlannedStart().Add(-time.Millisecond) }},
+		{name: "future creation time", createdAt: func(core.Reservation) time.Time { return now.Add(time.Millisecond) }},
+		{name: "missing creation time", createdAt: func(core.Reservation) time.Time { return time.Time{} }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			reservation := reservationForExecutor(t, now.Add(-20*time.Minute), 50*time.Minute)
+			reservation.CreatedAt = test.createdAt(reservation)
+			reservation.UpdatedAt = reservation.CreatedAt
+			store := &queueStore{items: []core.Reservation{reservation}, queried: make(chan struct{}, 4)}
+			executor := &schedulerExecutor{clock: &manualScheduleClock{now: now}, executed: make(chan struct{}, 1)}
+			scheduler, err := NewScheduler(store, executor, executor.clock, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- scheduler.Run(ctx) }()
+			if test.wantRun {
+				select {
+				case <-executor.executed:
+				case <-time.After(time.Second):
+					cancel()
+					t.Fatal("新しく追加した放送中予約が始まりませんでした")
+				}
+			} else {
+				for range 2 {
+					select {
+					case <-store.queried:
+					case <-time.After(time.Second):
+						cancel()
+						t.Fatal("遅延予約が判定されませんでした")
+					}
+				}
+			}
+			cancel()
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			if test.wantRun && len(executor.execute) != 1 || !test.wantRun &&
+				(len(executor.miss) != 1 || executor.miss[0] != core.ReasonLateStartExpired) {
+				t.Fatalf("execute=%d miss=%v", len(executor.execute), executor.miss)
+			}
+		})
+	}
+}
+
 func TestSchedulerReloadsReservationAfterClaimConflict(t *testing.T) {
 	start := time.Date(2026, 8, 12, 1, 0, 0, 0, time.UTC)
 	old := reservationForExecutor(t, start, 10*time.Minute)
