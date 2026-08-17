@@ -1293,6 +1293,81 @@ func TestOneSegLifecycleKeepsMainByteCountAndSettlesBothSegments(t *testing.T) {
 	}
 }
 
+func TestSettledOneSegAvailabilityCanReturnFromMissingToPartial(t *testing.T) {
+	_, store := openMigratedStore(t)
+	reservation := reservationForTest(t, store)
+	reservation.OneSegOutput = &recording.OneSegOutput{ProviderServiceLocator: "1004"}
+	created, err := store.CreateReservation(context.Background(), reservation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attemptID := testID(t, 217)
+	oneSegPlan, err := recording.NewOneSegFilePlan(created, attemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := reservation.CreatedAt.Add(time.Minute)
+	if _, err := store.ClaimRecording(context.Background(), recording.ClaimRequest{
+		ReservationID: created.ID, ReservationVersion: created.Version,
+		AttemptID: attemptID, SegmentID: testID(t, 218), OneSegSegmentID: testID(t, 219),
+		OwnerID: testID(t, 220), OwnerGeneration: 1, Now: now,
+		Plan:       recording.FilePlan{PartialPath: "2026/08/main-partial.ts.partial", FinalPath: "2026/08/main-partial.ts"},
+		OneSegPlan: &oneSegPlan,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.StartAttempt(context.Background(), attemptID, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecordingStarted(context.Background(), attemptID, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.OneSegRecordingStarted(context.Background(), attemptID, now.Add(3*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpdateRecordingProgress(context.Background(), attemptID, 376, now.Add(4*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpdateOneSegProgress(context.Background(), attemptID, 188, now.Add(5*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.BeginFinalization(context.Background(), recording.FinalizeRequest{
+		AttemptID: attemptID, Token: testID(t, 221), ByteCount: 376,
+		State: recording.AttemptSucceeded, Reason: recording.ReasonCompleted, Now: now.Add(6 * time.Second),
+		OneSeg: &recording.OneSegResult{ByteCount: 188, Availability: recording.AvailabilityPartial,
+			Reason: recording.ReasonStreamEndedEarly, FileSynced: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkFinalPublished(context.Background(), attemptID, now.Add(7*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkDirectorySynced(context.Background(), attemptID, now.Add(8*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishAttempt(context.Background(), recording.FinishRequest{
+		AttemptID: attemptID, State: recording.AttemptSucceeded, Reason: recording.ReasonCompleted,
+		ByteCount: 376, Availability: recording.AvailabilityFinal, Now: now.Add(9 * time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetOneSegAvailability(context.Background(), attemptID, recording.AvailabilityMissing,
+		recording.ReasonFileMissing, now.Add(10*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetOneSegAvailability(context.Background(), attemptID, recording.AvailabilityPartial,
+		recording.ReasonFileMissing, now.Add(11*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	items, err := store.RecoveryAttempts(context.Background(), recording.MaxRecoveryPage, catalogmodel.ID{})
+	if err != nil || len(items) != 1 || items[0].OneSeg == nil ||
+		items[0].OneSeg.State != recording.SegmentPartial ||
+		items[0].OneSeg.Availability != recording.AvailabilityPartial ||
+		items[0].OneSeg.IntegrityReason != recording.ReasonFileMissing {
+		t.Fatalf("items=%+v err=%v", items, err)
+	}
+}
+
 func TestRecoveryRejectsMissingMainAndUnsupportedOrdinal(t *testing.T) {
 	for _, test := range []struct {
 		name    string
