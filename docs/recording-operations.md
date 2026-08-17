@@ -76,6 +76,17 @@ DBに記録した完成状態、ファイルの種類、権限、所有者、サ
 
 Komorebi 1.1.0-beta6向けには、CtrlCmd 2017で一覧、2024で詳細を返します。resolverが返す仮想URLから元のTSを直接再生します。画像は中立な代替画像、チャプターは空、タイル情報は最小値です。実サムネイルや画質変換にはまだ対応していません。
 
+Docker Composeの削除overrideを明示した場合は、KonomiTVの管理者画面から完成録画を削除できます。Sazanamiは
+録画履歴を削除せず、一分ごとに完了録画を最大1,000件ずつ再確認します。完成fileがなくなれば
+`MISSING / FILE_MISSING`、所有者、mode、file種別、link数、期待sizeが不正なら
+`MISMATCHED / FILE_INTEGRITY_MISMATCH`を記録します。正しいmetadataと期待sizeの完成fileを同じpathへ戻すと、
+後続の確認で`FINAL`へ戻ります。
+
+削除overrideでは、KonomiTVを録画directoryの信頼済み共同所有者として扱います。Sazanamiの所有lockは
+read-onlyで保護しますが、KonomiTVはlock以外の録画fileを変更できます。Checksumは保存しないため、同じsizeの
+内容変更は検出しません。KonomiTVのDB、thumbnail、補助file、未知fileはSazanamiから変更しません。詳しい起動方法と
+切り戻しは[Docker Composeで導入する](docker-compose.md)を参照してください。
+
 ## 局ロゴを使う
 
 KonomiTVはCtrlCmd 2060、Komorebiは`/legacy/logo.lua`から局ロゴを取得します。Sazanami DVRは、完成済み番組表で放送局を一つに絞れた場合だけ、Mirakurunの局ロゴをその場で取得して返します。ロゴはDBやファイルへ保存しません。
