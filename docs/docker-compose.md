@@ -14,7 +14,8 @@ Mirakurun互換APIを用意してください。初版のCompose全体はLinux a
 - 両serviceは同じhost UID/GIDとhost networkを使います。
 - SazanamiのCtrlCmdと録画HTTPは`127.0.0.1:4520`と`127.0.0.1:4521`へ限定します。
 - KonomiTVのWeb画面は設定例のport 7200です。
-- KonomiTVにはhost rootを渡さず、録画directoryだけをread-onlyで渡します。
+- KonomiTVにはhost rootを渡さず、録画directoryだけをread-onlyで渡します。録画削除を明示した場合だけ、
+  別のoverrideで録画directoryへの書込みを許可します。
 
 ## 初回準備
 
@@ -25,7 +26,8 @@ Release archiveの`packaging/compose`を、永続dataを置く専用directoryへ
 ```
 
 `prepare.sh`は、現在のUID/GIDを使う`.env`、KonomiTV設定、mode 0700の相対directoryを、存在しない場合だけ
-作ります。既存fileは上書きしません。
+作ります。録画directoryの所有lockも、存在しない場合だけ0600で作ります。既存lockがsymlink、directory、
+特殊file、別所有者、0600以外、link数1以外の場合は、変更せずに停止します。既存fileは上書きしません。
 
 `.env`の`MIRAKURUN_URL`と`config/konomitv.yaml`の`mirakurun_url`を同じ接続先へ設定します。実際の接続先、
 token、番組情報をIssueやlogへ貼らないでください。
@@ -75,6 +77,32 @@ docker compose ps
 ```
 
 KonomiTVはSazanamiのhealthcheck成功後に起動します。Web画面の接続先は、設定したhostのport 7200です。
+
+## KonomiTVから録画を削除する
+
+既定では、KonomiTVへ録画directoryをread-onlyで渡します。KonomiTVの管理者画面から録画を削除する場合だけ、
+Base Composeと削除overrideを明示して起動します。
+
+```sh
+docker compose \
+  -f compose.yaml \
+  -f compose.konomitv-delete.yaml \
+  up -d
+```
+
+削除overrideでは、SazanamiとKonomiTVを同じhost UID/GIDで動かし、KonomiTVを録画directoryの信頼済み共同所有者と
+して扱います。KonomiTVは録画fileを削除、置換、同じsizeで変更できます。Sazanamiの所有lockだけは、同じpathへ
+個別にread-onlyでmountします。Host root、Sazanamiのdata、SQLite、Docker socketは渡しません。
+
+Sazanamiは完了録画を一分ごとに最大1,000件ずつ照合します。KonomiTVが完成fileを削除すると、録画履歴は残したまま
+`MISSING / FILE_MISSING`へ変わります。所有者、mode、file種別、link数、期待sizeが正しい完成fileを同じpathへ戻すと、
+次の照合で`FINAL`へ戻ります。内容のchecksumは保存しないため、同じsizeの別内容も`FINAL`になります。
+
+KonomiTVのDB、thumbnail、補助file、録画directory内の未知fileはSazanamiから変更しません。File観測の直後に外部変更が
+重なった場合は、一時的に古い状態を表示し、次の照合で収束します。
+
+削除を無効へ戻す場合はcontainerを停止し、削除overrideを外してBase Composeだけで作り直します。録画fileと両DBは
+削除しません。
 
 ## 更新する
 
@@ -127,7 +155,8 @@ docker compose down
 
 ## 制限
 
-- KonomiTVの録画mountはread-onlyです。KonomiTV画面から録画fileを削除できません。
+- KonomiTVの録画mountは既定でread-onlyです。削除overrideを明示した構成だけ、KonomiTV画面から削除できます。
+- 削除overrideではKonomiTVがlock以外の録画directory内fileを変更できます。同じsizeの内容変更は検出しません。
 - Compose全体のarm64、GPU encoder、Docker Desktop、rootless Dockerは未検証です。
 - KonomiTV／Komorebiの全操作対応を示す構成ではありません。
 - Source buildだけでは、番組表、途中録画、停止、再生の実通信成功を証明しません。

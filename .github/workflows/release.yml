@@ -84,6 +84,7 @@ jobs:
               packaging/systemd/sazanami-dvr.service \
               packaging/systemd/sazanami-dvr.env.example \
               packaging/compose/compose.yaml \
+              packaging/compose/compose.konomitv-delete.yaml \
               packaging/compose/.env.example \
               packaging/compose/konomitv.yaml.example \
               packaging/compose/prepare.sh; do
@@ -97,6 +98,7 @@ jobs:
               packaging/systemd/sazanami-dvr.service \
               packaging/systemd/sazanami-dvr.env.example \
               packaging/compose/compose.yaml \
+              packaging/compose/compose.konomitv-delete.yaml \
               packaging/compose/.env.example \
               packaging/compose/konomitv.yaml.example \
               packaging/compose/prepare.sh; do
