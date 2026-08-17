@@ -185,6 +185,11 @@ func (store *Store) SetOneSegAvailability(ctx context.Context, attemptID catalog
 		if reason != "" {
 			return errors.New("sqlite: final one-seg must not have integrity reason")
 		}
+	case recording.AvailabilityPartial:
+		if !reason.Valid() {
+			return errors.New("sqlite: partial one-seg requires stable reason")
+		}
+		integrity = reason
 	case recording.AvailabilityMissing:
 		if reason != recording.ReasonFileMissing {
 			return errors.New("sqlite: missing one-seg requires stable reason")
@@ -207,8 +212,9 @@ func (store *Store) SetOneSegAvailability(ctx context.Context, attemptID catalog
 		AND EXISTS (SELECT 1 FROM recording_attempts a WHERE a.id=? AND
 			(a.state='SUCCEEDED' OR (a.state='PARTIAL' AND a.terminal_reason='USER_REQUESTED_STOP')))
 		AND (?<>'FINAL' OR state='FINALIZED')
+		AND (?<>'PARTIAL' OR state='PARTIAL')
 		AND (availability<>? OR COALESCE(integrity_reason,'')<>?)`, availability, integrity, now.UnixMilli(),
-		attemptID.Bytes(), attemptID.Bytes(), availability, availability, integrityText)
+		attemptID.Bytes(), attemptID.Bytes(), availability, availability, availability, integrityText)
 	if err != nil {
 		return sanitize("update-one-seg-availability", err)
 	}
