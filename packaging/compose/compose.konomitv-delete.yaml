@@ -1,0 +1,15 @@
+services:
+  konomitv:
+    volumes:
+      - type: bind
+        source: ${RECORDING_DIR:?RECORDING_DIRを設定してください}
+        target: /host-rootfs/recordings
+        read_only: false
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${RECORDING_DIR:?RECORDING_DIRを設定してください}/.sazanami-dvr.lock
+        target: /host-rootfs/recordings/.sazanami-dvr.lock
+        read_only: true
+        bind:
+          create_host_path: false

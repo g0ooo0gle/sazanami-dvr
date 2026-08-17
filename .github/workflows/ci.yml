@@ -128,38 +128,15 @@ jobs:
       - name: Compose構成を確認
         run: |
           compose_json="$RUNNER_TEMP/compose.json"
+          delete_json="$RUNNER_TEMP/compose-delete.json"
           docker compose --env-file packaging/compose/.env.example \
             -f packaging/compose/compose.yaml config --format json > "$compose_json"
-          python3 - "$compose_json" <<'PY'
-          import json
-          import sys
-
-          with open(sys.argv[1], encoding="utf-8") as source:
-              document = json.load(source)
-          services = document["services"]
-          assert set(services) == {"sazanami", "konomitv"}
-          for name in services:
-              service = services[name]
-              assert service["network_mode"] == "host"
-              assert service["user"] == "1000:1000"
-              assert service["cap_drop"] == ["ALL"]
-              assert "no-new-privileges:true" in service["security_opt"]
-              assert service.get("privileged") is not True
-              assert not service.get("devices")
-              for volume in service["volumes"]:
-                  assert volume["source"] != "/"
-                  assert "docker.sock" not in volume["source"]
-          sazanami = services["sazanami"]
-          assert sazanami["read_only"] is True
-          assert sazanami["healthcheck"]["test"][-1] == "http://127.0.0.1:4521/api/recordings?limit=1"
-          konomitv = services["konomitv"]
-          assert konomitv["platform"] == "linux/amd64"
-          assert konomitv["build"]["context"].endswith("#0a32188274b81c1e7bed642474b208bd2a543a6b")
-          recording_mount = next(item for item in konomitv["volumes"] if item["target"] == "/host-rootfs/recordings")
-          assert recording_mount["read_only"] is True
-          assert all(item["target"] != "/host-rootfs" for item in konomitv["volumes"])
-          PY
+          docker compose --env-file packaging/compose/.env.example \
+            -f packaging/compose/compose.yaml -f packaging/compose/compose.konomitv-delete.yaml \
+            config --format json > "$delete_json"
+          python3 packaging/compose/compose_test.py "$compose_json" "$delete_json"
           sh -n packaging/compose/prepare.sh
+          sh packaging/compose/prepare_test.sh
           grep -qx "    edcb_url: 'tcp://127.0.0.1:4520/'" packaging/compose/konomitv.yaml.example
           grep -qx "    port: 7200" packaging/compose/konomitv.yaml.example
           grep -qx "        - '/recordings'" packaging/compose/konomitv.yaml.example
