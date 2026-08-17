@@ -264,6 +264,12 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	if err := recovery.Run(startupContext); err != nil {
 		return errorsStable("recording-recovery-failed")
 	}
+	completedReconciler := &recordingapp.CompletedReconciler{
+		Store: store, Inspect: recordingRoot.Inspect, Clock: recordingClock,
+	}
+	completedReconcileRunner := recordingapp.CompletedReconcileRunner{
+		Reconcile: completedReconciler.Run, Observe: observeCompletedRecordingReconcile(stdout, stderr),
+	}
 	scheduler, err := recordingapp.NewScheduler(store, executor, recordingClock, effectiveMaximum)
 	if err != nil {
 		return errorsStable("recording-scheduler-invalid")
@@ -326,9 +332,11 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	serverDone := make(chan error, 1)
 	schedulerDone := make(chan error, 1)
 	refreshDone := make(chan error, 1)
+	reconcileDone := make(chan error, 1)
 	httpDone := make(chan error, 1)
 	go func() { serverDone <- server.Serve(serviceContext, listener) }()
 	go func() { schedulerDone <- scheduler.Run(serviceContext) }()
+	go func() { reconcileDone <- completedReconcileRunner.Run(serviceContext) }()
 	go func() {
 		err := httpServer.Serve(httpListener)
 		if errors.Is(err, http.ErrServerClosed) {
@@ -359,8 +367,8 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	fmt.Fprintf(stdout, "録画プロセスを開始しました: ctrlcmd_scope=%s http_scope=%s services=%d catalog_refresh_interval=%s max_concurrent_recordings=%d max_concurrent_source=%s\n",
 		recordingListenScope(*listenAddress), recordingListenScope(*httpListenAddress), snapshot.Count(), refreshInterval.String(), effectiveMaximum, maximumSource)
 	writeCtrlCmdLANNotice(stdout, *listenAddress)
-	var serverErr, schedulerErr, refreshErr, httpErr error
-	serverFinished, schedulerFinished, refreshFinished, httpFinished := false, false, false, false
+	var serverErr, schedulerErr, refreshErr, reconcileErr, httpErr error
+	serverFinished, schedulerFinished, refreshFinished, reconcileFinished, httpFinished := false, false, false, false, false
 	select {
 	case serverErr = <-serverDone:
 		serverFinished = true
@@ -368,6 +376,8 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 		schedulerFinished = true
 	case refreshErr = <-refreshDone:
 		refreshFinished = true
+	case reconcileErr = <-reconcileDone:
+		reconcileFinished = true
 	case httpErr = <-httpDone:
 		httpFinished = true
 	case <-ctx.Done():
@@ -383,7 +393,7 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	_ = httpListener.Close()
 	shutdown := time.NewTimer(30 * time.Second)
 	defer shutdown.Stop()
-	for !serverFinished || !schedulerFinished || !refreshFinished || !httpFinished {
+	for !serverFinished || !schedulerFinished || !refreshFinished || !reconcileFinished || !httpFinished {
 		select {
 		case serverErr = <-serverDone:
 			serverFinished = true
@@ -391,6 +401,8 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 			schedulerFinished = true
 		case refreshErr = <-refreshDone:
 			refreshFinished = true
+		case reconcileErr = <-reconcileDone:
+			reconcileFinished = true
 		case httpErr = <-httpDone:
 			httpFinished = true
 		case <-shutdown.C:
@@ -406,6 +418,9 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	}
 	if refreshErr != nil {
 		return errorsStable("recording-catalog-refresh-failed")
+	}
+	if reconcileErr != nil {
+		return errorsStable("recording-reconcile-runner-failed")
 	}
 	if httpErr != nil {
 		return errorsStable("recording-http-listen-failed")
