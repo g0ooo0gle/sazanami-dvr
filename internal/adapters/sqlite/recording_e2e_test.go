@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -464,6 +465,33 @@ func TestReservationToFinalFileSurvivesRestart(t *testing.T) {
 	observation, err := recordingRoot.Inspect(items[0].Plan)
 	if err != nil || observation.Partial.Exists || !observation.Final.Regular || observation.Final.Size != 376 {
 		t.Fatalf("observation=%+v err=%v", observation, err)
+	}
+	reconciler := apprecording.CompletedReconciler{Store: store, Inspect: recordingRoot.Inspect, Clock: clock}
+	finalPath, err := recordingRoot.FinalPath(items[0].Plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(finalPath); err != nil {
+		t.Fatal(err)
+	}
+	if result, reason, err := reconciler.Run(context.Background()); err != nil || reason != "" ||
+		result.Checked != 1 || result.Changed != 1 || result.Missing != 1 {
+		t.Fatalf("missing result=%+v reason=%q err=%v", result, reason, err)
+	}
+	history, err := store.RecordingHistoryItem(context.Background(), created.Number)
+	if err != nil || history == nil || history.Availability != core.AvailabilityMissing || history.Playable() {
+		t.Fatalf("missing history=%+v err=%v", history, err)
+	}
+	if err := os.WriteFile(finalPath, bytes.Repeat([]byte{0x11}, 376), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if result, reason, err := reconciler.Run(context.Background()); err != nil || reason != "" ||
+		result.Checked != 1 || result.Changed != 1 || result.Missing != 0 || result.Mismatched != 0 {
+		t.Fatalf("restored result=%+v reason=%q err=%v", result, reason, err)
+	}
+	history, err = store.RecordingHistoryItem(context.Background(), created.Number)
+	if err != nil || history == nil || history.Availability != core.AvailabilityFinal || !history.Playable() {
+		t.Fatalf("restored history=%+v err=%v", history, err)
 	}
 	if next, err := store.NextActiveReservation(context.Background(), time.Now().UTC()); err != nil || next != nil {
 		t.Fatalf("next=%+v err=%v", next, err)
