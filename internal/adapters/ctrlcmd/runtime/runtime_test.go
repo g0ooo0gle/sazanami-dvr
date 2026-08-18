@@ -442,6 +442,35 @@ func TestRecordingRouterDispatchesCompletedRecordingList(t *testing.T) {
 	}
 }
 
+func TestRecordingRouterRoutesFixedKonomiTVV0141Commands(t *testing.T) {
+	root, path, base, _ := validFixture(t)
+	snapshot, err := BuildSnapshot(context.Background(), root, path, &recordingCatalog{fakeCatalog: base})
+	if err != nil {
+		t.Fatal(err)
+	}
+	router, err := NewRecordingRouterWithLive(snapshot, emptyReservationOperations{},
+		emptyAutomaticReservationOperations{}, emptyRecordedOperations{}, emptyLiveOperations{},
+		emptyLogoProvider{}, SystemClock{}, codec.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	commands := [...]int32{
+		2200, 1060, 1021, 1029, 2060, 1025,
+		2011, 2013, 2015, 1014, 1087, 1081,
+		2131, 2132, 2134, 1033, 1073, 301, 1074,
+	}
+	for _, command := range commands {
+		t.Run(fmt.Sprint(command), func(t *testing.T) {
+			var codecError *codec.Error
+			err := router.Handle(context.Background(), commandFrame(command, nil), &bytes.Buffer{})
+			if errors.As(err, &codecError) && codecError.Category == codec.Unsupported {
+				t.Fatalf("固定KonomiTV v0.14.1のcommand %dが未接続です", command)
+			}
+		})
+	}
+}
+
 func TestRecordingRouterMarksOnlyLiveRelayAsLongLived(t *testing.T) {
 	root, path, base, _ := validFixture(t)
 	snapshot, err := BuildSnapshot(context.Background(), root, path, &recordingCatalog{fakeCatalog: base})
