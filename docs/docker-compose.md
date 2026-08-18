@@ -11,6 +11,8 @@ Mirakurun互換APIを用意してください。初版のCompose全体はLinux a
 - SazanamiはGHCRの完全な版tagを使います。
 - KonomiTVはtag `v0.14.1`、commit `0a32188274b81c1e7bed642474b208bd2a543a6b`の公式Dockerfileから、
   local imageをbuildします。Sazanami projectはKonomiTV imageを再配布しません。
+- Sazanami imageのbuilderは[ADR-0065](adr/0065-go-1-26-6-security-patch.md)に従い、Go 1.26.6と
+  multi-platform image digestを固定します。
 - 両serviceは同じhost UID/GIDとhost networkを使います。
 - SazanamiのCtrlCmdと録画HTTPは`127.0.0.1:4520`と`127.0.0.1:4521`へ限定します。
 - KonomiTVのWeb画面は設定例のport 7200です。
