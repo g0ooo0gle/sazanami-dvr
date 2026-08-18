@@ -2,7 +2,7 @@ module github.com/g0ooo0gle/sazanami-dvr
 
 go 1.26.0
 
-toolchain go1.26.5
+toolchain go1.26.6
 
 require github.com/ncruces/go-sqlite3 v0.35.2
 
