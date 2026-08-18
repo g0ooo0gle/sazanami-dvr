@@ -267,7 +267,9 @@ func TestAddAcceptsDisabledAndMarginBoundariesAtomically(t *testing.T) {
 		{name: "positive negative boundary", mode: 1, useMargins: 1, start: 3600, end: -3600, wantOK: true},
 		{name: "one over", mode: 1, useMargins: 1, start: 3601, wantOK: false},
 		{name: "invalid flag", mode: 1, useMargins: 2, wantOK: false},
-		{name: "default with value", mode: 1, start: 1, wantOK: false},
+		{name: "default ignores unused end", mode: 1, end: 30, wantOK: true},
+		{name: "default ignores unused start", mode: 1, start: -15, wantOK: true},
+		{name: "default ignores unused integer boundaries", mode: 1, start: -1 << 31, end: 1<<31 - 1, wantOK: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			before := len(operations.added)
@@ -294,6 +296,21 @@ func TestAddAcceptsDisabledAndMarginBoundariesAtomically(t *testing.T) {
 				t.Fatalf("partial acceptance frame=%+v calls=%d", frame, len(operations.added))
 			}
 		})
+	}
+}
+
+func TestChangeIgnoresUnusedMarginFields(t *testing.T) {
+	operations := &fakeOperations{}
+	handler := Handler{Operations: operations, Limits: codec.DefaultLimits()}
+	request := reservationRequestSettings(t, CommandChange, Version, 42, 1, 3, true, 0, -15, 30, 1)
+	var response bytes.Buffer
+	if err := handler.Handle(context.Background(), request, &response); err != nil {
+		t.Fatal(err)
+	}
+	frame, err := codec.ParseRequestFrame(response.Bytes(), codec.DefaultLimits())
+	if err != nil || frame.Code != ResultSuccess || len(operations.changed) != 1 ||
+		operations.changed[0].Request.Margins != nil {
+		t.Fatalf("frame=%+v changed=%+v err=%v", frame, operations.changed, err)
 	}
 }
 

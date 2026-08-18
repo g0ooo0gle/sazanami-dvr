@@ -432,17 +432,14 @@ func decodeSettings(reader *codec.Reader) (decodedSettings, error) {
 		if partial == 1 {
 			settings.oneSegOutput = &oneSegOutput
 		}
-		if useMargins == 0 {
-			if startMargin != 0 || endMargin != 0 {
+		if useMargins == 1 {
+			if startMargin < -3600 || startMargin > 3600 || endMargin < -3600 || endMargin > 3600 {
 				return failure(codec.Unsupported, "recording-setting-out-of-profile", 0)
 			}
-		} else if useMargins == 1 && startMargin >= -3600 && startMargin <= 3600 && endMargin >= -3600 && endMargin <= 3600 {
 			settings.margins = &recording.RecordingMargins{
 				Start: time.Duration(startMargin) * time.Second,
 				End:   time.Duration(endMargin) * time.Second,
 			}
-		} else {
-			return failure(codec.Unsupported, "recording-setting-out-of-profile", 0)
 		}
 		settings.follow = followValue == 1
 		settings.disabled = recordingMode == 5
