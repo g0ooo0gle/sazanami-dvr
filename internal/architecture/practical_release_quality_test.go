@@ -79,4 +79,11 @@ func TestPracticalReleaseQualitySurface(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "internal/app/catalogsync/target_soak_test.go")); !os.IsNotExist(err) {
 		t.Errorf("専用の長時間soak試験が残っています: %v", err)
 	}
+	for _, name := range []string{
+		"spec/operations/linux-installation-lifecycle-v1.md",
+		"spec/operations/linux-installation-lifecycle-v2.md",
+		"spec/operations/linux-lifecycle-verification-v1.md",
+	} {
+		requireText(name, read(name), "- Status: Superseded", "Superseded by:")
+	}
 }
