@@ -7,6 +7,7 @@
 - Related: ADR-0023、ADR-0026、ADR-0034、ADR-0056、Plan 0040、Plan 0072、Handoff 0048
 - Product copy path: `docs/adr/0057-komorebi-original-live-hls.md`
 - Product sync state: NOT COPIED
+- Partially superseded by: ADR-0069（時間指定の耐久試験を将来の必須条件にする部分）
 
 ## 背景
 

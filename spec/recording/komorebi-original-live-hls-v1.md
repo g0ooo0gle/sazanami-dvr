@@ -8,6 +8,7 @@
 - Design inspection base: `6443e5e6b9dba5f207a5f913ecc307f5819670c8`
 - Target product base: `5deb65c9f0604d1a089a85d32123e27de7f72e28`
 - Media contract: RFC 8216 MPEG-2 Transport Stream Media Segments
+- Active override: ADR-0069（時間指定の耐久試験を必須にする部分）
 
 ## 目的
 
@@ -332,8 +333,7 @@ PCR、playlist処理を録画filterへ持ち込まず、汎用media frameworkに
 報告にはsession件数、segment件数、転送byte数、playlist duration、所要時間、固定終了理由、成否だけを
 残す。接続先、端末名、放送ID、局、番組、HLS key、file名、path、hash、TS内容、生の応答を残さない。
 
-## 長時間確認
+## 長時間確認（履歴）
 
-短い実Android確認を完了した同じ製品内容で、主画面または主画面＋二画面を含む連続運転をv0.9.0候補の
-72時間試験へ組み込む。途中で実行時挙動を変えた場合は、新しい候補で最初からやり直す。72時間試験前は
-v1.0対応済みと宣言しない。
+以下は採用当時の条件であり、ADR-0069が置き換えた。時間指定の耐久試験とv0.9.0経由は、現在の品質目標、
+完了条件、成果物に使わない。短いAndroid確認の証拠区分と、未確認事項を対応済みにしない原則は維持する。
