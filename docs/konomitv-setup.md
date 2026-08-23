@@ -2,6 +2,7 @@
 
 この手順では、KonomiTVの番組表からSazanami DVRへ予約を送り、完成した録画ファイルをKonomiTVで
 見つけられる構成にします。KonomiTVとSazanami DVRは、同じUbuntuまたは信頼できる同じLANで動かしてください。
+別のホストで動かす場合は、Sazanami DVRの録画保存先をKonomiTVのホストへマウントする必要があります。
 
 初回は「接続の分担」から「一件確認する」までを順に進めます。「うまくいかない場合」は、問題が起きた
 ときだけ参照してください。
@@ -10,7 +11,7 @@ Sazanami DVRのCtrlCmdは、既定で同じLANから接続できます。KonomiT
 
 確認対象はKonomiTV v0.14.1です。画面の番組表から予約し、5分間録画したファイルを録画済み一覧から
 再生するところまで一件確認しました。自動予約はHTTP APIから条件の追加・一覧取得・変更・削除を行い、
-実Mirakurunの番組表から予約を作って、再起動後に重複しないところまで確認しました。長時間運転や幅広い環境での動作は未確認です。
+実Mirakurunの番組表から予約を作って、再起動後に重複しないところまで確認しました。幅広い環境での動作は未確認です。
 操作別の状況は[互換実装表](compatibility.md)で確認できます。
 
 ## Sazanami DVRが予約とライブ視聴をMirakurunへ接続する
@@ -107,6 +108,10 @@ video:
 `backend`が`Mirakurun`のままだと、KonomiTVの録画予約機能は利用できません。Sazanami DVRの完成ファイルは
 録画保存先の下へ`.ts`として作られます。KonomiTV v0.14.1は登録したフォルダを再帰的に監視し、60秒以上の
 TSファイルを録画済み番組の解析対象にします。
+
+別のホストで動かす場合は、Sazanami DVRの録画保存先をKonomiTVのホストへ共有し、
+`<recording-root>`にはKonomiTVから読めるマウント先を指定します。KonomiTVから読めないパスでは、
+録画済み一覧への表示や再生はできません。
 
 `<sazanami-host>`にはSazanami DVRホストのLANアドレスを指定します。KonomiTVとSazanami DVRを同じPCで動かし、Sazanami DVRをloopback限定にした場合は`127.0.0.1`を使えます。
 

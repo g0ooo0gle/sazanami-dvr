@@ -6,6 +6,7 @@
 - Decision: `docs/adr/0063-konomitv-v0-5-0-intermediate-release.md`
 - Fixed KonomiTV source: tag `v0.14.1` / commit `0a32188274b81c1e7bed642474b208bd2a543a6b`
 - License: MIT
+- Active overrides: ADR-0067（全操作release gate）、ADR-0069（checksum成果物と時間指定耐久試験）
 
 ## 目的
 
@@ -140,8 +141,9 @@ BS4K、直接チューナー制御、WebUIのLAN公開・認証は本仕様の�
 うち必要な証拠を持ち、未実施は`NOT RUN`のまま残す。Sazanami起因の未対応応答、HTTP 5xx、バックエンドエラー、
 resource残留が一行でも残る間はv0.5.0のrelease-prepへ進まない。
 
-版番号、変更履歴、tag、GitHub Release、asset、checksum、OCI imageは、専用release-prep handoffで同じrelease commitへ
-固定する。v0.5.0を公開しても、Komorebi全対応、72時間試験、v1.0.0の条件は満たしたことにならない。
+V0.5.0の版、変更履歴、tag、GitHub Release、asset、OCI imageは、専用release-prep handoffで同じrelease
+commitへ固定した。公開時のchecksum記録は履歴として残すが、次版の必須成果物にはしない。V1.0.0は
+実用リリース品質仕様v1の条件で判定する。
 
 ## 必須テスト
 

@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-08-11
 - Deciders: Project owner（v1.0までの判断をCodexへ委任）
+- Partially superseded by: ADR-0069（配布archiveの利用者hash照合を導入条件にする部分）
 
 ## 背景
 

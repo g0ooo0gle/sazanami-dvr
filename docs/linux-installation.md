@@ -19,17 +19,9 @@
 
 ## 初回導入
 
-### 1. 配布物のハッシュを確認する
+GitHub Releaseから、利用するCPU向けのアーカイブを取得します。
 
-GitHub Releaseから、利用するCPU向けのアーカイブと`SHA256SUMS`を同じリリースから取得します。ダウンロードしたアーカイブだけを照合できます。
-
-```console
-sha256sum --ignore-missing --check SHA256SUMS
-```
-
-対象アーカイブが`OK`にならない場合は、そのファイルを展開しないでください。
-
-### 2. 専用利用者とディレクトリを作る
+### 1. 専用利用者とディレクトリを作る
 
 次の操作にはroot権限が必要です。`sazanami-dvr`利用者は対話ログインに使いません。
 
@@ -47,7 +39,7 @@ sudo install -d -o sazanami-dvr -g sazanami-dvr -m 0700 \
   /var/lib/sazanami-dvr/recordings
 ```
 
-### 3. 新しい版を展開する
+### 2. 新しい版を展開する
 
 ```console
 sudo tar -xzf sazanami-dvr_<version>_linux_<arch>.tar.gz \
@@ -62,7 +54,7 @@ sudo ln -s /opt/sazanami-dvr/<version>/sazanami-dvr \
 
 表示された版がアーカイブの版と異なる場合は、DB操作へ進まないでください。
 
-### 4. 設定を初回だけ作る
+### 3. 設定を初回だけ作る
 
 環境設定例をコピーし、MirakurunまたはmirakcのURLを編集します。更新時は、このファイルを上書きしません。
 
@@ -90,7 +82,7 @@ sudo install -o root -g sazanami-dvr -m 0640 \
   /var/lib/sazanami-dvr/channels.json
 ```
 
-### 5. DBと番組表を明示的に準備する
+### 4. DBと番組表を明示的に準備する
 
 Sazanami DVRはサービス起動時にDBを自動更新しません。初回だけ、専用利用者で次を実行します。
 

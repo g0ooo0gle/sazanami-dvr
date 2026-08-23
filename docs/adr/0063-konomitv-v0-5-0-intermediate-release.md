@@ -6,7 +6,12 @@
 - Delegated reviewer: Codex
 - Related: ADR-0026、ADR-0053、Plan 0040、Plan 0058、Plan 0079、Handoff 0055
 - Supersedes: None
-- Superseded by: None
+- Superseded by: ADR-0067（全12操作群の未実施を残さないことと、全検索条件総当たりをv0.5.0の
+  release gateにする部分だけ。source inventory、操作matrix、上限、既知制限は有効）
+- Partially superseded by: ADR-0069（時間指定耐久試験を将来の必須release gateとして維持する部分）
+
+ADR-0069と実用リリース品質仕様v1により、v0.9.0の経由と時間を固定した試験は、
+現在のv1.0.0公開条件から外れた。以下の該当記述は当時の判断履歴であり、現行条件ではない。
 
 ## 背景
 
@@ -41,10 +46,10 @@ v0.5.0のtag、GitHub Release、配布物は、KonomiTVの全行が同一製品c
 
 ## ADR-0026・ADR-0053との関係
 
-本ADRは、Accepted ADR-0026またはADR-0053の本文、status、履歴を編集しない。
+本ADRの採用当時は、Accepted ADR-0026とADR-0053の本文、status、履歴を編集しなかった。
 
-- ADR-0026が定めたv1.0の「KonomiTVとKomorebiの全到達操作」という長期目標は維持する。
-- ADR-0053が定めたv0.9.0の機能完成版とv1.0.0の72時間試験後の安定版も維持する。
+- ADR-0026の固定source調査と証拠区分は維持する。Komorebiを必須にする部分はADR-0067が置き換えた。
+- ADR-0053のv0.9.0経由と時間を固定した試験は当時の履歴であり、ADR-0069により現行条件ではない。
 - v0.5.0は、その途中にKonomiTVだけの完了条件を置く新しい機能版である。Komorebiの確認を放棄する判断ではない。
 - Project ownerは2026-08-18に、KonomiTV全操作をv0.5.0の中間目標とし、Komorebi全対応を次の機能版へ移す方針を明示した。この指示を本ADRの採用根拠とする。
 

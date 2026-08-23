@@ -5,6 +5,10 @@
 - Requirements: `VER-001`～`VER-012`
 - Related decision: ADR-0053
 - Target: Sazanami DVR v0.1.0以後
+- Active override: `spec/release/practical-release-quality-v1.md`（`VER-009`のchecksum成果物と`VER-010`／`VER-011`を置換）
+
+版番号の三桁、機能版と修正版の区別、tagと製品版の一致は維持する。v0.9.0経由、時間指定の耐久試験、
+配布archiveのchecksum成果物は現在の公開条件ではない。
 
 ## 目的
 
@@ -59,16 +63,20 @@ CGOを使わない主要環境buildを行う。merge後の`main`完全SHAでも�
 ### VER-009: tagと配布物を照合する
 
 release workflowはtagの`v`を除いた値と実行ファイルの版表示を照合する。Linux amd64／arm64の
-配布物、SHA-256、license、README、公開手順、必要なthird-party noticeを確認する。実行ファイルに
+配布物、license、README、CHANGELOG、公開手順、必要なthird-party noticeを確認する。実行ファイルに
 埋め込んだVCS commitはtagの完全SHAと一致し、dirtyではない。
 
-### VER-010: v0.9.0は72時間試験前の完成候補にする
+### VER-010: v0.9.0は時間指定耐久試験前の完成候補にする（Superseded）
+
+この要件は、ADR-0069と実用release品質仕様v1が置き換えた。以下は採用当時の履歴である。
 
 v0.9.0までに、Plan 0040のv1.0条件のうち実験用Ubuntuの連続72時間試験以外を完了する。固定版
 KonomiTV／Komorebiの対象操作、導入、更新、切り戻し、復旧、短い実環境試験、自動test、配布物、
 公開文書に未完了を残さない。未検証項目を版番号だけで対応済みにしない。
 
-### VER-011: v1.0.0は最終候補と同じ内容で72時間試験を通す
+### VER-011: v1.0.0は最終候補と同じ内容で時間指定耐久試験を通す（Superseded）
+
+この要件は、ADR-0069と実用release品質仕様v1が置き換えた。以下は採用当時の履歴である。
 
 v1.0.0は、最終候補と同じ製品コード、設定、配布処理のコミットで連続72時間試験に合格してから
 公開する。試験後に実行時挙動を変える修正をした場合は、新しい候補で72時間試験をやり直す。
@@ -99,7 +107,7 @@ Handoff 0043の専用PRで次をそろえる。
 - READMEの現在版とv0.1.0変更履歴が、統合したhandoffの範囲と一致する。
 - 互換実装表に、実環境証拠のない「対応済み」が増えていない。
 - 通常、shuffle、race、vet、module検証、既知脆弱性検査、CGO無効のLinux／Darwin amd64／arm64 build。
-- Linux amd64／arm64配布物のSHA-256、収録file、実行版、VCS commit、dirty状態。
+- Linux amd64／arm64配布物の収録file、実行版、VCS commit、dirty状態。
 - 公開Linux amd64配布物による短い導入、DB状態、起動、停止、旧版への切り戻し。
 
 ## 完了条件

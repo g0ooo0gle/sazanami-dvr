@@ -1,11 +1,15 @@
 # Linux導入・更新・削除仕様 v2
 
-- Status: Accepted
+- Status: Superseded
 - Date: 2026-08-11
 - Applies to: Sazanami DVR v0.1.2以降
 - Decision: `docs/adr/0058-channel-map-standard-path.md`
 - Base decision: `docs/adr/0051-versioned-linux-installation.md`
 - Supersedes: `spec/operations/linux-installation-lifecycle-v1.md`
+- Superseded by: `spec/operations/linux-installation-lifecycle-v3.md`
+
+版別配置、権限、明示DB更新、backup、切り戻し、通常削除、purgeは有効である。配布archiveの
+checksum取得と照合は、現在の導入手順と完了条件には使わない。
 
 ## 目的
 

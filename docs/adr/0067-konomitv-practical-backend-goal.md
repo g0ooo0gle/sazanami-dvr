@@ -6,7 +6,7 @@
 - Delegated reviewer: Codex
 - Related: ADR-0026、ADR-0053、ADR-0063、Plan 0083、Handoffs 0055、0059
 - Supersedes: ADR-0026のKomorebi必須条件、ADR-0053のv0.9.0／v1.0.0必須工程、ADR-0063の全画面総当たりrelease gate
-- Superseded by: None
+- Partially superseded by: ADR-0069（checksumを必須成果物にする部分と、時間指定耐久試験を将来へ残す部分）
 
 ## 背景
 
@@ -48,8 +48,8 @@ KonomiTVで使える状態を作る。
 5. 管理者削除でKonomiTVのDB、thumbnail、録画fileを削除し、Sazanami履歴を
    `MISSING / FILE_MISSING`へ収束できる。
 6. KonomiTVに画面導線がないキーワード自動予約は、公開HTTP APIでCRUD、予約生成、後始末が動く。
-7. 専用release commitのCI、tag、GitHub Release、Linux amd64／arm64 archive、checksum、
-   OCI imageの来歴が一致する。
+7. 専用release commitのCI、tag、GitHub Release、Linux amd64／arm64 archive、OCI image、
+   binary revisionの来歴が一致する。
 
 source、contract、black-box、実験環境の証拠は操作に応じて組み合わせる。固定clientから届く要求を
 製品試験と実験環境で確認済みなら、全検索条件を一件ずつ画面操作することや、同じ経路を再度画面で
@@ -61,7 +61,7 @@ source、contract、black-box、実験環境の証拠は操作に応じて組み
 - 別versionのKonomiTVへの互換宣言
 - Komorebi、Android TV、TvCast、HLS、cast、画質変換、端末codecの完全対応
 - 全検索条件、全画面、全失敗条件の実機総当たり
-- 72時間試験、厳密な長期resource測定、v0.9.0を経由すること
+- 時間指定の耐久試験、厳密な長期resource測定、v0.9.0を経由すること
 - BS4K、直接チューナー制御、WebUIのLAN公開・認証
 
 これらの実装や既存証拠は削除しない。将来必要になった時点で、別の版とhandoffとして扱う。
@@ -70,7 +70,7 @@ source、contract、black-box、実験環境の証拠は操作に応じて組み
 
 - ADR-0026の固定source調査、上限、失敗応答、来歴、秘匿の原則は維持する。Komorebiを
   最終releaseの必須条件にする部分だけを置き換える。
-- ADR-0053の版、tag、Release、assetを同じcommitへ固定する規則は維持する。v0.9.0と72時間試験を
+- ADR-0053の版、tag、Release、assetを同じcommitへ固定する規則は維持する。v0.9.0と時間指定耐久試験を
   最終ゴールの必須工程にする部分だけを置き換える。
 - ADR-0063と全操作マトリクス仕様v1は、source inventory、実装表、既知制限を追跡する資料として残す。
   全12操作群の未実施を残さないことと、全検索条件総当たりをv0.5.0のrelease gateにする部分は、
@@ -88,7 +88,7 @@ source、contract、black-box、実験環境の証拠は操作に応じて組み
 
 ### 従来のv1.0.0条件を維持する
 
-採用しない。KonomiTVの日常利用と無関係なKomorebi、72時間試験、全画面総当たりが公開を妨げる。
+採用しない。KonomiTVの日常利用と無関係なKomorebi、時間指定の耐久試験、全画面総当たりが公開を妨げる。
 
 ### 19種類のCtrlCmdが応答すれば完了とする
 
@@ -96,7 +96,7 @@ source、contract、black-box、実験環境の証拠は操作に応じて組み
 
 ### 実験環境だけ確認し、配布物を作らない
 
-採用しない。導入可能なtag、archive、checksum、OCI imageまで同じcommitへ固定して初めて利用可能になる。
+採用しない。導入可能なtag、archive、OCI image、binary revisionまで同じcommitへ固定して初めて利用可能になる。
 
 ## 検証
 
@@ -104,4 +104,4 @@ source、contract、black-box、実験環境の証拠は操作に応じて組み
 - 公開互換表に固定client、確認済み導線、未実施、既知制限、対象外を記録する。
 - release-prep差分へ新機能、schema変更、migration、依存追加を混ぜない。
 - candidate CIと統合後main CIを成功させた後にだけtagを作る。
-- 公開した二つのarchive、`SHA256SUMS`、`OCI_IMAGE`、OCI digest、binary revisionを読み戻す。
+- 公開した二つのarchive、`OCI_IMAGE`、OCI digest、binary revisionを読み戻す。

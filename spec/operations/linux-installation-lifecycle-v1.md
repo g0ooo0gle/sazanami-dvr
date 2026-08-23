@@ -1,9 +1,12 @@
 # Linux導入・更新・削除仕様 v1
 
-- Status: Accepted
+- Status: Superseded
 - Date: 2026-08-11
 - Applies to: Sazanami DVR v1.0準備版以降
 - Decision: `docs/adr/0051-versioned-linux-installation.md`
+- Superseded by: `spec/operations/linux-installation-lifecycle-v2.md`、現行は`spec/operations/linux-installation-lifecycle-v3.md`
+
+以下は初版の履歴であり、現在の導入手順と完了条件に使わない。
 
 ## 目的
 
