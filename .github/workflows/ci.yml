@@ -162,3 +162,91 @@ jobs:
             --provenance=false --sbom=false \
             --output "type=oci,dest=$RUNNER_TEMP/sazanami-dvr.oci.tar" .
           tar -tf "$RUNNER_TEMP/sazanami-dvr.oci.tar" | grep -Fx index.json
+
+  lifecycle:
+    name: Linux lifecycle確認
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: sourceを取得
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Go toolchainを準備
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: "1.26.6"
+          check-latest: false
+          cache: false
+
+      - name: lifecycle scriptを確認
+        run: sh packaging/lifecycle/verify_test.sh
+
+      - name: candidate archiveを作成
+        id: candidate
+        run: |
+          version=$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"\([^"]*\)"/\1/p' cmd/sazanami-dvr/main.go)
+          test -n "$version"
+          package="sazanami-dvr_${version}_linux_amd64"
+          candidate_dir="$RUNNER_TEMP/candidate"
+          mkdir -p "$candidate_dir/$package"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags "-s -w -X main.productCommit=$GITHUB_SHA" \
+            -o "$candidate_dir/$package/sazanami-dvr" ./cmd/sazanami-dvr
+          cp LICENSE README.md CHANGELOG.md THIRD_PARTY_NOTICES.md "$candidate_dir/$package/"
+          cp -R docs packaging "$candidate_dir/$package/"
+          tar -C "$candidate_dir" -czf "$candidate_dir/$package.tar.gz" "$package"
+          printf 'archive=%s\n' "$candidate_dir/$package.tar.gz" >> "$GITHUB_OUTPUT"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: 公開v0.5.0 archiveを取得
+        id: baseline
+        run: |
+          baseline_dir="$RUNNER_TEMP/baseline"
+          mkdir -p "$baseline_dir"
+          archive="$baseline_dir/sazanami-dvr_0.5.0_linux_amd64.tar.gz"
+          curl --fail --location \
+            --output "$archive" \
+            https://github.com/g0ooo0gle/sazanami-dvr/releases/download/v0.5.0/sazanami-dvr_0.5.0_linux_amd64.tar.gz
+          printf 'archive=%s\n' "$archive" >> "$GITHUB_OUTPUT"
+
+      - name: 既存resourceを変更前に拒否する
+        run: |
+          sudo env "PATH=$PATH" packaging/lifecycle/verify.sh --preflight-only
+
+          symlink_target=$(mktemp -d)
+          sudo ln -s "$symlink_target" /opt/sazanami-dvr
+          if sudo env "PATH=$PATH" packaging/lifecycle/verify.sh --preflight-only; then
+            echo "既存symlinkを拒否しませんでした" >&2
+            exit 1
+          fi
+          sudo rm -f -- /opt/sazanami-dvr
+          test -d "$symlink_target"
+          rmdir "$symlink_target"
+
+          python3 -m http.server --bind 127.0.0.1 4520 >/dev/null 2>&1 &
+          listener_pid=$!
+          trap 'kill "$listener_pid" 2>/dev/null || true' EXIT
+          timeout 5 sh -c 'until ss -H -ltn "sport = :4520" | grep -q .; do sleep 0.1; done'
+          if sudo env "PATH=$PATH" packaging/lifecycle/verify.sh --preflight-only; then
+            echo "使用中portを拒否しませんでした" >&2
+            exit 1
+          fi
+          kill "$listener_pid"
+          wait "$listener_pid" 2>/dev/null || true
+          trap - EXIT
+
+          sudo test ! -e /opt/sazanami-dvr
+          sudo test ! -e /etc/sazanami-dvr
+          sudo test ! -e /var/lib/sazanami-dvr
+          ! getent passwd sazanami-dvr
+          ! getent group sazanami-dvr
+
+      - name: Fresh Ubuntuで主要lifecycleを確認
+        run: |
+          sudo env "PATH=$PATH" packaging/lifecycle/verify.sh \
+            "${{ steps.baseline.outputs.archive }}" \
+            "${{ steps.candidate.outputs.archive }}" \
+            "$GITHUB_SHA" \
+            "${{ steps.candidate.outputs.version }}"

@@ -76,9 +76,9 @@ jobs:
               "GOARCH=$arch"; do
               printf '%s\n' "$build_info" | grep -Fq "$required_setting"
             done
-            cp LICENSE README.md THIRD_PARTY_NOTICES.md "dist/$package/"
+            cp LICENSE README.md CHANGELOG.md THIRD_PARTY_NOTICES.md "dist/$package/"
             cp -R docs packaging "dist/$package/"
-            for required_file in sazanami-dvr LICENSE README.md THIRD_PARTY_NOTICES.md \
+            for required_file in sazanami-dvr LICENSE README.md CHANGELOG.md THIRD_PARTY_NOTICES.md \
               docs/linux-installation.md \
               docs/docker-compose.md \
               packaging/systemd/sazanami-dvr.service \
@@ -92,7 +92,7 @@ jobs:
             done
             tar -C dist -czf "dist/$package.tar.gz" "$package"
             tar -tzf "dist/$package.tar.gz" > "$RUNNER_TEMP/$package.list"
-            for required_file in sazanami-dvr LICENSE README.md THIRD_PARTY_NOTICES.md \
+            for required_file in sazanami-dvr LICENSE README.md CHANGELOG.md THIRD_PARTY_NOTICES.md \
               docs/linux-installation.md \
               docs/docker-compose.md \
               packaging/systemd/sazanami-dvr.service \
@@ -106,8 +106,6 @@ jobs:
             done
             rm -r "dist/$package"
           done
-          cd dist
-          sha256sum ./*.tar.gz > SHA256SUMS
 
       - name: Sazanami OCI imageを公開
         env:
@@ -144,4 +142,4 @@ jobs:
           case "$version" in
             0.*) options+=(--prerelease) ;;
           esac
-          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS dist/OCI_IMAGE "${options[@]}"
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/OCI_IMAGE "${options[@]}"

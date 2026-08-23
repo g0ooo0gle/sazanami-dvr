@@ -6,12 +6,11 @@ Sazanami DVRは、Mirakurun／mirakcから番組情報と放送ストリーム�
 
 ## 最短セットアップ
 
-この4段階は、GitHub Releaseの配布アーカイブをLinuxのsystemdで動かす場合の入口です。Mirakurunまたはmirakc、Linux、systemd、利用するCPUに合うamd64またはarm64のアーカイブを先に用意してください。Docker Composeを使う場合は、下の目的別ガイドから専用手順を参照してください。
+この3段階は、GitHub Releaseの配布アーカイブをLinuxのsystemdで動かす場合の入口です。Mirakurunまたはmirakc、Linux、systemd、利用するCPUに合うamd64またはarm64のアーカイブを先に用意してください。Docker Composeを使う場合は、下の目的別ガイドから専用手順を参照してください。
 
 1. **Mirakurun／mirakcとチャンネルを準備する。** Mirakurunまたはmirakcを先に用意し、利用するサービスとチャンネル設定を確認します。
-2. **配布物を検証する。** Releaseから利用するアーカイブと`SHA256SUMS`をダウンロードし、`sha256sum --ignore-missing --check SHA256SUMS`で照合します。ハッシュが一致しなければ、展開せずにそこで止めます。
-3. **配置と初期設定を分けて行う。** rootまたは管理者がアーカイブと環境設定を配置し、`channels.json`を用意します。サービス利用者で`db migrate`、`catalog sync`、`ctrlcmd validate`を順に実行します。
-4. **systemdを起動して確認する。** systemdサービスを起動し、`systemctl is-active sazanami-dvr`が`active`になることと、CtrlCmdの`4520`、録画HTTPの`4521`が待ち受けていることを確認します。CtrlCmdは認証なしで待ち受けるため、インターネットへ直接公開しません。
+2. **配置と初期設定を分けて行う。** Releaseから利用するCPU向けのアーカイブを取得します。rootまたは管理者がアーカイブと環境設定を配置し、`channels.json`を用意します。サービス利用者で`db migrate`、`catalog sync`、`ctrlcmd validate`を順に実行します。
+3. **systemdを起動して確認する。** systemdサービスを起動し、`systemctl is-active sazanami-dvr`が`active`になることと、CtrlCmdの`4520`、録画HTTPの`4521`が待ち受けていることを確認します。CtrlCmdは認証なしで待ち受けるため、インターネットへ直接公開しません。
 
 ## 主な機能
 
