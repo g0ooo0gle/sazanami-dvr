@@ -9,9 +9,9 @@
 - Related planning documents: Plan 0066、Plan 0085
 - Related handoffs: Handoffs 0041、0049
 - Product copy path: `docs/adr/0068-two-layer-linux-lifecycle-verification.md`
-- Product sync state: NOT COPIED
+- Product sync state: COPIED (SUPERSEDED REVISION; ADR-0069と仕様v2はNOT COPIED)
 - Supersedes: None
-- Superseded by: None
+- Partially superseded by: ADR-0069（archive checksum、必須LAB証拠、厳しい成果物をrelease gateにする部分）
 
 ## Context
 
@@ -22,8 +22,8 @@ Linux導入・更新・削除仕様v2は、標準配置、systemd、明示migrat
 unit、portが衝突する。実運用環境を止めて試験することも、privileged containerの中へsystemdを新設することも、
 今回の残件を閉じるための必要条件ではない。
 
-必要なのは、公開手順の厳密な再現と実Mirakurun接続を、それぞれ安全な場所で証明することである。このADRでは
-二種類の証拠の役割と、どちらも省略しない境界を決めたい。
+必要なのは、公開手順を安全に再現できることである。本ADRは当初、実Mirakurun接続も別層の必須証拠とした。
+ADR-0069はその必須化を置き換え、provider接続に影響する変更がある場合だけLABを使う。
 
 ## Decision drivers
 
@@ -45,19 +45,19 @@ unit、portが衝突する。実運用環境を止めて試験することも、
 
 ## Decision
 
-Project ownerの2026-08-23の明示承認により、fresh Ubuntu CIと隔離LABの二層構成を採用する。
+プロジェクトオーナーの2026-08-23の明示承認により、fresh Ubuntu CIを標準検証に採用する。
 
 第一層では、`ubuntu-24.04` x64のfresh GitHub-hosted VMへ標準利用者、標準path、標準unit、既定portを作る。固定した公開
 v0.1.2 archiveを導入し、Python標準libraryだけのsynthetic Mirakurunで初回起動する。Workflowが作ったexact
 candidate archiveへ更新してschema 12から13以降へ進め、更新前backupから復元してv0.1.2へ切り戻し、再び
 candidateへ更新する。通常削除の保持と明示purgeまで同じ入口で検証する。
 
-第二層では、実験環境に別名の利用者、path、unit、loopback portを持つ隔離profileを作り、同じcandidateで
-実Mirakurunのcatalog、tuner取得、service起動だけを確認する。稼働中Compose、既存標準導入、KonomiTV、録画、
-予約には触れない。
+第二層の隔離LABは、provider接続や実Mirakurun固有の境界を変更した場合に限り使う。
+実施するときは、別名の利用者、path、unit、loopback portを持つ隔離profileで、同じcandidateの
+実Mirakurunのcatalog、tuner取得、service起動だけを確認する。稼働中Compose、既存標準導入、KonomiTV、録画、予約には触れない。
 
-標準配置CI、Releaseでのexact archive検証、LAB実provider smokeは三つの証拠区分として記録する。LAB成功は
-標準配置CIを代替せず、synthetic provider成功はLABを代替しない。
+標準配置CIとReleaseでのarchive検証を必須証拠とする。LABを実施した場合は別の証拠区分に記録し、
+標準配置CIの代替にしない。
 
 ## Consequences
 
@@ -70,35 +70,35 @@ candidateへ更新する。通常削除の保持と明示purgeまで同じ入口
 
 ### Negative
 
-- Synthetic providerとLAB profileの二種類を保守する必要がある。
+- Synthetic providerを保守する。LAB profileは必要な変更の検証時だけ用意する。
 - Fresh CIはroot権限とsystemd起動を伴い、通常のGo testより実行時間が長い。
-- LAB smokeは宅内環境が必要なので、公開CIだけでは完結しない。
+- LAB smokeが必要な変更は、公開CIだけでは完結しない。
 
 ### Risks and mitigations
 
 - Cleanupの誤り: 固定absolute pathだけを対象にし、resource存在時は開始前に失敗させる。
-- Candidate archiveの取り違え: Workflow内でSHA-256を固定し、検証対象と公開対象を照合する。
+- Candidate archiveの取り違え: 版、VCS revision、OS／architecture、収録ファイルを検証する。
 - Synthetic providerの過剰実装: `/api/version`、`/api/services`、`/api/programs`、`/api/tuners`の最小静的応答に限定する。
 - LABへの影響: 別名resourceとloopback portを使い、開始前後に稼働中環境をread-onlyで照合する。
 
 ## Verification
 
-- Accepted仕様v1のLVC-001からLVC-011を製品test、workflow、公開文書へ対応付ける。
+- Accepted仕様v2のLVC2-001からLVC2-008を製品test、workflow、公開文書へ対応付ける。
 - GitHub公式資料で、`ubuntu-24.04`がjobごとのVMでありpasswordless `sudo`を使えることを実装時にも確認する。
 - PR CIのfresh Ubuntuで初回導入、更新、restore、rollback、再更新、通常削除、purgeを成功させる。
-- Release workflowで公開直前のexact archiveへ同じ検証を適用する。
-- Main成功後、lifecycle checkをbranch protectionのrequired checkへ追加してread backする。
-- LAB隔離profileで実Mirakurunのcatalog、tuner取得、service起動とcleanupを確認する。
+- Release workflowで公開archiveの版、VCS revision、OS／architecture、収録fileを確認する。
+- Mainでも同じlifecycle checkが成功したことをread backする。
+- Provider接続を変更した場合だけ、LAB隔離profileで実Mirakurunのcatalog、tuner取得、service起動を確認する。
 - 実際のreboot、待機、休止、電源断は`NOT RUN: host recovery is not guaranteed`と記録する。
 
 ## Product synchronization
 
-- Handoff: Handoff 0061で固定する。
-- Planning source commit: 未確定。
-- Target product base commit: 未確定。handoff作成時に`origin/main`から固定する。
+- Handoff: Handoff 0062がHandoff 0061を置き換える。
+- Planning source commit: Handoff 0062で固定する。
+- Target product base commit: Handoff 0062で固定する。
 - Product destination: 同じpath。
-- Last synchronized product commit: None
-- Known divergence: 製品には本ADRとLinux lifecycle検証仕様v1がまだない。
+- Last synchronized product commit: `822df1a42b1dbfe948c72ab20287c0d122e69dc2`（旧revision）
+- Known divergence: 製品には本ADRの旧revisionと検証仕様v1があり、ADR-0069と検証仕様v2は未同期。
 
 ## Revisit when
 

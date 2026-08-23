@@ -6,7 +6,25 @@
 - Delegated reviewer: Codex
 - Related: Plan 0040、Plan 0068、Handoff 0043
 - Product copy path: `docs/adr/0053-release-version-policy.md`
-- Product sync state: NOT COPIED
+- Product sync state: COPIED
+- Product sync commit: `8a6b0d7920ef77c1086ffbf21b4cf7127e874b9f`
+- Product sync readback: v0.2.0 / `0c301f3ae918987ff3bfb64d0dcd7f7f074727df`（2026-08-12）
+- Partially superseded by: ADR-0067（従来の最終ゴール範囲）、ADR-0069（v0.9.0経由と時間指定耐久試験）
+
+ADR-0069と実用リリース品質仕様v1により、v0.9.0の経由と時間を固定した試験は、
+現在のv1.0.0公開条件から外れた。以下の該当記述は当時の判断履歴であり、現行条件ではない。
+
+## 製品同期の読み戻し（2026-08-12）
+
+Acceptedの判断本文と製品版仕様v1は、Handoff 0043により製品コミット
+`8a6b0d7920ef77c1086ffbf21b4cf7127e874b9f`へ同じpathで複製された。v0.2.0の公開コミット
+`0c301f3ae918987ff3bfb64d0dcd7f7f074727df`でも、製品側の本ADRは同期時と同じSHA-256
+`ea01c6164d4d4f9db7566abb200223d0a95303792dc8b304e53f83cb13a99264`を保っている。
+
+上記の同期状態と本節は、planning側に残っていた`NOT COPIED`を実績に合わせて直すための来歴追記である。
+以下のAccepted判断は変更していない。この追記後はplanning側と製品側のファイルに来歴だけの差分があるため、
+製品実装では対象製品コミット内のコピーを正本とする。差分を自動同期せず、判断内容を変える場合は新しい判断と
+handoffで扱う。
 
 ## 背景
 

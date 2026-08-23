@@ -5,6 +5,7 @@
 - Applies to: Sazanami DVR v0.5.0
 - Decision: `docs/adr/0067-konomitv-practical-backend-goal.md`
 - Fixed KonomiTV source: tag `v0.14.1` / commit `0a32188274b81c1e7bed642474b208bd2a543a6b`
+- Active override: ADR-0069（v0.5.0公開後のchecksum成果物と時間指定耐久試験）
 
 ## 目的
 
@@ -70,14 +71,17 @@ SCREEN-VERIFIED、NOT RUNを区別する。次を満たす経路は、SCREEN-VER
 3. 利用者の後続状態を含む同等の公開APIまたはprotocol境界を固定clientの実験環境で確認している。
 4. 画面固有の制限を互換表へ明記している。
 
-### `KB-007` Release gate
+### `KB-007` v0.5.0公開記録
 
 機能実装commitとrelease commitを分ける。release-prepでは版、版表示test、README、変更履歴、互換表、
 本仕様とADR-0067の製品copy以外を変更しない。schema、migration、依存、録画形式、機能codeは変更しない。
 
-candidateと統合後mainのCI成功後にannotated tag `v0.5.0`を作る。既存workflowでprerelease、
-Linux amd64／arm64 archive、`SHA256SUMS`、`OCI_IMAGE`、multi-architecture OCI imageを公開する。
-公開後にchecksum、archive内容、binary版、VCS revision、dirty状態、OCI digestを読み戻す。
+candidateと統合後mainのCI成功後にannotated tag `v0.5.0`を作成した。当時のworkflowでprerelease、
+Linux amd64／arm64 archive、`SHA256SUMS`、`OCI_IMAGE`、multi-architecture OCI imageを公開し、
+公開後にchecksum、archive内容、binary版、VCS revision、dirty状態、OCI digestを読み戻した。
+
+次版はv0.5.0の公開記録を引き継がない。実用リリース品質仕様v1に従い、
+`SHA256SUMS`を生成・公開せず、利用者の照合結果も完了条件にしない。
 
 ### `KB-008` 表示と非対象
 
@@ -87,7 +91,7 @@ Linux amd64／arm64 archive、`SHA256SUMS`、`OCI_IMAGE`、multi-architecture OC
 - Komorebi、Android TV、TvCast、HLS、cast、画質変換、端末codec
 - 60秒未満の録画をKonomiTV一覧へ表示すること
 - キーワード自動予約のKonomiTV同梱画面
-- 72時間試験、全画面・全検索条件の実機総当たり
+- 全画面・全検索条件の実機総当たり
 
 ## 必須検証
 
@@ -95,6 +99,7 @@ Linux amd64／arm64 archive、`SHA256SUMS`、`OCI_IMAGE`、multi-architecture OC
 - full、shuffle、race、vet、module verification、既知脆弱性検査、主要四環境build、Container CIを行う。
 - 実験環境で予約、放送途中録画、自然終了、ライブ、通常取得、Range、再起動、再解析、thumbnail、削除、
   履歴収束を確認する。
-- version、tag、Release、四つの公開asset、binaryとOCI imageの来歴を同じrelease commitへ固定する。
+- v0.5.0のversion、tag、Release、公開asset、binaryとOCI imageの来歴を同じrelease commitへ固定した。
+- 次版の公開条件は、実用リリース品質仕様v1で確認する。
 
 実施していない検証は`NOT RUN`のまま残す。未実施を広い互換性の根拠にしない。
