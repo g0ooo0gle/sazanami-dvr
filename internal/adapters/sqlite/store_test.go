@@ -1282,9 +1282,26 @@ func TestCurrentCatalogQueriesUseBoundedIndexes(t *testing.T) {
 		SELECT id FROM catalog_syncs
 		WHERE backend_instance_id=? AND state='COMPLETED'
 		ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1`, make([]byte, 16))
+	completedReferenceQuery := `
+		WITH current_sync AS (
+			SELECT id, started_at_utc_ms FROM catalog_syncs
+			WHERE backend_instance_id=? AND state='COMPLETED'
+			ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1
+		)
+		SELECT pr.id FROM current_sync cs
+		JOIN program_observations po ON po.sync_id=cs.id
+		JOIN program_revisions pr ON pr.id=po.program_revision_id
+		WHERE po.program_instance_id=? LIMIT 1`
+	assertQueryPlanUses(t, store.reader, "catalog_syncs_completed_backend_idx", completedReferenceQuery,
+		make([]byte, 16), make([]byte, 16))
+	assertQueryPlanUses(t, store.reader, "program_observations_sync_instance_idx", completedReferenceQuery,
+		make([]byte, 16), make([]byte, 16))
+	assertQueryPlanUses(t, store.reader, "sqlite_autoindex_program_revisions_3", `
+		SELECT id FROM program_revisions
+		WHERE program_instance_id=? AND content_hash=?`, make([]byte, 16), make([]byte, 32))
 	assertQueryPlanUses(t, store.reader, "sqlite_autoindex_program_revisions_2", `
-		SELECT id, content_hash, revision_number FROM program_revisions
-		WHERE program_instance_id=? ORDER BY revision_number DESC LIMIT 1`, make([]byte, 16))
+		SELECT COALESCE(MAX(revision_number), 0) + 1 FROM program_revisions
+		WHERE program_instance_id=?`, make([]byte, 16))
 }
 
 func assertQueryPlanUses(t *testing.T, database *sql.DB, index, query string, arguments ...any) {
