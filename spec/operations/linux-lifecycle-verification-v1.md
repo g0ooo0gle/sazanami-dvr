@@ -1,10 +1,14 @@
 # Linux lifecycle検証仕様 v1
 
-- Status: Accepted
+- Status: Superseded
 - Date: 2026-08-23
 - Applies to: Sazanami DVR v0.1.2以降のLinux amd64 release archive
 - Decision: `docs/adr/0068-two-layer-linux-lifecycle-verification.md`
 - Base specification: `spec/operations/linux-installation-lifecycle-v2.md`
+- Superseded by: `spec/operations/linux-lifecycle-verification-v2.md`
+
+Fresh Ubuntuで短くlifecycleを一回確認する部分だけを引き継ぐ。Archive checksum、必須LAB、
+厳しい証拠成果物は現在のrelease gateにしない。実装はHandoff 0062を正本とする。
 
 ## 目的
 
