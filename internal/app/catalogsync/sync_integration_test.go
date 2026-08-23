@@ -124,6 +124,137 @@ func TestIdenticalReplayConvergesToSameRevision(t *testing.T) {
 	}
 }
 
+func TestPastContentHashReobservationReusesRevision(t *testing.T) {
+	_, store := migratedStore(t)
+	clock := &advancingClock{now: time.Date(2026, 8, 2, 0, 0, 0, 0, time.UTC)}
+	backendID := mustCatalogID(t, 89)
+	backend := catalogmodel.Backend{ID: backendID, Kind: "FAKE", IdentityHash: sha256.Sum256([]byte("fake:hash-reobservation"))}
+	request := catalogsync.Request{
+		Backend: backend, ServicePageLimit: 16, ProgramPageLimit: 16, VerifiedFakeLineage: true,
+	}
+	service := catalogsync.Service{Repository: store, Clock: clock}
+	titles := []string{"版A", "版B", "版A", "版A"}
+	correlations := []string{"version-a", "version-b", "version-a-again", "version-a-replay"}
+	var first catalogmodel.CurrentProgram
+
+	for index, title := range titles {
+		service.Provider = newHarness(t, title, nil).Catalog
+		request.CorrelationID = correlations[index]
+		if _, err := service.Sync(context.Background(), request); err != nil {
+			t.Fatalf("sync %d: %v", index+1, err)
+		}
+		current, err := store.CurrentPrograms(context.Background(), backendID, 16, catalogmodel.ID{})
+		if err != nil || len(current) != 1 {
+			t.Fatalf("current %d=%+v err=%v", index+1, current, err)
+		}
+		switch index {
+		case 0:
+			first = current[0]
+			if first.RevisionNumber != 1 || first.Classification != catalogmodel.NewInstance {
+				t.Fatalf("first=%+v", first)
+			}
+		case 1:
+			if current[0].InstanceID != first.InstanceID || current[0].RevisionID == first.RevisionID ||
+				current[0].RevisionNumber != 2 || current[0].Classification != catalogmodel.VerifiedSuccessor {
+				t.Fatalf("second=%+v", current[0])
+			}
+		default:
+			if current[0].InstanceID != first.InstanceID || current[0].RevisionID != first.RevisionID ||
+				current[0].RevisionNumber != 1 || current[0].Hash != first.Hash ||
+				current[0].Classification != catalogmodel.SameContent || *current[0].Material.Title != "版A" {
+				t.Fatalf("reobserved %d: first=%+v current=%+v", index+1, first, current[0])
+			}
+		}
+	}
+}
+
+func TestFailedGenerationDoesNotBecomeContinuityBaseline(t *testing.T) {
+	_, store := migratedStore(t)
+	clock := &advancingClock{now: time.Date(2026, 8, 2, 0, 0, 0, 0, time.UTC)}
+	backendID := mustCatalogID(t, 90)
+	backend := catalogmodel.Backend{ID: backendID, Kind: "MIRAKURUN", IdentityHash: sha256.Sum256([]byte("mirakurun:failed-baseline"))}
+	request := catalogsync.Request{Backend: backend, CorrelationID: "completed-a", ServicePageLimit: 16, ProgramPageLimit: 16}
+	eventID := uint16(10)
+	withEvent := func(config *fake.Config) { config.ProgramPages[0].Items[0].EventID = &eventID }
+	service := catalogsync.Service{Provider: newHarness(t, "完成A", withEvent).Catalog, Repository: store, Clock: clock}
+	if _, err := service.Sync(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := store.CurrentPrograms(context.Background(), backendID, 16, catalogmodel.ID{})
+	if err != nil || len(completed) != 1 {
+		t.Fatalf("completed=%+v err=%v", completed, err)
+	}
+
+	want := errors.New("candidate rejected")
+	request.CorrelationID = "failed-b"
+	service.Provider = newHarness(t, "失敗B", func(config *fake.Config) {
+		withEvent(config)
+		shifted := config.ProgramPages[0].Items[0].Start.Add(6 * time.Hour)
+		config.ProgramPages[0].Items[0].Start = &shifted
+	}).Catalog
+	if _, err := service.SyncValidated(context.Background(), request, func(context.Context, catalogmodel.ID) error {
+		return want
+	}); !errors.Is(err, want) {
+		t.Fatalf("failed candidate err=%v", err)
+	}
+	afterFailure, err := store.CurrentPrograms(context.Background(), backendID, 16, catalogmodel.ID{})
+	if err != nil || len(afterFailure) != 1 || afterFailure[0].RevisionID != completed[0].RevisionID {
+		t.Fatalf("after failure=%+v err=%v", afterFailure, err)
+	}
+
+	request.CorrelationID = "completed-c"
+	service.Provider = newHarness(t, "完成C", func(config *fake.Config) {
+		withEvent(config)
+		shifted := config.ProgramPages[0].Items[0].Start.Add(-time.Hour)
+		config.ProgramPages[0].Items[0].Start = &shifted
+	}).Catalog
+	if _, err := service.Sync(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	current, err := store.CurrentPrograms(context.Background(), backendID, 16, catalogmodel.ID{})
+	if err != nil || len(current) != 1 || current[0].InstanceID != completed[0].InstanceID ||
+		current[0].RevisionNumber != 3 || current[0].Classification != catalogmodel.VerifiedSuccessor ||
+		*current[0].Material.Title != "完成C" {
+		t.Fatalf("current=%+v err=%v", current, err)
+	}
+}
+
+func TestFirstFailedGenerationDoesNotBecomeContinuityBaseline(t *testing.T) {
+	_, store := migratedStore(t)
+	clock := &advancingClock{now: time.Date(2026, 8, 2, 0, 0, 0, 0, time.UTC)}
+	backendID := mustCatalogID(t, 91)
+	backend := catalogmodel.Backend{ID: backendID, Kind: "MIRAKURUN", IdentityHash: sha256.Sum256([]byte("mirakurun:first-failed-baseline"))}
+	request := catalogsync.Request{Backend: backend, CorrelationID: "failed-a", ServicePageLimit: 16, ProgramPageLimit: 16}
+	eventID := uint16(10)
+	withEvent := func(config *fake.Config) { config.ProgramPages[0].Items[0].EventID = &eventID }
+	service := catalogsync.Service{Provider: newHarness(t, "失敗A", func(config *fake.Config) {
+		withEvent(config)
+		shifted := config.ProgramPages[0].Items[0].Start.Add(7 * time.Hour)
+		config.ProgramPages[0].Items[0].Start = &shifted
+	}).Catalog, Repository: store, Clock: clock}
+	want := errors.New("first candidate rejected")
+	if _, err := service.SyncValidated(context.Background(), request, func(context.Context, catalogmodel.ID) error {
+		return want
+	}); !errors.Is(err, want) {
+		t.Fatalf("first candidate err=%v", err)
+	}
+	current, err := store.CurrentPrograms(context.Background(), backendID, 16, catalogmodel.ID{})
+	if err != nil || len(current) != 0 {
+		t.Fatalf("failed generation was published: current=%+v err=%v", current, err)
+	}
+
+	request.CorrelationID = "completed-b"
+	service.Provider = newHarness(t, "完成B", withEvent).Catalog
+	if _, err := service.Sync(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	current, err = store.CurrentPrograms(context.Background(), backendID, 16, catalogmodel.ID{})
+	if err != nil || len(current) != 1 || current[0].RevisionNumber != 2 ||
+		current[0].Classification != catalogmodel.NewInstance || *current[0].Material.Title != "完成B" {
+		t.Fatalf("current=%+v err=%v", current, err)
+	}
+}
+
 func TestFailedGenerationDoesNotReplaceCompletedCatalog(t *testing.T) {
 	_, store := migratedStore(t)
 	clock := &advancingClock{now: time.Date(2026, 8, 2, 0, 0, 0, 0, time.UTC)}

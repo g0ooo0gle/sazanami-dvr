@@ -735,11 +735,9 @@ func storeProgram(ctx context.Context, tx *sql.Tx, syncID catalogmodel.ID, backe
 
 	var instanceID catalogmodel.ID
 	var instanceIDBytes []byte
-	var previousEventID sql.NullInt64
-	var previousSeenMS int64
-	err := tx.QueryRowContext(ctx, `SELECT id, raw_event_id, last_seen_at_utc_ms FROM program_instances
+	err := tx.QueryRowContext(ctx, `SELECT id FROM program_instances
 		WHERE service_id=? AND provider_event_locator=?`, serviceID.Bytes(), observation.EventLocator).
-		Scan(&instanceIDBytes, &previousEventID, &previousSeenMS)
+		Scan(&instanceIDBytes)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return insertNewProgram(ctx, tx, syncID, serviceID, verifiedFakeLineage, observation, hash)
@@ -749,63 +747,161 @@ func storeProgram(ctx context.Context, tx *sql.Tx, syncID catalogmodel.ID, backe
 	if err := copyExact(instanceID[:], instanceIDBytes); err != nil {
 		return err
 	}
-
-	var revisionID catalogmodel.ID
-	var revisionIDBytes []byte
-	var latestHash, previousMetadata []byte
-	var revisionNumber int64
-	var previousStart, previousDuration, previousFree sql.NullInt64
-	var previousTitle, previousDescription sql.NullString
-	var previousValidation string
-	if err := tx.QueryRowContext(ctx, `
-		SELECT id, content_hash, revision_number, start_at_utc_ms, duration_ms, title, description,
-		       free_access, validation_state, metadata FROM program_revisions
-		WHERE program_instance_id=? ORDER BY revision_number DESC LIMIT 1`, instanceID.Bytes()).
-		Scan(&revisionIDBytes, &latestHash, &revisionNumber, &previousStart, &previousDuration,
-			&previousTitle, &previousDescription, &previousFree, &previousValidation, &previousMetadata); err != nil {
-		return sanitize("read-latest-revision", err)
-	}
-	if err := copyExact(revisionID[:], revisionIDBytes); err != nil {
-		return err
-	}
 	observedAt, err := syncStartedAt(ctx, tx, syncID)
 	if err != nil {
 		return err
 	}
-	if bytesEqual(latestHash, hash[:]) {
+	reference, hasReference, err := readCompletedProgramReference(ctx, tx, backendID, instanceID)
+	if err != nil {
+		return err
+	}
+	if !hasReference {
+		revisionID, exists, err := findProgramRevisionByHash(ctx, tx, instanceID, hash)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			revisionID, err = catalogmodel.NewID()
+			if err != nil {
+				return errors.New("sqlite: generate revision id")
+			}
+			number, err := nextProgramRevisionNumber(ctx, tx, instanceID)
+			if err != nil {
+				return err
+			}
+			if err := insertRevision(ctx, tx, revisionID, instanceID, number, hash, observation.Material, observedAt); err != nil {
+				return err
+			}
+		}
+		if err := touchProgramInstance(ctx, tx, instanceID, observedAt); err != nil {
+			return err
+		}
+		return insertProgramObservation(ctx, tx, syncID, observation, hash, instanceID, revisionID, catalogmodel.NewInstance)
+	}
+	if reference.hash == hash {
+		if err := touchProgramInstance(ctx, tx, instanceID, observedAt); err != nil {
+			return err
+		}
+		return insertProgramObservation(ctx, tx, syncID, observation, hash, instanceID, reference.revisionID, catalogmodel.SameContent)
+	}
+	verified := verifiedFakeLineage || providerKind == "MIRAKURUN" && catalogmodel.MirakurunSuccessor(
+		reference.material, reference.rawEventID, reference.observedAt, observation.Material, observation.RawEventID, observedAt)
+	if !verified {
+		if err := touchProgramInstance(ctx, tx, instanceID, observedAt); err != nil {
+			return err
+		}
+		return insertProgramObservation(ctx, tx, syncID, observation, hash, instanceID, reference.revisionID, catalogmodel.Ambiguous)
+	}
+	revisionID, exists, err := findProgramRevisionByHash(ctx, tx, instanceID, hash)
+	if err != nil {
+		return err
+	}
+	if exists {
 		if err := touchProgramInstance(ctx, tx, instanceID, observedAt); err != nil {
 			return err
 		}
 		return insertProgramObservation(ctx, tx, syncID, observation, hash, instanceID, revisionID, catalogmodel.SameContent)
 	}
-	previousMaterial, err := materialFromSQL(previousStart, previousDuration, previousTitle, previousDescription,
-		previousFree, previousValidation, previousMetadata)
-	if err != nil {
-		return err
-	}
-	var previousEventPointer *int64
-	if previousEventID.Valid {
-		previousEventPointer = &previousEventID.Int64
-	}
-	verified := verifiedFakeLineage || providerKind == "MIRAKURUN" && catalogmodel.MirakurunSuccessor(
-		previousMaterial, previousEventPointer, previousSeenMS, observation.Material, observation.RawEventID, observedAt)
-	if !verified {
-		if err := touchProgramInstance(ctx, tx, instanceID, observedAt); err != nil {
-			return err
-		}
-		return insertProgramObservation(ctx, tx, syncID, observation, hash, instanceID, revisionID, catalogmodel.Ambiguous)
-	}
 	newRevisionID, err := catalogmodel.NewID()
 	if err != nil {
 		return errors.New("sqlite: generate revision id")
 	}
-	if err := insertRevision(ctx, tx, newRevisionID, instanceID, revisionNumber+1, hash, observation.Material, observedAt); err != nil {
+	number, err := nextProgramRevisionNumber(ctx, tx, instanceID)
+	if err != nil {
+		return err
+	}
+	if err := insertRevision(ctx, tx, newRevisionID, instanceID, number, hash, observation.Material, observedAt); err != nil {
 		return err
 	}
 	if err := touchProgramInstance(ctx, tx, instanceID, observedAt); err != nil {
 		return err
 	}
 	return insertProgramObservation(ctx, tx, syncID, observation, hash, instanceID, newRevisionID, catalogmodel.VerifiedSuccessor)
+}
+
+type programReference struct {
+	revisionID catalogmodel.ID
+	hash       [sha256.Size]byte
+	material   catalogmodel.RevisionMaterial
+	rawEventID *int64
+	observedAt int64
+}
+
+func readCompletedProgramReference(ctx context.Context, tx *sql.Tx, backendID []byte,
+	instanceID catalogmodel.ID,
+) (programReference, bool, error) {
+	var reference programReference
+	var revisionIDBytes, contentHash, metadata []byte
+	var rawEventID, start, duration, free sql.NullInt64
+	var title, description sql.NullString
+	var validation string
+	err := tx.QueryRowContext(ctx, `
+		WITH current_sync AS (
+			SELECT id, started_at_utc_ms FROM catalog_syncs
+			WHERE backend_instance_id=? AND state='COMPLETED'
+			ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1
+		)
+		SELECT pr.id, pr.content_hash, po.raw_event_id, pr.start_at_utc_ms, pr.duration_ms,
+		       pr.title, pr.description, pr.free_access, pr.validation_state, pr.metadata,
+		       cs.started_at_utc_ms
+		FROM current_sync cs
+		JOIN program_observations po ON po.sync_id=cs.id
+		JOIN program_revisions pr ON pr.id=po.program_revision_id
+		WHERE po.program_instance_id=? LIMIT 1`, backendID, instanceID.Bytes()).
+		Scan(&revisionIDBytes, &contentHash, &rawEventID, &start, &duration, &title, &description,
+			&free, &validation, &metadata, &reference.observedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return programReference{}, false, nil
+	}
+	if err != nil {
+		return programReference{}, false, sanitize("read-completed-program-reference", err)
+	}
+	if err := copyExact(reference.revisionID[:], revisionIDBytes); err != nil {
+		return programReference{}, false, err
+	}
+	if err := copyExact(reference.hash[:], contentHash); err != nil {
+		return programReference{}, false, errors.New("sqlite: invalid completed program hash")
+	}
+	reference.material, err = materialFromSQL(start, duration, title, description, free, validation, metadata)
+	if err != nil {
+		return programReference{}, false, err
+	}
+	if rawEventID.Valid {
+		value := rawEventID.Int64
+		reference.rawEventID = &value
+	}
+	return reference, true, nil
+}
+
+func findProgramRevisionByHash(ctx context.Context, tx *sql.Tx, instanceID catalogmodel.ID,
+	hash [sha256.Size]byte,
+) (catalogmodel.ID, bool, error) {
+	var revisionID catalogmodel.ID
+	var revisionIDBytes []byte
+	err := tx.QueryRowContext(ctx, `SELECT id FROM program_revisions
+		WHERE program_instance_id=? AND content_hash=?`, instanceID.Bytes(), hash[:]).Scan(&revisionIDBytes)
+	if errors.Is(err, sql.ErrNoRows) {
+		return catalogmodel.ID{}, false, nil
+	}
+	if err != nil {
+		return catalogmodel.ID{}, false, sanitize("find-program-revision-by-hash", err)
+	}
+	if err := copyExact(revisionID[:], revisionIDBytes); err != nil {
+		return catalogmodel.ID{}, false, err
+	}
+	return revisionID, true, nil
+}
+
+func nextProgramRevisionNumber(ctx context.Context, tx *sql.Tx, instanceID catalogmodel.ID) (int64, error) {
+	var number int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(revision_number), 0) + 1
+		FROM program_revisions WHERE program_instance_id=?`, instanceID.Bytes()).Scan(&number); err != nil {
+		return 0, sanitize("read-next-program-revision-number", err)
+	}
+	if number < 2 {
+		return 0, errors.New("sqlite: invalid next program revision number")
+	}
+	return number, nil
 }
 
 func touchProgramInstance(ctx context.Context, tx *sql.Tx, instanceID catalogmodel.ID, observedAt int64) error {
