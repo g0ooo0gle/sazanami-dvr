@@ -92,7 +92,12 @@ stop_account_process() {
 
 restore_data_root() {
   if [ "$data_root_swapped" -eq 1 ]; then
-    rm -f -- "$data_root"
+    if [ -L "$data_root" ] || [ -f "$data_root" ]; then
+      rm -f -- "$data_root"
+    elif [ -d "$data_root" ]; then
+      printf 'Installer lifecycle cleanup: unexpected data root type: %s\n' "$data_root" >&2
+      return 0
+    fi
     if [ -d "$saved_data_root" ] && [ ! -L "$saved_data_root" ]; then
       mv "$saved_data_root" "$data_root"
     fi
@@ -226,6 +231,8 @@ preflight() {
   getent group "$account_name" >/dev/null 2>&1 && fail existing-group
   getent passwd "$peer_name" >/dev/null 2>&1 && fail existing-peer
   getent group "$peer_name" >/dev/null 2>&1 && fail existing-peer-group
+  [ -d /opt ] && [ ! -L /opt ] || fail unsafe-opt-path
+  [ -d /usr/local/bin ] && [ ! -L /usr/local/bin ] || fail unsafe-usr-local-bin-path
   opt_uid=$(stat -c %u /opt)
   opt_gid=$(stat -c %g /opt)
   opt_mode=$(stat -c %a /opt)
@@ -248,23 +255,24 @@ ensure_conflict_directory() {
 }
 
 create_conflict_resource() {
-  active_conflict_path=$1
-  require_absent "$active_conflict_path"
-  case "$active_conflict_path" in
+  conflict_path=$1
+  require_absent "$conflict_path"
+  case "$conflict_path" in
     "$wants_link")
-      conflict_parent=${active_conflict_path%/*}
+      conflict_parent=${conflict_path%/*}
       ensure_conflict_directory "$conflict_parent"
-      ln -s "$unit_link" "$active_conflict_path"
+      ln -s "$unit_link" "$conflict_path"
       ;;
     *.d)
-      ensure_conflict_directory "$active_conflict_path"
+      ensure_conflict_directory "$conflict_path"
       ;;
     *)
-      conflict_parent=${active_conflict_path%/*}
+      conflict_parent=${conflict_path%/*}
       ensure_conflict_directory "$conflict_parent"
-      install -o root -g root -m 0644 /dev/null "$active_conflict_path"
+      install -o root -g root -m 0644 /dev/null "$conflict_path"
       ;;
   esac
+  active_conflict_path=$conflict_path
 }
 
 wants_root_is_mountpoint() {
