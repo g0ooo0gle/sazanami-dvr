@@ -5,8 +5,9 @@
 - Applies to: Sazanami DVR v1.2.0の公開文書
 - Content baseline: v1.1.0の実装・公開内容（release commitは未確定）
 - Decision: [`docs/adr/0071-public-documentation-information-architecture.md`](../../docs/adr/0071-public-documentation-information-architecture.md)
-- Related: [Plan 0089](../../docs/plans/0089-v1-2-0-public-documentation-restructure.md)、ADR-0053、ADR-0069、
-  [Handoff 0066](../../handoffs/0066-v1-2-0-public-documentation.md)
+- Related: [Plan 0089](https://github.com/g0ooo0gle/sazanami-planning/blob/main/docs/plans/0089-v1-2-0-public-documentation-restructure.md)、
+  ADR-0053、ADR-0069、
+  [Handoff 0066](https://github.com/g0ooo0gle/sazanami-planning/blob/main/handoffs/0066-v1-2-0-public-documentation.md)
 - Requirements: `DOC-001`～`DOC-014`
 - Precedence: 本仕様は公開文書の導線だけを定める。v1.1.0の製品挙動、既存の互換性claim、
   ADR、spec、plansの保存場所を変更しない

@@ -5,8 +5,9 @@
 - Decision date: 2026-09-11
 - Deciders: プロジェクトオーナー
 - Reviewer: Codex
-- Related: [Plan 0089](../plans/0089-v1-2-0-public-documentation-restructure.md)、ADR-0053、ADR-0069、
-  [公開文書仕様 v1](../../spec/operations/public-documentation-v1.md)、[Handoff 0066](../../handoffs/0066-v1-2-0-public-documentation.md)
+- Related: [Plan 0089](https://github.com/g0ooo0gle/sazanami-planning/blob/main/docs/plans/0089-v1-2-0-public-documentation-restructure.md)、
+  ADR-0053、ADR-0069、[公開文書仕様 v1](../../spec/operations/public-documentation-v1.md)、
+  [Handoff 0066](https://github.com/g0ooo0gle/sazanami-planning/blob/main/handoffs/0066-v1-2-0-public-documentation.md)
 - Product copy path: `docs/adr/0071-public-documentation-information-architecture.md`
 - Product sync state: NOT COPIED
 - Supersedes: None
