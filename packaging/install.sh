@@ -598,6 +598,7 @@ fresh_unit_conflict_preflight() {
     "/etc/systemd/system/multi-user.target.wants/$service_name"; do
     path_exists "$conflicting_unit_path" && fail existing-resource
   done
+  return 0
 }
 
 install_preflight() {
