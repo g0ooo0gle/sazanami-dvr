@@ -750,13 +750,17 @@ main() {
   opt_metadata_changed=0
 
   userdel "$account_name"
-  groupdel "$account_name"
+  if getent group "$account_name" >/dev/null 2>&1; then
+    groupdel "$account_name"
+  fi
   useradd --system --user-group --no-create-home --comment recreated-without-token \
     --home-dir "$data_root" --shell /usr/sbin/nologin "$account_name"
   expect_rejected recreated-account install account-not-managed
   assert_runtime_present
   userdel "$account_name"
-  groupdel "$account_name"
+  if getent group "$account_name" >/dev/null 2>&1; then
+    groupdel "$account_name"
+  fi
   groupadd --system --gid "$marker_gid" "$account_name"
   useradd --system --uid "$marker_uid" --gid "$account_name" --no-create-home \
     --comment "sazanami-dvr-installer-$marker_id" --home-dir "$data_root" \
