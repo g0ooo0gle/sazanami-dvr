@@ -138,7 +138,8 @@ restore_wants_root() {
 
 cleanup() {
   result=$?
-  trap - EXIT HUP INT TERM
+  trap - EXIT
+  trap '' HUP INT TERM
   if [ -n "$purge_pid" ]; then
     kill "$purge_pid" 2>/dev/null || true
     wait "$purge_pid" 2>/dev/null || true
