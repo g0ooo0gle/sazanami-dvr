@@ -266,6 +266,6 @@ jobs:
           sudo chmod 0755 /opt
           sudo chown root:root /usr/local/bin
           sudo chmod 0755 /usr/local/bin
-          sudo env "PATH=$PATH" sh -x packaging/lifecycle/installer_verify.sh \
+          sudo env "PATH=$PATH" packaging/lifecycle/installer_verify.sh \
             "${{ steps.candidate.outputs.archive }}" \
             "${{ steps.candidate.outputs.version }}"
