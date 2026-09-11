@@ -583,21 +583,60 @@ remove_runtime_files() {
 install_mode=
 runtime_state=
 
-fresh_unit_conflict_preflight() {
-  for conflicting_unit_path in \
-    "/run/systemd/system/$service_name" \
-    "/run/systemd/transient/$service_name" \
-    "/usr/local/lib/systemd/system/$service_name" \
-    "/usr/lib/systemd/system/$service_name" \
-    "/lib/systemd/system/$service_name" \
-    "/etc/systemd/system/$service_name.d" \
-    "/run/systemd/system/$service_name.d" \
-    "/usr/local/lib/systemd/system/$service_name.d" \
-    "/usr/lib/systemd/system/$service_name.d" \
-    "/lib/systemd/system/$service_name.d" \
-    "/etc/systemd/system/multi-user.target.wants/$service_name"; do
-    path_exists "$conflicting_unit_path" && fail existing-resource
+systemd_unit_paths() {
+  systemctl show --property=UnitPath --value 2>/dev/null | tr ' ' '\n'
+}
+
+systemd_conflict_is_managed() {
+  [ "$runtime_state" = present ] || return 1
+  conflict_candidate=$1
+  for managed_systemd_path in "$unit_link" "$wants_link"; do
+    managed_systemd_parent=${managed_systemd_path%/*}
+    managed_systemd_name=${managed_systemd_path##*/}
+    resolved_managed_parent=$(readlink -f -- "$managed_systemd_parent") || return 1
+    [ "$conflict_candidate" = "$resolved_managed_parent/$managed_systemd_name" ] && return 0
   done
+  return 1
+}
+
+reject_systemd_conflict() {
+  path_exists "$1" || return 0
+  systemd_conflict_is_managed "$1" && return 0
+  fail existing-resource
+}
+
+fresh_unit_conflict_preflight() {
+  unit_paths=$(systemd_unit_paths) || fail systemd-required
+  [ -n "$unit_paths" ] || fail systemd-required
+
+  while IFS= read -r unit_path; do
+    valid_literal_path "$unit_path" || fail systemd-required
+    path_exists "$unit_path" || continue
+    resolved_unit_path=$(readlink -f -- "$unit_path") || fail systemd-required
+    valid_literal_path "$resolved_unit_path" || fail systemd-required
+    [ -d "$resolved_unit_path" ] && [ ! -L "$resolved_unit_path" ] || fail systemd-required
+
+    for unit_relative_path in \
+      "$service_name" \
+      "$service_name.d" \
+      "sazanami-.service.d" \
+      "service.d"; do
+      reject_systemd_conflict "$resolved_unit_path/$unit_relative_path"
+    done
+
+    dependency_conflicts=$(find "$resolved_unit_path" -mindepth 2 -maxdepth 2 \
+      \( -path "$resolved_unit_path/*.wants/$service_name" \
+      -o -path "$resolved_unit_path/*.requires/$service_name" \
+      -o -path "$resolved_unit_path/*.upholds/$service_name" \) -print) || fail systemd-required
+    while IFS= read -r dependency_conflict; do
+      [ -n "$dependency_conflict" ] || continue
+      reject_systemd_conflict "$dependency_conflict"
+    done <<EOF
+$dependency_conflicts
+EOF
+  done <<EOF
+$unit_paths
+EOF
   return 0
 }
 
@@ -633,9 +672,7 @@ install_preflight() {
     fail runtime-not-managed
   fi
 
-  if [ "$runtime_state" = absent ]; then
-    fresh_unit_conflict_preflight
-  fi
+  fresh_unit_conflict_preflight
 }
 
 created_account=0

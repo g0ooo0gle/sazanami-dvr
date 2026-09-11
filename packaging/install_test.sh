@@ -4,6 +4,7 @@ set -eu
 script_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 installer="$script_root/install.sh"
 test_root=$(mktemp -d "${TMPDIR:-/tmp}/sazanami-install-test.XXXXXX")
+test_root=$(printf '%s\n' "$test_root" | sed 's://*:/:g')
 
 case "$test_root" in
   */sazanami-install-test.*) ;;
@@ -173,6 +174,13 @@ systemctl() {
 }
 expect_rejected service_inactive_preflight
 
+wants_symlink_target="$test_root/wants-symlink-target"
+wants_root="$test_root/wants-symlink"
+mkdir "$wants_symlink_target"
+ln -s "$wants_symlink_target" "$wants_root"
+expect_rejected wants_root_preflight
+rm -f -- "$wants_root"
+
 wants_root="$test_root/wants-root"
 mkdir "$wants_root"
 root_controlled_directory() {
@@ -193,5 +201,46 @@ not_mountpoint() {
   return 1
 }
 expect_rejected wants_root_preflight
+
+systemd_search_root="$test_root/systemd-search"
+mkdir "$systemd_search_root"
+systemd_unit_paths() {
+  printf '%s\n' "$systemd_search_root"
+}
+runtime_state=absent
+fresh_unit_conflict_preflight
+
+for conflict_relative in \
+  "$service_name" \
+  "$service_name.d" \
+  "sazanami-.service.d" \
+  "service.d"; do
+  conflict_path="$systemd_search_root/$conflict_relative"
+  case "$conflict_relative" in
+    *.d) mkdir "$conflict_path" ;;
+    *) touch "$conflict_path" ;;
+  esac
+  expect_rejected fresh_unit_conflict_preflight
+  rm -rf -- "$conflict_path"
+done
+
+mkdir "$systemd_search_root/other.target.wants"
+ln -s /nonexistent "$systemd_search_root/other.target.wants/$service_name"
+expect_rejected fresh_unit_conflict_preflight
+rm -rf -- "$systemd_search_root/other.target.wants"
+
+previous_unit_link=$unit_link
+previous_wants_link=$wants_link
+unit_link="$systemd_search_root/$service_name"
+wants_link="$systemd_search_root/multi-user.target.wants/$service_name"
+mkdir "$systemd_search_root/multi-user.target.wants"
+ln -s /nonexistent "$unit_link"
+ln -s /nonexistent "$wants_link"
+runtime_state=present
+fresh_unit_conflict_preflight || test_fail "管理中のunit linkを競合と判定しました"
+rm -f -- "$unit_link" "$wants_link"
+rmdir "$systemd_search_root/multi-user.target.wants"
+unit_link=$previous_unit_link
+wants_link=$previous_wants_link
 
 printf 'Installer contract test: ok\n'

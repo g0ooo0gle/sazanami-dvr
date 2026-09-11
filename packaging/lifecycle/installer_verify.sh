@@ -55,11 +55,10 @@ usr_local_bin_metadata_changed=0
 usr_local_bin_uid=
 usr_local_bin_gid=
 usr_local_bin_mode=
-wants_root_original=
-wants_root_swapped=0
 wants_root_mount_active=0
 active_conflict_path=
 conflict_created_dirs=
+cleanup_safe=1
 
 fail() {
   printf 'Installer lifecycle確認に失敗しました: %s\n' "$*" >&2
@@ -92,17 +91,24 @@ stop_account_process() {
 
 restore_data_root() {
   if [ "$data_root_swapped" -eq 1 ]; then
-    if [ -L "$data_root" ] || [ -f "$data_root" ]; then
-      rm -f -- "$data_root"
-    elif [ -d "$data_root" ]; then
-      printf 'Installer lifecycle cleanup: unexpected data root type: %s\n' "$data_root" >&2
-      return 0
-    fi
     if [ -d "$saved_data_root" ] && [ ! -L "$saved_data_root" ]; then
-      mv "$saved_data_root" "$data_root"
+      if [ -L "$data_root" ] && [ "$(readlink "$data_root")" = "$saved_data_root" ]; then
+        rm -f -- "$data_root"
+      elif path_exists "$data_root"; then
+        printf 'Installer lifecycle cleanup: unexpected data root type: %s\n' "$data_root" >&2
+        return 1
+      fi
+      mv "$saved_data_root" "$data_root" || return 1
+    elif [ -d "$data_root" ] && [ ! -L "$data_root" ]; then
+      data_root_swapped=0
+      return 0
+    else
+      printf 'Installer lifecycle cleanup: data root recovery state is invalid\n' >&2
+      return 1
     fi
     data_root_swapped=0
   fi
+  return 0
 }
 
 cleanup_conflict_resource() {
@@ -121,20 +127,13 @@ cleanup_conflict_resource() {
 
 restore_wants_root() {
   if [ "$wants_root_mount_active" -eq 1 ]; then
-    umount "$wants_root" 2>/dev/null || true
+    if ! umount "$wants_root"; then
+      printf 'Installer lifecycle cleanup: wants root mount remains: %s\n' "$wants_root" >&2
+      return 1
+    fi
     wants_root_mount_active=0
   fi
-  if [ "$wants_root_swapped" -eq 1 ]; then
-    if [ -L "$wants_root" ]; then
-      rm -f -- "$wants_root"
-    elif [ -d "$wants_root" ]; then
-      rmdir "$wants_root" 2>/dev/null || true
-    fi
-    if [ -d "$wants_root_original" ] && [ ! -L "$wants_root_original" ]; then
-      mv "$wants_root_original" "$wants_root"
-    fi
-    wants_root_swapped=0
-  fi
+  return 0
 }
 
 cleanup() {
@@ -147,16 +146,22 @@ cleanup() {
   fi
   stop_account_process
   cleanup_conflict_resource
-  restore_wants_root
+  restore_wants_root || cleanup_safe=0
   if [ "$data_mount_active" -eq 1 ]; then
-    umount "$data_root" 2>/dev/null || true
-    data_mount_active=0
+    if umount "$data_root"; then
+      data_mount_active=0
+    else
+      cleanup_safe=0
+    fi
   fi
   if [ "$external_mount_active" -eq 1 ]; then
-    umount "$external_mount" 2>/dev/null || true
-    external_mount_active=0
+    if umount "$external_mount"; then
+      external_mount_active=0
+    else
+      cleanup_safe=0
+    fi
   fi
-  restore_data_root
+  restore_data_root || cleanup_safe=0
   if [ "$opt_metadata_changed" -eq 1 ]; then
     chown "$opt_uid:$opt_gid" /opt 2>/dev/null || true
     chmod "$opt_mode" /opt 2>/dev/null || true
@@ -167,7 +172,7 @@ cleanup() {
     chmod "$usr_local_bin_mode" /usr/local/bin 2>/dev/null || true
     usr_local_bin_metadata_changed=0
   fi
-  if [ "$owned_resources" -eq 1 ]; then
+  if [ "$owned_resources" -eq 1 ] && [ "$cleanup_safe" -eq 1 ]; then
     systemctl stop "$service_name" >/dev/null 2>&1 || true
     systemctl disable "$service_name" >/dev/null 2>&1 || true
     rm -f -- "$test_drop_in"
@@ -202,12 +207,16 @@ cleanup() {
       fi
     done
   fi
-  if [ -n "$work_root" ]; then
+  if [ "$cleanup_safe" -eq 1 ] && [ -n "$work_root" ]; then
     case "$work_root" in
       /run/sazanami-installer-lifecycle.*)
         [ ! -L "$work_root" ] && rm -rf -- "$work_root"
         ;;
     esac
+  fi
+  if [ "$cleanup_safe" -ne 1 ]; then
+    printf 'Installer lifecycle cleanupを安全に完了できなかったため、試験資源を保持しました。\n' >&2
+    result=1
   fi
   exit "$result"
 }
@@ -279,61 +288,16 @@ wants_root_is_mountpoint() {
   awk -v path="$wants_root" '$5 == path { found = 1 } END { exit found ? 0 : 1 }' /proc/self/mountinfo
 }
 
-prepare_wants_root_swap() {
-  [ -d "$wants_root" ] && [ ! -L "$wants_root" ] || return 1
-  wants_root_is_mountpoint && return 1
-  [ -n "$wants_root_original" ] || return 1
-  [ ! -e "$wants_root_original" ] && [ ! -L "$wants_root_original" ] || return 1
-  mv "$wants_root" "$wants_root_original"
-  wants_root_swapped=1
-}
-
-test_wants_root_symlink() {
-  if ! prepare_wants_root_swap; then
-    printf 'Installer lifecycle確認: wants root symlink testをskipしました\n' >&2
-    return 0
-  fi
-  symlink_wants_root=$work_root/wants-root-symlink-target
-  symlink_wants_sentinel=$symlink_wants_root/sentinel
-  symlink_wants_link=$symlink_wants_root/$service_name
-  install -d -o root -g root -m 0755 "$symlink_wants_root"
-  printf 'wants-root-symlink-sentinel\n' > "$symlink_wants_sentinel"
-  ln -s "$unit_link" "$symlink_wants_link"
-  ln -s "$symlink_wants_root" "$wants_root"
-  systemctl daemon-reload
-  expect_rejected wants-root-symlink uninstall unsafe-standard-path
-  [ -L "$wants_root" ] || fail wants-root-symlink-removed
-  [ -f "$symlink_wants_sentinel" ] || fail wants-root-symlink-sentinel-removed
-  [ -L "$symlink_wants_link" ] || fail wants-root-symlink-link-removed
-  [ "$(readlink "$symlink_wants_link")" = "$unit_link" ] || fail wants-root-symlink-link-changed
-  restore_wants_root
-  systemctl daemon-reload
-}
-
 test_wants_root_bind_mount() {
-  if ! prepare_wants_root_swap; then
-    printf 'Installer lifecycle確認: wants root bind mount testをskipしました\n' >&2
-    return 0
-  fi
-  bind_wants_root=$work_root/wants-root-bind-target
-  bind_wants_sentinel=$bind_wants_root/sentinel
-  bind_wants_link=$bind_wants_root/$service_name
-  install -d -o root -g root -m 0755 "$bind_wants_root" "$wants_root"
-  printf 'wants-root-bind-sentinel\n' > "$bind_wants_sentinel"
-  ln -s "$unit_link" "$bind_wants_link"
-  if mount --bind "$bind_wants_root" "$wants_root"; then
-    wants_root_mount_active=1
-    systemctl daemon-reload
+  [ -d "$wants_root" ] && [ ! -L "$wants_root" ] || fail wants-root-invalid
+  wants_root_is_mountpoint && fail wants-root-already-mounted
+  wants_root_mount_active=1
+  if mount --bind "$wants_root" "$wants_root"; then
     expect_rejected wants-root-bind-mount uninstall unsafe-standard-path
-    [ -f "$bind_wants_sentinel" ] || fail wants-root-bind-sentinel-removed
-    [ -L "$bind_wants_link" ] || fail wants-root-bind-link-removed
-    [ "$(readlink "$bind_wants_link")" = "$unit_link" ] || fail wants-root-bind-link-changed
-    restore_wants_root
-    systemctl daemon-reload
+    [ -L "$wants_link" ] || fail wants-root-bind-link-removed
+    restore_wants_root || fail wants-root-bind-unmount
   else
-    rmdir "$wants_root" 2>/dev/null || fail wants-root-bind-target-cleanup
-    restore_wants_root
-    systemctl daemon-reload
+    wants_root_mount_active=0
     printf 'Installer lifecycle確認: wants root bind mount testをskipしました（mount不可）\n' >&2
   fi
 }
@@ -519,7 +483,6 @@ main() {
   trap 'exit 130' INT
   trap 'exit 143' TERM
   work_root=$(mktemp -d /run/sazanami-installer-lifecycle.XXXXXX)
-  wants_root_original=$work_root/original-wants-root
   candidate_archive_copy=$work_root/candidate.tar.gz
   install -o root -g root -m 0600 "$candidate_archive" "$candidate_archive_copy"
   candidate_archive=$candidate_archive_copy
@@ -586,7 +549,6 @@ main() {
   cp "$account_marker" "$work_root/marker.before-uninstall"
   systemctl enable "$service_name" >/dev/null
   [ -L "$wants_link" ] || fail service-enable-missing
-  test_wants_root_symlink
   test_wants_root_bind_mount
   install -d -o root -g root -m 0755 "$unmanaged_wants_root"
   ln -s "$unit_link" "$unmanaged_wants_link"
@@ -734,9 +696,9 @@ main() {
   data_mount_active=0
   assert_purge_untouched
 
+  data_root_swapped=1
   mv "$data_root" "$saved_data_root"
   ln -s "$saved_data_root" "$data_root"
-  data_root_swapped=1
   expect_rejected target-root-symlink purge purge-path-not-safe PURGE
   assert_runtime_present
   restore_data_root
