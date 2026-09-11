@@ -47,7 +47,12 @@ jobs:
           env_file=packaging/systemd/sazanami-dvr.env.example
           test -f "$unit"
           test -f "$env_file"
-          test -f docs/linux-installation.md
+          if test -f docs/getting-started/linux.md; then
+            test -f docs/operations/update-and-remove.md
+            test -f docs/reference/configuration.md
+          else
+            test -f docs/linux-installation.md
+          fi
           test "$(grep -c '^ExecStart=' "$unit")" -eq 1
           grep -qx 'Restart=on-failure' "$unit"
           grep -qx 'RestartSec=5s' "$unit"
@@ -68,14 +73,27 @@ jobs:
           grep -Fq '${SAZANAMI_CTRLCMD_LISTEN}' "$unit"
           grep -Fq '${SAZANAMI_RECORDING_HTTP_LISTEN}' "$unit"
           grep -Fq '${SAZANAMI_CHANNEL_MAP}' "$unit"
-          grep -Fq -- "--channel-map $channel_map" docs/linux-installation.md
-          test "$(awk 'index($0, "/etc/sazanami-dvr/channels.json") { count++ } END { print count + 0 }' docs/linux-installation.md)" -eq 1
-          test "$(awk '/^## 新しい版へ更新する$/ { update = 1 } /^## 以前の版へ切り戻す$/ { update = 0 } update && index($0, "/etc/sazanami-dvr/channels.json") { count++ } END { print count + 0 }' docs/linux-installation.md)" -eq 1
           ! grep -Fq -- '--max-concurrent-recordings' "$unit"
           ! grep -Fq -- '--max-concurrent-recordings' "$env_file"
-          grep -Fx 'ExecStart=' docs/linux-installation.md
-          grep -Fq -- '--max-concurrent-recordings 2' docs/linux-installation.md
-          grep -Fq 'GET /api/tuners' docs/linux-installation.md
+          if test -f docs/getting-started/linux.md; then
+            for document in \
+              docs/getting-started/linux.md \
+              docs/reference/configuration.md; do
+              grep -Fq 'SAZANAMI_CHANNEL_MAP' "$document"
+              grep -Fq "$channel_map" "$document"
+            done
+            grep -Fq 'SAZANAMI_CHANNEL_MAP' docs/operations/update-and-remove.md
+            grep -Fq "$channel_map" docs/operations/update-and-remove.md
+            grep -Fq 'Mirakurunのチューナー数' docs/reference/configuration.md
+            grep -Fq '取得できない場合は1' docs/reference/configuration.md
+          else
+            grep -Fq -- "--channel-map $channel_map" docs/linux-installation.md
+            test "$(awk 'index($0, "/etc/sazanami-dvr/channels.json") { count++ } END { print count + 0 }' docs/linux-installation.md)" -eq 1
+            test "$(awk '/^## 新しい版へ更新する$/ { update = 1 } /^## 以前の版へ切り戻す$/ { update = 0 } update && index($0, "/etc/sazanami-dvr/channels.json") { count++ } END { print count + 0 }' docs/linux-installation.md)" -eq 1
+            grep -Fx 'ExecStart=' docs/linux-installation.md
+            grep -Fq -- '--max-concurrent-recordings 2' docs/linux-installation.md
+            grep -Fq 'GET /api/tuners' docs/linux-installation.md
+          fi
           go build -trimpath -o "$RUNNER_TEMP/sazanami-dvr-systemd-verify" ./cmd/sazanami-dvr
           sudo useradd --system --user-group --home-dir /var/lib/sazanami-dvr --shell /usr/sbin/nologin sazanami-dvr
           sudo install -D -m 0755 "$RUNNER_TEMP/sazanami-dvr-systemd-verify" /usr/local/bin/sazanami-dvr
