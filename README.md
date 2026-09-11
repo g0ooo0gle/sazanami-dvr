@@ -1,16 +1,34 @@
 # Sazanami DVR
 
-Sazanami DVRは、Mirakurun／mirakcから番組情報と放送ストリームを受け取り、KonomiTVから受け付けた予約に従って録画する軽量なバックエンドです。Goで実装した単一の実行ファイルで動作します。
+Sazanami DVRは、Mirakurun／mirakcから番組情報と放送ストリームを受け取る、KonomiTV向けの軽量な録画バックエンドです。予約に従って録画し、単一の実行ファイルで動作します。
 
-現在のバージョンは **v1.0.0（安定版）** です。対象はKonomiTV v0.14.1の日常的なバックエンド操作です。EDCB全機能、KonomiTVの他の版、Komorebi全体への互換性は表明しません。変更内容は[変更履歴](CHANGELOG.md)を参照してください。
+現在のバージョンは **v1.0.0（安定版）** です。KonomiTV v0.14.1の日常的なバックエンド操作を対象とします。EDCBの全機能、KonomiTVの他のバージョン、Komorebi全体との互換性は表明していません。変更内容は[変更履歴](CHANGELOG.md)を参照してください。
 
-## 最短セットアップ
+## 標準の導入方法は2つ
 
-この3段階は、GitHub Releaseの配布アーカイブをLinuxのsystemdで動かす場合の入口です。Mirakurunまたはmirakc、Linux、systemd、利用するCPUに合うamd64またはarm64のアーカイブを先に用意してください。Docker Composeを使う場合は、下の目的別ガイドから専用手順を参照してください。
+どちらの方法でも、先にMirakurunまたはmirakcを利用できる状態にし、`channels.json`を用意します。
 
-1. **Mirakurun／mirakcとチャンネルを準備する。** Mirakurunまたはmirakcを先に用意し、利用するサービスとチャンネル設定を確認します。
-2. **配置と初期設定を分けて行う。** Releaseから利用するCPU向けのアーカイブを取得します。rootまたは管理者がアーカイブと環境設定を配置し、`channels.json`を用意します。サービス利用者で`db migrate`、`catalog sync`、`ctrlcmd validate`を順に実行します。
-3. **systemdを起動して確認する。** systemdサービスを起動し、`systemctl is-active sazanami-dvr`が`active`になることと、CtrlCmdの`4520`、録画HTTPの`4521`が待ち受けていることを確認します。CtrlCmdは認証なしで待ち受けるため、インターネットへ直接公開しません。
+### Linuxへ直接入れる
+
+systemdが動くLinuxで使う方法です。GitHub ReleaseからCPUに合うアーカイブを展開し、同梱のインストーラを実行します。
+
+```console
+sudo ./packaging/install.sh install
+```
+
+`install`は専用利用者、標準ディレクトリ、実行ファイル、systemdのサービス定義、環境設定ファイルを配置します。続けて接続先とチャンネルを設定し、DBを準備してからサービスを起動してください。コピーして使える手順は[Linuxへ導入する](docs/linux-installation.md)にまとめています。
+
+### Docker ComposeでSazanami DVRとKonomiTVを起動する
+
+Docker EngineとDocker Composeが動くLinuxで使う方法です。配布アーカイブの`packaging/compose`を専用ディレクトリへコピーし、コピー先へ移動して準備スクリプトを実行します。
+
+```console
+cp -R packaging/compose <install-dir>
+cd <install-dir>
+./prepare.sh
+```
+
+作成された2つの設定ファイルを編集し、用意した`channels.json`を配置したら、Sazanami DVRとKonomiTVを起動できます。詳しくは[Docker Composeで導入する](docs/docker-compose.md)を参照してください。
 
 ## 主な機能
 

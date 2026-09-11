@@ -54,6 +54,8 @@ jobs:
           go mod verify
           go test -count=1 ./...
           go vet ./...
+          sh packaging/install_test.sh
+          sh packaging/lifecycle/verify_test.sh
 
       - name: Linux release archiveを作成
         run: |
@@ -81,6 +83,7 @@ jobs:
             for required_file in sazanami-dvr LICENSE README.md CHANGELOG.md THIRD_PARTY_NOTICES.md \
               docs/linux-installation.md \
               docs/docker-compose.md \
+              packaging/install.sh \
               packaging/systemd/sazanami-dvr.service \
               packaging/systemd/sazanami-dvr.env.example \
               packaging/compose/compose.yaml \
@@ -90,11 +93,13 @@ jobs:
               packaging/compose/prepare.sh; do
               test -f "dist/$package/$required_file"
             done
+            test -x "dist/$package/packaging/install.sh"
             tar -C dist -czf "dist/$package.tar.gz" "$package"
             tar -tzf "dist/$package.tar.gz" > "$RUNNER_TEMP/$package.list"
             for required_file in sazanami-dvr LICENSE README.md CHANGELOG.md THIRD_PARTY_NOTICES.md \
               docs/linux-installation.md \
               docs/docker-compose.md \
+              packaging/install.sh \
               packaging/systemd/sazanami-dvr.service \
               packaging/systemd/sazanami-dvr.env.example \
               packaging/compose/compose.yaml \
@@ -106,6 +111,12 @@ jobs:
             done
             rm -r "dist/$package"
           done
+
+      - name: Fresh Ubuntuでinstaller lifecycleを確認
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          archive="$(pwd)/dist/sazanami-dvr_${version}_linux_amd64.tar.gz"
+          sudo env "PATH=$PATH" packaging/lifecycle/installer_verify.sh "$archive" "$version"
 
       - name: Sazanami OCI imageを公開
         env:
