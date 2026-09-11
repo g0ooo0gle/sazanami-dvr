@@ -286,7 +286,7 @@ base_preflight() {
   systemctl --version >/dev/null 2>&1 || fail systemd-required
 
   for controlled_path in /opt /etc /var /var/lib /usr /usr/local /usr/local/bin /etc/systemd /etc/systemd/system; do
-    root_controlled_directory "$controlled_path" || fail unsafe-standard-path
+    root_controlled_directory "$controlled_path" || fail "unsafe-standard-path:$controlled_path"
   done
 
   service_inactive_preflight
