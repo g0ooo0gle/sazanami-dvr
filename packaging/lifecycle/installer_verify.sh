@@ -7,6 +7,7 @@ peer_name=sazanami-installer-peer
 install_root=/opt/sazanami-dvr
 binary_link=/usr/local/bin/sazanami-dvr
 unit_link=/etc/systemd/system/sazanami-dvr.service
+wants_root=/etc/systemd/system/multi-user.target.wants
 wants_link=/etc/systemd/system/multi-user.target.wants/sazanami-dvr.service
 config_root=/etc/sazanami-dvr
 data_root=/var/lib/sazanami-dvr
@@ -21,6 +22,20 @@ test_drop_in=/run/systemd/system/sazanami-dvr.service.d/installer-test.conf
 test_drop_in_root=/run/systemd/system/sazanami-dvr.service.d
 unmanaged_wants_root=/etc/systemd/system/sazanami-installer-test.target.wants
 unmanaged_wants_link=$unmanaged_wants_root/sazanami-dvr.service
+
+conflict_resource_paths="
+/run/systemd/system/$service_name
+/run/systemd/transient/$service_name
+/usr/local/lib/systemd/system/$service_name
+/usr/lib/systemd/system/$service_name
+/lib/systemd/system/$service_name
+/etc/systemd/system/$service_name.d
+/run/systemd/system/$service_name.d
+/usr/local/lib/systemd/system/$service_name.d
+/usr/lib/systemd/system/$service_name.d
+/lib/systemd/system/$service_name.d
+$wants_link
+"
 
 work_root=
 installer=
@@ -40,6 +55,11 @@ usr_local_bin_metadata_changed=0
 usr_local_bin_uid=
 usr_local_bin_gid=
 usr_local_bin_mode=
+wants_root_original=
+wants_root_swapped=0
+wants_root_mount_active=0
+active_conflict_path=
+conflict_created_dirs=
 
 fail() {
   printf 'Installer lifecycle確認に失敗しました: %s\n' "$*" >&2
@@ -80,6 +100,38 @@ restore_data_root() {
   fi
 }
 
+cleanup_conflict_resource() {
+  if [ -n "$active_conflict_path" ]; then
+    case "$active_conflict_path" in
+      *.d) rm -rf -- "$active_conflict_path" ;;
+      *) rm -f -- "$active_conflict_path" ;;
+    esac
+    active_conflict_path=
+  fi
+  for conflict_created_dir in $conflict_created_dirs; do
+    rmdir "$conflict_created_dir" 2>/dev/null || true
+  done
+  conflict_created_dirs=
+}
+
+restore_wants_root() {
+  if [ "$wants_root_mount_active" -eq 1 ]; then
+    umount "$wants_root" 2>/dev/null || true
+    wants_root_mount_active=0
+  fi
+  if [ "$wants_root_swapped" -eq 1 ]; then
+    if [ -L "$wants_root" ]; then
+      rm -f -- "$wants_root"
+    elif [ -d "$wants_root" ]; then
+      rmdir "$wants_root" 2>/dev/null || true
+    fi
+    if [ -d "$wants_root_original" ] && [ ! -L "$wants_root_original" ]; then
+      mv "$wants_root_original" "$wants_root"
+    fi
+    wants_root_swapped=0
+  fi
+}
+
 cleanup() {
   result=$?
   trap - EXIT HUP INT TERM
@@ -89,6 +141,8 @@ cleanup() {
     purge_pid=
   fi
   stop_account_process
+  cleanup_conflict_resource
+  restore_wants_root
   if [ "$data_mount_active" -eq 1 ]; then
     umount "$data_root" 2>/dev/null || true
     data_mount_active=0
@@ -165,6 +219,9 @@ preflight() {
     "$unmanaged_wants_root"; do
     require_absent "$resource"
   done
+  for conflict_resource in $conflict_resource_paths; do
+    require_absent "$conflict_resource"
+  done
   getent passwd "$account_name" >/dev/null 2>&1 && fail existing-account
   getent group "$account_name" >/dev/null 2>&1 && fail existing-group
   getent passwd "$peer_name" >/dev/null 2>&1 && fail existing-peer
@@ -176,6 +233,97 @@ preflight() {
   usr_local_bin_uid=$(stat -c %u /usr/local/bin)
   usr_local_bin_gid=$(stat -c %g /usr/local/bin)
   usr_local_bin_mode=$(stat -c %a /usr/local/bin)
+}
+
+ensure_conflict_directory() {
+  conflict_directory=$1
+  if path_exists "$conflict_directory"; then
+    [ -d "$conflict_directory" ] && [ ! -L "$conflict_directory" ] || fail conflict-parent-invalid
+    return 0
+  fi
+  conflict_parent=${conflict_directory%/*}
+  [ "$conflict_parent" != "$conflict_directory" ] || fail conflict-parent-invalid
+  ensure_conflict_directory "$conflict_parent"
+  install -d -o root -g root -m 0755 "$conflict_directory"
+  conflict_created_dirs="$conflict_directory $conflict_created_dirs"
+}
+
+create_conflict_resource() {
+  active_conflict_path=$1
+  require_absent "$active_conflict_path"
+  case "$active_conflict_path" in
+    *.d)
+      ensure_conflict_directory "$active_conflict_path"
+      ;;
+    *)
+      conflict_parent=${active_conflict_path%/*}
+      ensure_conflict_directory "$conflict_parent"
+      install -o root -g root -m 0644 /dev/null "$active_conflict_path"
+      ;;
+  esac
+}
+
+wants_root_is_mountpoint() {
+  awk -v path="$wants_root" '$5 == path { found = 1 } END { exit found ? 0 : 1 }' /proc/self/mountinfo
+}
+
+prepare_wants_root_swap() {
+  [ -d "$wants_root" ] && [ ! -L "$wants_root" ] || return 1
+  wants_root_is_mountpoint && return 1
+  [ -n "$wants_root_original" ] || return 1
+  [ ! -e "$wants_root_original" ] && [ ! -L "$wants_root_original" ] || return 1
+  mv "$wants_root" "$wants_root_original"
+  wants_root_swapped=1
+}
+
+test_wants_root_symlink() {
+  if ! prepare_wants_root_swap; then
+    printf 'Installer lifecycle確認: wants root symlink testをskipしました\n' >&2
+    return 0
+  fi
+  symlink_wants_root=$work_root/wants-root-symlink-target
+  symlink_wants_sentinel=$symlink_wants_root/sentinel
+  symlink_wants_link=$symlink_wants_root/$service_name
+  install -d -o root -g root -m 0755 "$symlink_wants_root"
+  printf 'wants-root-symlink-sentinel\n' > "$symlink_wants_sentinel"
+  ln -s "$unit_link" "$symlink_wants_link"
+  ln -s "$symlink_wants_root" "$wants_root"
+  systemctl daemon-reload
+  expect_rejected wants-root-symlink uninstall unsafe-standard-path
+  [ -L "$wants_root" ] || fail wants-root-symlink-removed
+  [ -f "$symlink_wants_sentinel" ] || fail wants-root-symlink-sentinel-removed
+  [ -L "$symlink_wants_link" ] || fail wants-root-symlink-link-removed
+  [ "$(readlink "$symlink_wants_link")" = "$unit_link" ] || fail wants-root-symlink-link-changed
+  restore_wants_root
+  systemctl daemon-reload
+}
+
+test_wants_root_bind_mount() {
+  if ! prepare_wants_root_swap; then
+    printf 'Installer lifecycle確認: wants root bind mount testをskipしました\n' >&2
+    return 0
+  fi
+  bind_wants_root=$work_root/wants-root-bind-target
+  bind_wants_sentinel=$bind_wants_root/sentinel
+  bind_wants_link=$bind_wants_root/$service_name
+  install -d -o root -g root -m 0755 "$bind_wants_root" "$wants_root"
+  printf 'wants-root-bind-sentinel\n' > "$bind_wants_sentinel"
+  ln -s "$unit_link" "$bind_wants_link"
+  if mount --bind "$bind_wants_root" "$wants_root"; then
+    wants_root_mount_active=1
+    systemctl daemon-reload
+    expect_rejected wants-root-bind-mount uninstall unsafe-standard-path
+    [ -f "$bind_wants_sentinel" ] || fail wants-root-bind-sentinel-removed
+    [ -L "$bind_wants_link" ] || fail wants-root-bind-link-removed
+    [ "$(readlink "$bind_wants_link")" = "$unit_link" ] || fail wants-root-bind-link-changed
+    restore_wants_root
+    systemctl daemon-reload
+  else
+    rmdir "$wants_root" 2>/dev/null || fail wants-root-bind-target-cleanup
+    restore_wants_root
+    systemctl daemon-reload
+    printf 'Installer lifecycle確認: wants root bind mount testをskipしました（mount不可）\n' >&2
+  fi
 }
 
 validate_candidate_archive() {
@@ -302,6 +450,25 @@ expect_rejected() {
   grep -F "$rejection_reason" "$rejection_output" >/dev/null || fail "rejection-reason-missing:$rejection_label"
 }
 
+test_managed_reinstall_conflicts() {
+  conflict_index=0
+  for conflict_resource in $conflict_resource_paths; do
+    conflict_index=$((conflict_index + 1))
+    create_conflict_resource "$conflict_resource"
+    expect_rejected "managed-reinstall-conflict-$conflict_index" install existing-resource
+    require_absent "$install_root"
+    require_absent "$binary_link"
+    require_absent "$unit_link"
+    if [ "$conflict_resource" = "$wants_link" ]; then
+      [ -L "$wants_link" ] || fail managed-reinstall-wants-conflict-removed
+    else
+      require_absent "$wants_link"
+    fi
+    assert_account_present
+    cleanup_conflict_resource
+  done
+}
+
 write_recording_root() {
   new_recording_root=$1
   sed "s|^SAZANAMI_RECORDING_ROOT=.*|SAZANAMI_RECORDING_ROOT=$new_recording_root|" \
@@ -340,6 +507,7 @@ main() {
   trap 'exit 130' INT
   trap 'exit 143' TERM
   work_root=$(mktemp -d /run/sazanami-installer-lifecycle.XXXXXX)
+  wants_root_original=$work_root/original-wants-root
   candidate_archive_copy=$work_root/candidate.tar.gz
   install -o root -g root -m 0600 "$candidate_archive" "$candidate_archive_copy"
   candidate_archive=$candidate_archive_copy
@@ -406,6 +574,8 @@ main() {
   cp "$account_marker" "$work_root/marker.before-uninstall"
   systemctl enable "$service_name" >/dev/null
   [ -L "$wants_link" ] || fail service-enable-missing
+  test_wants_root_symlink
+  test_wants_root_bind_mount
   install -d -o root -g root -m 0755 "$unmanaged_wants_root"
   ln -s "$unit_link" "$unmanaged_wants_link"
 
@@ -427,6 +597,8 @@ main() {
   cmp -s "$work_root/backup" "$data_root/backups/installer-test.backup" || fail uninstall-changed-backup
   cmp -s "$work_root/recording" "$recording_root/installer-test.ts" || fail uninstall-changed-recording
   assert_account_present
+
+  test_managed_reinstall_conflicts
 
   mv "$recording_root" "$work_root/recordings.saved"
   ln -s "$work_root/recordings.saved" "$recording_root"

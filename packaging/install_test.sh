@@ -173,4 +173,25 @@ systemctl() {
 }
 expect_rejected service_inactive_preflight
 
+wants_root="$test_root/wants-root"
+mkdir "$wants_root"
+root_controlled_directory() {
+  [ "$1" = "$wants_root" ]
+}
+not_mountpoint() {
+  [ "$1" = "$wants_root" ]
+}
+wants_root_preflight || test_fail "安全なwants rootを受理できませんでした"
+root_controlled_directory() {
+  return 1
+}
+expect_rejected wants_root_preflight
+root_controlled_directory() {
+  return 0
+}
+not_mountpoint() {
+  return 1
+}
+expect_rejected wants_root_preflight
+
 printf 'Installer contract test: ok\n'

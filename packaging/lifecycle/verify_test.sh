@@ -38,6 +38,12 @@ sh -n "$script_root/../install.sh"
 sh -n "$script_root/installer_verify.sh"
 grep -F 'validate_candidate_archive "$candidate_archive"' "$script_root/installer_verify.sh" >/dev/null
 
+repository_root=$(CDPATH= cd -- "$script_root/../.." && pwd)
+for workflow in ci.yml release.yml; do
+  grep -F 'sudo chown root:root /opt' "$repository_root/.github/workflows/$workflow" >/dev/null
+  grep -F 'sudo chmod 0755 /opt' "$repository_root/.github/workflows/$workflow" >/dev/null
+done
+
 python3 -c 'compile(open("'"$script_root"'/synthetic_mirakurun.py", encoding="utf-8").read(), "synthetic_mirakurun.py", "exec")'
 sh -n "$script_root/verify.sh"
 printf 'Linux lifecycle safety contract: ok\n'

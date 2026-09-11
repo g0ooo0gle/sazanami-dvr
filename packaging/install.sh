@@ -271,6 +271,13 @@ not_mountpoint() {
   [ "$mount_query_status" -eq 1 ]
 }
 
+wants_root_preflight() {
+  if path_exists "$wants_root"; then
+    root_controlled_directory "$wants_root" || return 1
+    not_mountpoint "$wants_root" || return 1
+  fi
+}
+
 required_commands() {
   for command_name in awk chmod chown dirname find getent grep groupdel id install ln mktemp mv od pgrep readlink rm rmdir runuser sed stat systemctl timeout tr uname useradd userdel; do
     require_command "$command_name"
@@ -602,7 +609,6 @@ install_preflight() {
     for fresh_path in "$install_root" "$binary_link" "$unit_link" "$config_root" "$data_root"; do
       path_exists "$fresh_path" && fail existing-resource
     done
-    fresh_unit_conflict_preflight
     install_mode=fresh
   elif [ "$account_lookup" = present ] && [ "$group_lookup" = present ]; then
     load_current_account || fail account-not-managed
@@ -624,6 +630,10 @@ install_preflight() {
     runtime_state=present
   else
     fail runtime-not-managed
+  fi
+
+  if [ "$runtime_state" = absent ]; then
+    fresh_unit_conflict_preflight
   fi
 }
 
@@ -761,6 +771,12 @@ perform_install() {
 
 uninstall_preflight() {
   validate_runtime_inventory || fail runtime-not-managed
+  if ! wants_root_preflight; then
+    if [ "${1:-uninstall}" = purge ]; then
+      fail_purge_path purge-path-not-safe
+    fi
+    fail "unsafe-standard-path:$wants_root"
+  fi
   links_match_runtime || fail link-not-managed
 }
 
@@ -823,7 +839,7 @@ validate_external_recording_root() {
 
 purge_preflight() {
   base_preflight
-  uninstall_preflight
+  uninstall_preflight purge
   load_current_account || fail account-not-managed
   account_has_processes && fail account-has-processes
 
@@ -831,10 +847,6 @@ purge_preflight() {
     root_controlled_directory "$purge_ancestor" || fail_purge_path purge-path-not-safe
     not_mountpoint "$purge_ancestor" || fail_purge_path purge-path-not-safe
   done
-  if path_exists "$wants_root"; then
-    root_controlled_directory "$wants_root" || fail_purge_path purge-path-not-safe
-    not_mountpoint "$wants_root" || fail_purge_path purge-path-not-safe
-  fi
   for purge_root in "$install_root" "$config_root" "$data_root"; do
     [ -d "$purge_root" ] && [ ! -L "$purge_root" ] || fail_purge_path purge-path-not-safe
     not_mountpoint "$purge_root" || fail_purge_path purge-path-not-safe
