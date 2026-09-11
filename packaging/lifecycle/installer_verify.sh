@@ -251,6 +251,11 @@ create_conflict_resource() {
   active_conflict_path=$1
   require_absent "$active_conflict_path"
   case "$active_conflict_path" in
+    "$wants_link")
+      conflict_parent=${active_conflict_path%/*}
+      ensure_conflict_directory "$conflict_parent"
+      ln -s "$unit_link" "$active_conflict_path"
+      ;;
     *.d)
       ensure_conflict_directory "$active_conflict_path"
       ;;
