@@ -116,9 +116,11 @@ jobs:
         run: |
           version=${GITHUB_REF_NAME#v}
           archive="$(pwd)/dist/sazanami-dvr_${version}_linux_amd64.tar.gz"
-          # Hosted runnerの/optは通常のUbuntuより緩い権限なので、試験対象の標準状態へ戻す。
+          # Hosted runnerの一部pathは通常のUbuntuより緩い権限なので、試験対象の標準状態へ戻す。
           sudo chown root:root /opt
           sudo chmod 0755 /opt
+          sudo chown root:root /usr/local/bin
+          sudo chmod 0755 /usr/local/bin
           sudo env "PATH=$PATH" packaging/lifecycle/installer_verify.sh "$archive" "$version"
 
       - name: Sazanami OCI imageを公開

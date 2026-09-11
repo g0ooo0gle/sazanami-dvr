@@ -42,6 +42,8 @@ repository_root=$(CDPATH= cd -- "$script_root/../.." && pwd)
 for workflow in ci.yml release.yml; do
   grep -F 'sudo chown root:root /opt' "$repository_root/.github/workflows/$workflow" >/dev/null
   grep -F 'sudo chmod 0755 /opt' "$repository_root/.github/workflows/$workflow" >/dev/null
+  grep -F 'sudo chown root:root /usr/local/bin' "$repository_root/.github/workflows/$workflow" >/dev/null
+  grep -F 'sudo chmod 0755 /usr/local/bin' "$repository_root/.github/workflows/$workflow" >/dev/null
 done
 
 python3 -c 'compile(open("'"$script_root"'/synthetic_mirakurun.py", encoding="utf-8").read(), "synthetic_mirakurun.py", "exec")'
