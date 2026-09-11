@@ -82,6 +82,11 @@ jobs:
           sudo install -D -m 0600 "$env_file" /etc/sazanami-dvr/sazanami-dvr.env
           sudo systemd-analyze verify "$unit"
 
+      - name: installer契約を確認
+        run: |
+          sh packaging/install_test.sh
+          sh -n packaging/lifecycle/installer_verify.sh
+
       - name: unit testを実行
         run: go test -count=1 ./...
 
@@ -181,7 +186,10 @@ jobs:
           cache: false
 
       - name: lifecycle scriptを確認
-        run: sh packaging/lifecycle/verify_test.sh
+        run: |
+          sh packaging/lifecycle/verify_test.sh
+          sh packaging/install_test.sh
+          sh -n packaging/lifecycle/installer_verify.sh
 
       - name: candidate archiveを作成
         id: candidate
@@ -249,4 +257,15 @@ jobs:
             "${{ steps.baseline.outputs.archive }}" \
             "${{ steps.candidate.outputs.archive }}" \
             "$GITHUB_SHA" \
+            "${{ steps.candidate.outputs.version }}"
+
+      - name: Fresh Ubuntuでinstaller lifecycleを確認
+        run: |
+          # Hosted runnerの一部pathは通常のUbuntuより緩い権限なので、試験対象の標準状態へ戻す。
+          sudo chown root:root /opt
+          sudo chmod 0755 /opt
+          sudo chown root:root /usr/local/bin
+          sudo chmod 0755 /usr/local/bin
+          sudo env "PATH=$PATH" packaging/lifecycle/installer_verify.sh \
+            "${{ steps.candidate.outputs.archive }}" \
             "${{ steps.candidate.outputs.version }}"

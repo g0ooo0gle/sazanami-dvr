@@ -185,7 +185,7 @@ validate_archive() {
 
   required_files='sazanami-dvr LICENSE README.md THIRD_PARTY_NOTICES.md docs/linux-installation.md packaging/systemd/sazanami-dvr.service packaging/systemd/sazanami-dvr.env.example'
   if [ "$changelog_required" -eq 1 ]; then
-    required_files="$required_files CHANGELOG.md"
+    required_files="$required_files CHANGELOG.md docs/docker-compose.md packaging/install.sh"
   fi
   for required_file in $required_files; do
     grep -Fx "$package/$required_file" "$list_file" >/dev/null || fail "archive-file-missing:$required_file"
@@ -196,6 +196,10 @@ validate_archive() {
   chown -R root:root "$extract_root"
   binary="$extract_root/sazanami-dvr"
   [ -x "$binary" ] && [ ! -L "$binary" ] || fail "archive-binary-invalid"
+  if [ "$changelog_required" -eq 1 ]; then
+    [ -x "$extract_root/packaging/install.sh" ] && [ ! -L "$extract_root/packaging/install.sh" ] ||
+      fail "archive-installer-invalid"
+  fi
   [ "$($binary --version)" = "sazanami-dvr $expected_version" ] || fail "archive-version-mismatch"
   build_info=$(go version -m "$binary")
   for required_setting in \
