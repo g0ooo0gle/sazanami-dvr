@@ -356,7 +356,10 @@ main() {
   if "$installer" install > "$work_root/fresh-unit-conflict.out" 2>&1; then
     fail fresh-unit-conflict-accepted
   fi
-  grep -F existing-resource "$work_root/fresh-unit-conflict.out" >/dev/null || fail fresh-unit-conflict-reason
+  if ! grep -F existing-resource "$work_root/fresh-unit-conflict.out" >/dev/null; then
+    sed 's/^/installer output: /' "$work_root/fresh-unit-conflict.out" >&2
+    fail fresh-unit-conflict-reason
+  fi
   require_absent "$install_root"
   require_absent "$config_root"
   require_absent "$data_root"
