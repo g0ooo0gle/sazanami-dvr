@@ -619,6 +619,9 @@ fresh_unit_conflict_preflight() {
     for unit_relative_path in \
       "$service_name" \
       "$service_name.d" \
+      "$service_name.wants" \
+      "$service_name.requires" \
+      "$service_name.upholds" \
       "sazanami-.service.d" \
       "service.d"; do
       reject_systemd_conflict "$resolved_unit_path/$unit_relative_path"

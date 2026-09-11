@@ -69,6 +69,17 @@ path_exists() {
   [ -e "$1" ] || [ -L "$1" ]
 }
 
+root_controlled_directory() {
+  controlled_path=$1
+  [ -d "$controlled_path" ] && [ ! -L "$controlled_path" ] || return 1
+  [ "$(stat -c %u "$controlled_path")" -eq 0 ] || return 1
+  controlled_mode=$(stat -c %a "$controlled_path") || return 1
+  case "$controlled_mode" in
+    *[!0-7]* | '') return 1 ;;
+  esac
+  [ $((0$controlled_mode & 0022)) -eq 0 ] || return 1
+}
+
 require_absent() {
   path_exists "$1" && fail "existing-resource:$1"
   return 0
@@ -134,6 +145,17 @@ restore_wants_root() {
     wants_root_mount_active=0
   fi
   return 0
+}
+
+wants_root_preflight() {
+  path_exists "$wants_root" || return 0
+  root_controlled_directory "$wants_root" || return 1
+  if wants_root_is_mountpoint; then
+    return 1
+  else
+    wants_root_mount_status=$?
+  fi
+  [ "$wants_root_mount_status" -eq 1 ]
 }
 
 cleanup() {
@@ -229,6 +251,8 @@ preflight() {
     require_command "$command_name"
   done
   [ -d /run/systemd/system ] || fail systemd-required
+  [ -r /proc/self/mountinfo ] || fail mount-state-unavailable
+  wants_root_preflight || fail unsafe-wants-root
   for resource in "$install_root" "$binary_link" "$unit_link" "$wants_link" "$config_root" "$data_root" \
     "$saved_data_root" "$external_root" "$external_alias" "$external_mount" "$test_drop_in_root" \
     "$unmanaged_wants_root"; do

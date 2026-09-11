@@ -48,4 +48,43 @@ done
 
 python3 -c 'compile(open("'"$script_root"'/synthetic_mirakurun.py", encoding="utf-8").read(), "synthetic_mirakurun.py", "exec")'
 sh -n "$script_root/verify.sh"
+
+if (
+  . "$script_root/installer_verify.sh"
+  wants_root=/tmp/sazanami-lifecycle-wants-root
+  path_exists() { return 0; }
+  root_controlled_directory() { return 0; }
+  wants_root_is_mountpoint() { return 1; }
+  wants_root_preflight
+); then
+  :
+else
+  printf '安全なwants rootを受理できませんでした\n' >&2
+  exit 1
+fi
+
+if (
+  . "$script_root/installer_verify.sh"
+  wants_root=/tmp/sazanami-lifecycle-wants-root
+  path_exists() { return 0; }
+  root_controlled_directory() { return 1; }
+  wants_root_is_mountpoint() { return 1; }
+  wants_root_preflight
+) >/dev/null 2>&1; then
+  printf '管理外wants rootを拒否しませんでした\n' >&2
+  exit 1
+fi
+
+if (
+  . "$script_root/installer_verify.sh"
+  wants_root=/tmp/sazanami-lifecycle-wants-root
+  path_exists() { return 0; }
+  root_controlled_directory() { return 0; }
+  wants_root_is_mountpoint() { return 0; }
+  wants_root_preflight
+) >/dev/null 2>&1; then
+  printf 'mountされたwants rootを拒否しませんでした\n' >&2
+  exit 1
+fi
+
 printf 'Linux lifecycle safety contract: ok\n'

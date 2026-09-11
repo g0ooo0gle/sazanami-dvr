@@ -213,11 +213,14 @@ fresh_unit_conflict_preflight
 for conflict_relative in \
   "$service_name" \
   "$service_name.d" \
+  "$service_name.wants" \
+  "$service_name.requires" \
+  "$service_name.upholds" \
   "sazanami-.service.d" \
   "service.d"; do
   conflict_path="$systemd_search_root/$conflict_relative"
   case "$conflict_relative" in
-    *.d) mkdir "$conflict_path" ;;
+    *.d | *.wants | *.requires | *.upholds) mkdir "$conflict_path" ;;
     *) touch "$conflict_path" ;;
   esac
   expect_rejected fresh_unit_conflict_preflight
