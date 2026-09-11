@@ -236,16 +236,15 @@ preflight() {
 }
 
 ensure_conflict_directory() {
-  conflict_directory=$1
-  if path_exists "$conflict_directory"; then
-    [ -d "$conflict_directory" ] && [ ! -L "$conflict_directory" ] || fail conflict-parent-invalid
+  if path_exists "$1"; then
+    [ -d "$1" ] && [ ! -L "$1" ] || fail conflict-parent-invalid
     return 0
   fi
-  conflict_parent=${conflict_directory%/*}
-  [ "$conflict_parent" != "$conflict_directory" ] || fail conflict-parent-invalid
+  conflict_parent=${1%/*}
+  [ "$conflict_parent" != "$1" ] || fail conflict-parent-invalid
   ensure_conflict_directory "$conflict_parent"
-  install -d -o root -g root -m 0755 "$conflict_directory"
-  conflict_created_dirs="$conflict_directory $conflict_created_dirs"
+  install -d -o root -g root -m 0755 "$1"
+  conflict_created_dirs="$1 $conflict_created_dirs"
 }
 
 create_conflict_resource() {
