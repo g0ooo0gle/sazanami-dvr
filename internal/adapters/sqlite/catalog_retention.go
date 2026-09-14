@@ -112,23 +112,30 @@ func commitCatalogPrune(ctx context.Context, tx *sql.Tx, result CatalogPruneResu
 }
 
 const pruneProgramObservationsSQL = `
-WITH candidate_syncs AS (
+WITH terminal_candidates AS (
 	SELECT cs.id, cs.finished_at_utc_ms
 	FROM catalog_syncs AS cs INDEXED BY catalog_gc_sync_terminal_idx
 	WHERE cs.state IN ('COMPLETED', 'FAILED')
 	  AND (cs.state = 'FAILED' OR EXISTS (
-		SELECT 1
-		FROM catalog_syncs AS newer INDEXED BY catalog_syncs_completed_backend_idx
-		WHERE newer.backend_instance_id = cs.backend_instance_id
-		  AND newer.state = 'COMPLETED'
-		  AND (newer.finished_at_utc_ms > cs.finished_at_utc_ms OR
-		       (newer.finished_at_utc_ms = cs.finished_at_utc_ms AND newer.id > cs.id))
-		LIMIT 1 OFFSET 2
+		SELECT 1 FROM (
+			SELECT newer.id
+			FROM catalog_syncs AS newer INDEXED BY catalog_syncs_completed_backend_idx
+			WHERE newer.backend_instance_id = cs.backend_instance_id
+			  AND newer.state = 'COMPLETED'
+			  AND newer.finished_at_utc_ms > cs.finished_at_utc_ms
+			UNION ALL
+			SELECT newer.id
+			FROM catalog_syncs AS newer INDEXED BY catalog_syncs_completed_backend_idx
+			WHERE newer.backend_instance_id = cs.backend_instance_id
+			  AND newer.state = 'COMPLETED'
+			  AND newer.finished_at_utc_ms = cs.finished_at_utc_ms
+			  AND newer.id > cs.id
+			LIMIT 1 OFFSET 2
+		)
 	  ))
-	ORDER BY cs.finished_at_utc_ms ASC, cs.id ASC
 ), candidate AS (
 	SELECT po.sequence
-	FROM candidate_syncs AS cs
+	FROM terminal_candidates AS cs
 	JOIN program_observations AS po INDEXED BY program_observations_sync_instance_idx
 	  ON po.sync_id = cs.id
 	ORDER BY cs.finished_at_utc_ms ASC, cs.id ASC, po.sequence ASC
@@ -138,23 +145,30 @@ DELETE FROM program_observations
 WHERE sequence IN (SELECT sequence FROM candidate)`
 
 const pruneServiceObservationsSQL = `
-WITH candidate_syncs AS (
+WITH terminal_candidates AS (
 	SELECT cs.id, cs.finished_at_utc_ms
 	FROM catalog_syncs AS cs INDEXED BY catalog_gc_sync_terminal_idx
 	WHERE cs.state IN ('COMPLETED', 'FAILED')
 	  AND (cs.state = 'FAILED' OR EXISTS (
-		SELECT 1
-		FROM catalog_syncs AS newer INDEXED BY catalog_syncs_completed_backend_idx
-		WHERE newer.backend_instance_id = cs.backend_instance_id
-		  AND newer.state = 'COMPLETED'
-		  AND (newer.finished_at_utc_ms > cs.finished_at_utc_ms OR
-		       (newer.finished_at_utc_ms = cs.finished_at_utc_ms AND newer.id > cs.id))
-		LIMIT 1 OFFSET 2
+		SELECT 1 FROM (
+			SELECT newer.id
+			FROM catalog_syncs AS newer INDEXED BY catalog_syncs_completed_backend_idx
+			WHERE newer.backend_instance_id = cs.backend_instance_id
+			  AND newer.state = 'COMPLETED'
+			  AND newer.finished_at_utc_ms > cs.finished_at_utc_ms
+			UNION ALL
+			SELECT newer.id
+			FROM catalog_syncs AS newer INDEXED BY catalog_syncs_completed_backend_idx
+			WHERE newer.backend_instance_id = cs.backend_instance_id
+			  AND newer.state = 'COMPLETED'
+			  AND newer.finished_at_utc_ms = cs.finished_at_utc_ms
+			  AND newer.id > cs.id
+			LIMIT 1 OFFSET 2
+		)
 	  ))
-	ORDER BY cs.finished_at_utc_ms ASC, cs.id ASC
 ), candidate AS (
 	SELECT so.sequence
-	FROM candidate_syncs AS cs
+	FROM terminal_candidates AS cs
 	JOIN service_observations AS so INDEXED BY service_observations_sync_service_idx
 	  ON so.sync_id = cs.id
 	ORDER BY cs.finished_at_utc_ms ASC, cs.id ASC, so.sequence ASC
@@ -164,20 +178,31 @@ DELETE FROM service_observations
 WHERE sequence IN (SELECT sequence FROM candidate)`
 
 const pruneCatalogSyncsSQL = `
-WITH candidate AS (
-	SELECT cs.id
+WITH terminal_candidates AS (
+	SELECT cs.id, cs.finished_at_utc_ms
 	FROM catalog_syncs AS cs INDEXED BY catalog_gc_sync_terminal_idx
 	WHERE cs.state IN ('COMPLETED', 'FAILED')
-	  AND cs.finished_at_utc_ms < ?
 	  AND (cs.state = 'FAILED' OR EXISTS (
-		SELECT 1
-		FROM catalog_syncs AS newer INDEXED BY catalog_syncs_completed_backend_idx
-		WHERE newer.backend_instance_id = cs.backend_instance_id
-		  AND newer.state = 'COMPLETED'
-		  AND (newer.finished_at_utc_ms > cs.finished_at_utc_ms OR
-		       (newer.finished_at_utc_ms = cs.finished_at_utc_ms AND newer.id > cs.id))
-		LIMIT 1 OFFSET 2
+		SELECT 1 FROM (
+			SELECT newer.id
+			FROM catalog_syncs AS newer INDEXED BY catalog_syncs_completed_backend_idx
+			WHERE newer.backend_instance_id = cs.backend_instance_id
+			  AND newer.state = 'COMPLETED'
+			  AND newer.finished_at_utc_ms > cs.finished_at_utc_ms
+			UNION ALL
+			SELECT newer.id
+			FROM catalog_syncs AS newer INDEXED BY catalog_syncs_completed_backend_idx
+			WHERE newer.backend_instance_id = cs.backend_instance_id
+			  AND newer.state = 'COMPLETED'
+			  AND newer.finished_at_utc_ms = cs.finished_at_utc_ms
+			  AND newer.id > cs.id
+			LIMIT 1 OFFSET 2
+		)
 	  ))
+), candidate AS (
+	SELECT cs.id
+	FROM terminal_candidates AS cs
+	WHERE cs.finished_at_utc_ms < ?
 	  AND NOT EXISTS (
 		SELECT 1
 		FROM service_observations AS so INDEXED BY service_observations_sync_service_idx

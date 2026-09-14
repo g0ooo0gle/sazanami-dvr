@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime/debug"
 	"strings"
 	"testing"
 	"time"
@@ -426,6 +427,7 @@ func TestCatalogRetentionConvergesAfterOneHundredSyntheticSyncs(t *testing.T) {
 func TestPruneCatalogBatchBoundsLatestThreeCheckAtHighCardinality(t *testing.T) {
 	_, store := openMigratedStore(t)
 	const generationCount = 20_000
+	const finishedAt = int64(100)
 	backendID := retentionID(20_000)
 	insertRetentionBackend(t, store, backendID)
 	tx, err := store.writer.BeginTx(context.Background(), nil)
@@ -433,10 +435,10 @@ func TestPruneCatalogBatchBoundsLatestThreeCheckAtHighCardinality(t *testing.T) 
 		t.Fatal(err)
 	}
 	for generation := 1; generation <= generationCount; generation++ {
-		syncID := retentionID(uint64(20_000 + generation))
+		syncID := highCardinalitySyncID(generation)
 		if _, err := tx.Exec(`INSERT INTO catalog_syncs
 			(id, backend_instance_id, state, started_at_utc_ms, finished_at_utc_ms, program_count, correlation_id)
-			VALUES (?, ?, 'COMPLETED', ?, ?, 1, ?)`, syncID.Bytes(), backendID.Bytes(), generation-1, generation, fmt.Sprintf("high-cardinality-%d", generation)); err != nil {
+			VALUES (?, ?, 'COMPLETED', 1, ?, 1, ?)`, syncID.Bytes(), backendID.Bytes(), finishedAt, fmt.Sprintf("high-cardinality-%d", generation)); err != nil {
 			_ = tx.Rollback()
 			t.Fatal(err)
 		}
@@ -453,11 +455,26 @@ func TestPruneCatalogBatchBoundsLatestThreeCheckAtHighCardinality(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), highCardinalityRetentionTimeout())
 	defer cancel()
-	result, err := store.PruneCatalogBatch(ctx, 0)
-	if err != nil || result.ProgramObservationsDeleted != 1 || result.AllEmpty {
-		t.Fatalf("high-cardinality result=%+v err=%v", result, err)
+	var total CatalogPruneResult
+	for {
+		result, err := store.PruneCatalogBatch(ctx, finishedAt+1)
+		if err != nil {
+			t.Fatalf("high-cardinality result=%+v total=%+v err=%v", result, total, err)
+		}
+		total.ProgramObservationsDeleted += result.ProgramObservationsDeleted
+		total.ServiceObservationsDeleted += result.ServiceObservationsDeleted
+		total.CatalogSyncsDeleted += result.CatalogSyncsDeleted
+		total.ProgramRevisionsDeleted += result.ProgramRevisionsDeleted
+		total.ProgramInstancesDeleted += result.ProgramInstancesDeleted
+		total.ServicesDeleted += result.ServicesDeleted
+		if result.AllEmpty {
+			break
+		}
+	}
+	if total.ProgramObservationsDeleted != 1 || total.CatalogSyncsDeleted != generationCount-3 {
+		t.Fatalf("high-cardinality total=%+v", total)
 	}
 	var observations, syncs int
 	if err := store.reader.QueryRow(`SELECT count(*) FROM program_observations`).Scan(&observations); err != nil {
@@ -466,27 +483,29 @@ func TestPruneCatalogBatchBoundsLatestThreeCheckAtHighCardinality(t *testing.T) 
 	if err := store.reader.QueryRow(`SELECT count(*) FROM catalog_syncs`).Scan(&syncs); err != nil {
 		t.Fatal(err)
 	}
-	if observations != 3 || syncs != generationCount {
+	if observations != 3 || syncs != 3 {
 		t.Fatalf("high-cardinality observations=%d syncs=%d", observations, syncs)
 	}
-	rows, err := store.reader.Query(`SELECT cs.finished_at_utc_ms
+	rows, err := store.reader.Query(`SELECT cs.id, po.sequence
 		FROM program_observations po
 		JOIN catalog_syncs cs ON cs.id=po.sync_id
-		ORDER BY cs.finished_at_utc_ms`)
+		ORDER BY cs.id`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rows.Close()
-	for index, want := range []int64{generationCount - 2, generationCount - 1, generationCount} {
+	for index, generation := range []int{generationCount - 2, generationCount - 1, generationCount} {
 		if !rows.Next() {
 			t.Fatalf("remaining observation %d is missing", index)
 		}
-		var got int64
-		if err := rows.Scan(&got); err != nil {
+		var gotID []byte
+		var gotSequence int64
+		if err := rows.Scan(&gotID, &gotSequence); err != nil {
 			t.Fatal(err)
 		}
-		if got != want {
-			t.Fatalf("remaining observation %d finished=%d want=%d", index, got, want)
+		wantID := highCardinalitySyncID(generation)
+		if !bytes.Equal(gotID, wantID.Bytes()) || gotSequence != int64(generation) {
+			t.Fatalf("remaining observation %d id=%x sequence=%d want id=%x sequence=%d", index, gotID, gotSequence, wantID.Bytes(), generation)
 		}
 	}
 	if rows.Next() {
@@ -495,6 +514,25 @@ func TestPruneCatalogBatchBoundsLatestThreeCheckAtHighCardinality(t *testing.T) 
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func highCardinalitySyncID(generation int) catalogmodel.ID {
+	var id catalogmodel.ID
+	binary.BigEndian.PutUint64(id[:8], uint64(generation))
+	binary.BigEndian.PutUint64(id[8:], uint64(generation))
+	return id
+}
+
+func highCardinalityRetentionTimeout() time.Duration {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, setting := range info.Settings {
+			if setting.Key == "-race" && setting.Value == "true" {
+				return 90 * time.Second
+			}
+		}
+	}
+	// 本番GCの30秒より短くしつつ、CIの負荷変動を許容する。
+	return 15 * time.Second
 }
 
 func TestPruneCatalogBatchUsesStrictCutoffForSummariesInstancesAndServices(t *testing.T) {
