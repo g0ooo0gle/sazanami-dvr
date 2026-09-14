@@ -7,8 +7,10 @@
 - Authorization: Project ownerは番組表の自動GCを次の最優先機能とし、利用者が考えずに使える既定動作を承認した
 - Related plan: [Plan 0091](../plans/0091-bounded-catalog-retention.md)
 - Related specification: [番組表保持仕様 v1](../../spec/persistence/catalog-retention-v1.md)
+- Existing 5-minute authority: [録画中の番組終了追従仕様 v1 `AEE-008`](../../spec/recording/bounded-active-end-extension-v1.md)
 - Extends: ADR-0015、ADR-0021、ADR-0027
-- Supersedes: ADR-0021の初期製品内delete／prune対象外と、ADR-0027の古い番組表世代の削除対象外。
+- Supersedes: ADR-0021の初期製品内delete／prune対象外、ADR-0027の古い番組表世代の削除対象外、
+  番組表schema v1 §9のHF-05A自動GC非実施境界、ADR-0015のDraft候補`ID-005`〜`ID-007`。
   いずれも番組表GCに限る
 - Superseded by: None
 
@@ -16,7 +18,7 @@
 
 v1.2.0は、番組表更新ごとにサービスと番組の観測を新しい世代へ追加する。利用者へ返すのは最新の完了世代だが、
 古い世代、観測、番組instance、revisionを回収しない。このまま既定5分間隔で動かすと、表示する番組数が同じでも
-SQLiteだけが増え続ける。放置はできない。
+SQLiteだけが増え続けるため、自動整理が必要になる。
 
 番組表の大部分はMirakurunまたはmirakcから再取得できる。一方、予約、録画履歴、自動予約結果が参照する番組は、
 過去の番組であっても削除できない。最新世代を読む要求と更新処理も同時に動くため、切替え直後に旧世代を消すことも
@@ -26,6 +28,9 @@ SQLiteだけが増え続ける。放置はできない。
 
 `recording serve`と明示`catalog sync`は、番組表を取得する前に同じ自動GCを実行する。利用者向けの有効化flag、
 保持期間、batch size、実行間隔は追加しない。
+
+既定更新間隔は、Accepted [`AEE-008`](../../spec/recording/bounded-active-end-extension-v1.md)とv1.2.0の実装どおり5分とする。これはADR-0027と連続更新仕様v1に残る
+1時間の記述だけを置き換え、最短5分、最長24時間、直列実行、完了後に次のintervalを測る規則は維持する。
 
 ### 最新世代と参照中の番組を残す
 
@@ -39,6 +44,11 @@ SQLiteだけが増え続ける。放置はできない。
 - 30日を過ぎても、保持中の観測、予約、自動予約結果から参照される番組は回収しない。
 - serviceは、最後の観測から30日を過ぎ、観測と番組instanceを持たない場合だけ回収する。
 - 録画履歴、予約、自動予約規則、backup、録画ファイルは変更しない。
+
+`latest3`はactive readerの参照数を追跡するleaseではない。v1.2.0の通常CtrlCmd要求は14秒、HTTP要求は10秒で
+終了し、301ライブ中継はrelay開始前にcatalog照合を終える。現在の直列更新は処理完了後に最短5分待つため、
+これらの要求が古い世代を読む間は3世代の保護内に収まる。3回の更新完了をまたぐ新しいreaderを追加する場合は、
+同時にgeneration leaseを設計し、GC対象から除外する別のAccepted変更を必要とする。
 
 期限を過ぎた未参照番組のlineageは保持しない。同じprovider event IDが後から再出現した場合は新しい
 `ProgramInstanceId`、revision 1、`NEW_INSTANCE`として扱う。期限付きtombstoneやidentity台帳は設けない。

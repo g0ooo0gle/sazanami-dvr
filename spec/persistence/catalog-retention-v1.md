@@ -5,11 +5,14 @@
 - Decision owner: Project owner
 - Product destination: `spec/persistence/catalog-retention-v1.md`
 - Related decision: [ADR-0072](../../docs/adr/0072-bounded-catalog-retention.md)
+- Existing 5-minute authority: [録画中の番組終了追従仕様 v1 `AEE-008`](../recording/bounded-active-end-extension-v1.md)
 - Requirements: `CGR-001`〜`CGR-012`
 
-本仕様は、番組表GCに限って、番組表schema v1の「HF-05Aでは自動GCを行わない」という初期境界と、
-ADR-0015に記録された未採用の保持値候補を置き換える。番組identity、immutable revision、予約snapshotの
-保護は変更しない。
+本仕様は、番組表GCに限って、番組表schema v1 §9の「HF-05Aでは自動GCを行わない」という初期境界と、
+ADR-0015に記録されたDraft候補`ID-005`〜`ID-007`を置き換える。既定更新間隔はAccepted
+[`AEE-008`](../recording/bounded-active-end-extension-v1.md)どおり
+5分とし、連続更新仕様v1に残る1時間の記述だけを置き換える。番組identity、immutable revision、予約snapshot、
+最短5分、最長24時間、直列更新、backupの規則は変更しない。
 
 ## 目的
 
@@ -22,12 +25,12 @@ ADR-0015に記録された未採用の保持値候補を置き換える。番組
 | ID | 要件 |
 |---|---|
 | `CGR-001` | `recording serve`と`catalog sync`は、新しいcatalog世代を作る前に自動GCを1回実行する。 |
-| `CGR-002` | backendごとの最新3件の`COMPLETED`世代と全`RUNNING`世代を保護する。最新3件には公開中の世代とその前の完了世代2件を含める。 |
+| `CGR-002` | backendごとの最新3件の`COMPLETED`世代と全`RUNNING`世代を保護する。最新3件には公開中の世代とその前の完了世代2件を含め、新しい長寿命readerは別途generation leaseを必要とする。 |
 | `CGR-003` | 保護対象外のterminal世代から、program観測、service観測の順で削除する。 |
 | `CGR-004` | 観測を持たないterminal世代summaryは終了から30日保持し、保護対象でなければ削除できる。summaryの件数は同期完了時の実績として維持する。 |
 | `CGR-005` | program instanceとその全revisionは最終観測から30日保持し、保持中観測、予約、自動予約結果の参照があれば期限後も残す。期限内のinstanceから古いrevisionだけを削除しない。 |
 | `CGR-006` | serviceは最終観測から30日保持し、service観測とprogram instanceの両方がない場合だけ削除する。 |
-| `CGR-007` | 1 transactionの削除を1,000行以下、1回のGCを30秒以下に制限する。 |
+| `CGR-007` | 1 transactionの削除を1,000行以下、1回のGCを30秒以下に制限する。30秒はcontextの単調deadlineで判定する。 |
 | `CGR-008` | 時間切れと取消し後の再実行は、進捗tableなしで同じ保持状態へ収束する。 |
 | `CGR-009` | GCの失敗だけを理由に完成済みcatalogを無効化せず、親contextが有効なら次のprovider取得を試行する。 |
 | `CGR-010` | GCは録画、録画履歴、予約、自動予約規則、backup、録画ファイルを削除または変更しない。 |
@@ -51,8 +54,19 @@ ADR-0015に記録された未採用の保持値候補を置き換える。番組
 | 専用worker／queue | 0 |
 | 自動`VACUUM` | なし |
 
+GC開始時に注入可能なUTC clockから`now_utc_ms`を一度だけ取得し、その回の全stageとbatchで同じcutoffを使う。
 保持期間の比較にはUTC millisecondを使う。`finished_at_utc_ms < now - 30日`または
 `last_seen_at_utc_ms < now - 30日`を期限超過とし、境界と同値の行は残す。
+
+## 世代readerの寿命
+
+`latest3`はactive readerの参照数を数えるleaseではない。v1.2.0の通常CtrlCmd要求は14秒、HTTP要求は10秒で
+終了または取消しとなる。301ライブ中継はrelay開始前にcatalog照合を完了し、送信中に世代DBを読み続けない。
+catalog更新は直列で、一つの処理完了後から最短5分待って次を始める。このため、現行readerが固定世代を使う間は
+最新3世代の範囲から外れない。
+
+今後、3回の更新完了をまたいで固定世代を読む機能を追加する場合は、同じ変更でgeneration leaseを導入する。
+GCは有効なleaseが指す世代を候補から除外しなければならない。今回のschema 14にはlease tableを追加しない。
 
 ## 保護対象
 
@@ -97,23 +111,46 @@ GCは、次の段階を順に繰り返す。各段階は削除する主キーを
 5. revisionがなく、観測、予約、自動予約結果から参照されない期限超過`program_instances`
 6. 観測とprogram instanceを持たない期限超過`services`
 
-削除候補は時刻、主キーの昇順で選び、同じDB状態から同じ順序になるようにする。段階4で一つのinstanceに1,000件を
-超えるrevisionがある場合は、先頭batchだけを削除し、次回または次のbatchで続ける。instanceはrevisionが0件になるまで
-削除しない。
+削除候補は次の順で選び、同じDB状態から同じ結果になるようにする。
+
+| 段階 | 候補順 |
+|---:|---|
+| 1、2 | 親syncの`finished_at_utc_ms ASC, catalog_syncs.id ASC`、続いて観測`sequence ASC` |
+| 3 | `finished_at_utc_ms ASC, id ASC` |
+| 4 | 親instanceの`last_seen_at_utc_ms ASC, program_instances.id ASC`、続いて`revision_number ASC, program_revisions.id ASC` |
+| 5 | `last_seen_at_utc_ms ASC, id ASC` |
+| 6 | `last_seen_at_utc_ms ASC, id ASC` |
+
+`program_instances.last_seen_at_utc_ms`と`services.last_seen_at_utc_ms`は、観測を保存したsyncの
+`started_at_utc_ms`で更新される。段階4で一つのinstanceに1,000件を超えるrevisionがある場合は先頭batchだけを
+削除し、次回または次のbatchで続ける。instanceはrevisionが0件になるまで削除しない。
 
 一つの段階で候補が残っていても30秒に達したら終了する。次回は同じ照会から再開できるため、専用cursorや進捗行を
 永続化しない。
 
 ## Schema migration
 
-次のschema migrationを一つ追加する。
+唯一の追加migrationは`internal/adapters/sqlite/migrations/0014_catalog_retention.sql`とし、schema targetを14にする。
 
 - `program_revisions_no_delete` triggerを削除する。
 - `program_revisions_no_update` triggerは維持する。
-- `catalog_syncs(state, finished_at_utc_ms, id)`、`program_instances(last_seen_at_utc_ms, id)`、
-  `services(last_seen_at_utc_ms, id)`に加え、program／service観測と予約の参照確認に必要なGC用indexを追加する。
-- 既存indexで先頭列から同じ照会を支えられる場合は重複indexを追加しない。
+- 次のindexを追加する。実装名もここに固定する。
+
+| Index名 | Columns |
+|---|---|
+| `catalog_gc_sync_terminal_idx` | `catalog_syncs(state, finished_at_utc_ms, id)` |
+| `catalog_gc_program_instance_cutoff_idx` | `program_instances(last_seen_at_utc_ms, id)` |
+| `catalog_gc_service_cutoff_idx` | `services(last_seen_at_utc_ms, id)` |
+| `catalog_gc_program_observation_revision_idx` | `program_observations(program_revision_id, sequence)` |
+| `catalog_gc_program_observation_instance_idx` | `program_observations(program_instance_id, sequence)` |
+| `catalog_gc_service_observation_service_idx` | `service_observations(service_id, sequence)` |
+| `catalog_gc_reservation_revision_idx` | `reservations(program_revision_id, id)` |
+| `catalog_gc_reservation_instance_idx` | `reservations(program_instance_id, id)` |
+
+- 既存の先頭列が同じindexを変更または削除しない。`automatic_reservation_matches.program_instance_id`は既存の
+  unique indexを使う。
 - 既存行、schema migration履歴、予約、録画、backupを変更しない。
+- embedded migration manifestとschema 13の期待値を14へ更新し、file checksumと適用順を読み戻す。
 - migration後に`PRAGMA foreign_key_check`が空であることを確認する。
 
 既存のmigration contractに従い、空DBは全migrationを適用し、旧schemaからの更新は事前backupを必要とする。
@@ -153,6 +190,8 @@ GC結果は少なくとも次を持つ。
 - 参照のない期限超過program instance、revision、serviceだけを削除する。
 - 1,001件以上を複数batchで処理し、各transactionが1,000行を超えない。
 - 各段階の失敗と取消し後に再実行し、foreign key違反と二重削除を起こさない。
+- 6段階すべての候補SELECTが上記または既存の目的別indexを使い、対象tableを全走査しないことを
+  `EXPLAIN QUERY PLAN`で確認する。
 
 ### Migration
 
@@ -160,6 +199,7 @@ GC結果は少なくとも次を持つ。
 - migration後も番組表、予約、録画履歴、自動予約結果を読み戻せる。
 - revisionの更新は禁止されたままで、参照中revisionの削除はforeign keyにより拒否される。
 - 期限超過後に同じlocatorを再投入すると、新しいinstance、revision 1、`NEW_INSTANCE`になる。
+- migration manifest、file checksum、schema target 14、全8 indexを読み戻す。
 - 空DBへの全migrationと、旧binary用backupへの復元を確認する。
 
 ### Application and command
@@ -167,6 +207,7 @@ GC結果は少なくとも次を持つ。
 - `recording serve`と`catalog sync`だけが同期前にGCを呼ぶ。
 - GCの0件、部分完了、DB失敗の各結果後にcatalog取得を試行する。
 - 親context取消しではGC後に新しいprovider取得を開始しない。
+- 固定snapshotを使う通常要求が14秒以内に完了または取消しとなり、4回目の更新前に古い世代を読み終える。
 - GC logに番組、局、URL、path、生のerrorが含まれない。
 - 100回の合成同期後、観測行数が保持3世代分へ収束する。
 
