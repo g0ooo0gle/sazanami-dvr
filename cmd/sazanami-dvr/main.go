@@ -91,6 +91,17 @@ func runContext(ctx context.Context, arguments []string, stdout, stderr io.Write
 		}
 		return 0
 	}
+	if arguments[0] == "setup" {
+		if err := runSetupCommand(ctx, arguments[1:], stdout); err != nil {
+			if errors.Is(err, errSetupUsage) {
+				fmt.Fprintln(stderr, "使用方法: sazanami-dvr setup --mirakurun-url <url> [--data-root <dir>]")
+				return 2
+			}
+			fmt.Fprintf(stderr, "セットアップに失敗しました: %v\n", err)
+			return 1
+		}
+		return 0
+	}
 	if arguments[0] == "ctrlcmd" {
 		if len(arguments) < 2 || arguments[1] != "validate" && arguments[1] != "serve" {
 			fmt.Fprintln(stderr, "使用方法: sazanami-dvr ctrlcmd <validate|serve> --data-root <dir> --channel-map <file>")
@@ -114,7 +125,7 @@ func runContext(ctx context.Context, arguments []string, stdout, stderr io.Write
 		return 0
 	}
 	if arguments[0] != "db" || len(arguments) < 2 {
-		fmt.Fprintln(stderr, "使用方法: sazanami-dvr <catalog|ctrlcmd|db|recording|ui> ...")
+		fmt.Fprintln(stderr, "使用方法: sazanami-dvr <setup|catalog|ctrlcmd|db|recording|ui> ...")
 		return 2
 	}
 	if err := runDatabaseCommand(ctx, arguments[1], arguments[2:], stdout, stderr); err != nil {

@@ -17,6 +17,7 @@ import (
 
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/provider"
 	providerstream "github.com/g0ooo0gle/sazanami-dvr/internal/core/provider/stream"
+	"github.com/g0ooo0gle/sazanami-dvr/internal/mpegts"
 )
 
 type streamLimits struct {
@@ -25,6 +26,12 @@ type streamLimits struct {
 }
 
 var productionStreamLimits = streamLimits{connectHeader: 10 * time.Second, readIdle: 10 * time.Second}
+
+const (
+	probeDeadline  = 15 * time.Second
+	probeMaxBytes  = 1 << 20
+	probeReadBytes = 32 * 1024
+)
 
 // StreamAdapterはMirakurun互換のservice streamだけを開く専用HTTP clientを所有する。
 type StreamAdapter struct {
@@ -88,6 +95,119 @@ func (adapter *StreamAdapter) OpenStream(ctx context.Context, request providerst
 		!canonicalStreamServiceID(request.Target.Opaque) {
 		return nil, provider.NewFailure(provider.ReasonRejected, "stream-request-out-of-profile")
 	}
+	response, err := adapter.openServiceStream(ctx, request.Target.Opaque, "decode=1", 0)
+	if err != nil {
+		return nil, err
+	}
+	return &streamLease{
+		body: response.body, connection: response.connection, cancel: response.cancel, release: response.release,
+		idle: adapter.limits.readIdle, terminal: providerstream.Terminal{Reason: providerstream.TerminalActive},
+	}, nil
+}
+
+// ProbeTransportStreamIDはservice streamのPID 0からPATを一件だけ検証し、TSIDを返す。
+// Probeは通常の録画・ライブstreamと分離したdecode=0の短時間操作である。
+func (adapter *StreamAdapter) ProbeTransportStreamID(ctx context.Context, providerLocator string, serviceID uint16) (uint16, error) {
+	response, err := adapter.openServiceStream(ctx, providerLocator, "decode=0", probeDeadline)
+	if err != nil {
+		return 0, err
+	}
+	defer response.close()
+	if response.contentLength > probeMaxBytes {
+		return 0, provider.NewFailure(provider.ReasonOverLimit, "probe-content-length-over-limit")
+	}
+
+	var packetizer mpegts.Packetizer
+	var collector mpegts.PSICollector
+	var found *mpegts.PAT
+	buffer := make([]byte, probeReadBytes)
+	total := 0
+	for total < probeMaxBytes {
+		readBuffer := buffer
+		if remaining := probeMaxBytes - total; len(readBuffer) > remaining {
+			readBuffer = readBuffer[:remaining]
+		}
+		if err := response.connection.SetReadDeadline(time.Now().Add(response.idle)); err != nil {
+			return 0, provider.NewFailure(provider.ReasonUnavailable, "probe-read-deadline-failed")
+		}
+		read, readErr := response.body.Read(readBuffer)
+		if read < 0 || read > len(readBuffer) {
+			return 0, provider.NewFailure(provider.ReasonInternal, "probe-invalid-read-count")
+		}
+		total += read
+		if read > 0 {
+			feedErr := packetizer.Feed(readBuffer[:read], func(packet []byte) error {
+				if mpegts.PID(packet) != 0 || found != nil {
+					return nil
+				}
+				sections, sectionErr := collector.Feed(packet)
+				if sectionErr != nil {
+					return sectionErr
+				}
+				for _, section := range sections {
+					pat, parseErr := mpegts.ParsePAT(section)
+					if parseErr != nil {
+						return parseErr
+					}
+					if pat.ProgramNumber != serviceID {
+						return provider.NewFailure(provider.ReasonMalformed, "probe-service-id-mismatch")
+					}
+					value := pat
+					found = &value
+					break
+				}
+				return nil
+			})
+			if feedErr != nil {
+				return 0, probeParserFailure(feedErr)
+			}
+			if found != nil {
+				return found.TransportStreamID, nil
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return 0, provider.NewFailure(provider.ReasonEarlyEOF, "probe-pat-not-found")
+			}
+			return 0, classifyProbeReadFailure(response.ctx, readErr)
+		}
+		if read == 0 {
+			return 0, provider.NewFailure(provider.ReasonUnavailable, "probe-zero-progress")
+		}
+	}
+	return 0, provider.NewFailure(provider.ReasonOverLimit, "probe-byte-limit")
+}
+
+type streamResponse struct {
+	ctx           context.Context
+	body          io.ReadCloser
+	connection    net.Conn
+	cancel        context.CancelFunc
+	release       func()
+	idle          time.Duration
+	contentLength int64
+}
+
+func (response *streamResponse) close() {
+	if response == nil {
+		return
+	}
+	response.cancel()
+	_ = response.body.Close()
+	_ = response.connection.SetReadDeadline(time.Time{})
+	response.release()
+}
+
+func (adapter *StreamAdapter) openServiceStream(ctx context.Context, providerLocator, query string, deadline time.Duration) (*streamResponse, error) {
+	if adapter == nil || adapter.client == nil {
+		return nil, provider.NewFailure(provider.ReasonInternal, "nil-stream-adapter")
+	}
+	if err := provider.ContextFailure(ctx); err != nil {
+		return nil, err
+	}
+	if !canonicalStreamServiceID(providerLocator) {
+		return nil, provider.NewFailure(provider.ReasonRejected, "stream-request-out-of-profile")
+	}
 	adapter.mu.Lock()
 	if adapter.active >= adapter.maximumConcurrent {
 		adapter.mu.Unlock()
@@ -103,10 +223,16 @@ func (adapter *StreamAdapter) OpenStream(ctx context.Context, request providerst
 		adapter.mu.Unlock()
 	}
 
-	requestContext, cancel := context.WithCancel(ctx)
+	requestContext := ctx
+	var cancel context.CancelFunc
+	if deadline > 0 {
+		requestContext, cancel = context.WithTimeout(ctx, deadline)
+	} else {
+		requestContext, cancel = context.WithCancel(ctx)
+	}
 	endpoint := adapter.base
-	endpoint.Path = strings.TrimRight(adapter.base.Path, "/") + "/api/services/" + request.Target.Opaque + "/stream"
-	endpoint.RawQuery = "decode=1"
+	endpoint.Path = strings.TrimRight(adapter.base.Path, "/") + "/api/services/" + providerLocator + "/stream"
+	endpoint.RawQuery = query
 	httpRequest, err := http.NewRequestWithContext(requestContext, http.MethodGet, endpoint.String(), nil)
 	if err != nil {
 		cancel()
@@ -130,12 +256,12 @@ func (adapter *StreamAdapter) OpenStream(ctx context.Context, request providerst
 		release()
 		return nil, failure
 	}
-	if response.Body == nil {
+	if response == nil || response.Body == nil {
 		cancel()
 		release()
 		return nil, provider.NewFailure(provider.ReasonMalformed, "missing-stream-body")
 	}
-	fail := func(err error) (providerstream.Lease, error) {
+	fail := func(err error) (*streamResponse, error) {
 		_ = response.Body.Close()
 		cancel()
 		release()
@@ -157,10 +283,32 @@ func (adapter *StreamAdapter) OpenStream(ctx context.Context, request providerst
 	if streamConnection == nil {
 		return fail(provider.NewFailure(provider.ReasonInternal, "stream-connection-unavailable"))
 	}
-	return &streamLease{
-		body: response.Body, connection: streamConnection, cancel: cancel, release: release,
-		idle: adapter.limits.readIdle, terminal: providerstream.Terminal{Reason: providerstream.TerminalActive},
+	return &streamResponse{
+		ctx: requestContext, body: response.Body, connection: streamConnection, cancel: cancel, release: release,
+		idle: adapter.limits.readIdle, contentLength: response.ContentLength,
 	}, nil
+}
+
+func probeParserFailure(err error) error {
+	var providerFailure *provider.Failure
+	if errors.As(err, &providerFailure) {
+		return providerFailure
+	}
+	if errors.Is(err, mpegts.ErrSync) || errors.Is(err, mpegts.ErrPacket) || errors.Is(err, mpegts.ErrPSI) || errors.Is(err, mpegts.ErrSingleProgram) {
+		return provider.NewFailure(provider.ReasonMalformed, "probe-pat-invalid")
+	}
+	return provider.NewFailure(provider.ReasonInternal, "probe-parser-failed")
+}
+
+func classifyProbeReadFailure(ctx context.Context, err error) error {
+	if failure := provider.ContextFailure(ctx); failure != nil {
+		return failure
+	}
+	var netError net.Error
+	if errors.As(err, &netError) && netError.Timeout() {
+		return provider.NewFailure(provider.ReasonTimeout, "probe-read-timeout")
+	}
+	return provider.NewFailure(provider.ReasonUnavailable, "probe-read-failed")
 }
 
 // CloseIdleConnectionsは録画process終了時に再利用待ちのHTTP接続を閉じる。

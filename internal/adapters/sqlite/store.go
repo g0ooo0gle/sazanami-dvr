@@ -87,25 +87,29 @@ func OpenStore(ctx context.Context, dataRoot string) (*Store, error) {
 		}
 		return nil, fmt.Errorf("sqlite: schema state %s is not ready", inspection.State)
 	}
-	path := filepath.Join(dataRoot, databaseFilename)
-	reader, err := sqlitedriver.Open(buildReaderDSN(path))
+	store, err := openStorePools(ctx, dataRoot, writer, ownerLock)
 	if err != nil {
 		_ = writer.Close()
 		_ = releaseOwnerLock(ownerLock)
+		return nil, err
+	}
+	return store, nil
+}
+
+func openStorePools(ctx context.Context, dataRoot string, writer *sql.DB, ownerLock *os.File) (*Store, error) {
+	path := filepath.Join(dataRoot, databaseFilename)
+	reader, err := sqlitedriver.Open(buildReaderDSN(path))
+	if err != nil {
 		return nil, sanitize("open-reader", err)
 	}
 	reader.SetMaxOpenConns(4)
 	reader.SetMaxIdleConns(1)
 	if err := reader.PingContext(ctx); err != nil {
 		_ = reader.Close()
-		_ = writer.Close()
-		_ = releaseOwnerLock(ownerLock)
 		return nil, sanitize("ping-reader", err)
 	}
 	if err := verifyPragmas(ctx, reader, true); err != nil {
 		_ = reader.Close()
-		_ = writer.Close()
-		_ = releaseOwnerLock(ownerLock)
 		return nil, err
 	}
 	return &Store{writer: writer, reader: reader, root: dataRoot, ownerLock: ownerLock}, nil
