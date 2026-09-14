@@ -1279,13 +1279,13 @@ func TestEmbeddedMigrationChecksumAndLimits(t *testing.T) {
 
 func TestCurrentCatalogQueriesUseBoundedIndexes(t *testing.T) {
 	_, store := openMigratedStore(t)
-	assertQueryPlanUsesAny(t, store.reader, []string{"catalog_syncs_completed_backend_idx", "catalog_gc_sync_terminal_idx"}, `
-		SELECT id FROM catalog_syncs
+	assertQueryPlanUses(t, store.reader, "catalog_syncs_completed_backend_idx", `
+		SELECT id FROM catalog_syncs INDEXED BY catalog_syncs_completed_backend_idx
 		WHERE backend_instance_id=? AND state='COMPLETED'
 		ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1`, make([]byte, 16))
 	completedReferenceQuery := `
 		WITH current_sync AS (
-			SELECT id, started_at_utc_ms FROM catalog_syncs
+			SELECT id, started_at_utc_ms FROM catalog_syncs INDEXED BY catalog_syncs_completed_backend_idx
 			WHERE backend_instance_id=? AND state='COMPLETED'
 			ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1
 		)
@@ -1293,7 +1293,7 @@ func TestCurrentCatalogQueriesUseBoundedIndexes(t *testing.T) {
 		JOIN program_observations po ON po.sync_id=cs.id
 		JOIN program_revisions pr ON pr.id=po.program_revision_id
 		WHERE po.program_instance_id=? LIMIT 1`
-	assertQueryPlanUsesAny(t, store.reader, []string{"catalog_syncs_completed_backend_idx", "catalog_gc_sync_terminal_idx"}, completedReferenceQuery,
+	assertQueryPlanUses(t, store.reader, "catalog_syncs_completed_backend_idx", completedReferenceQuery,
 		make([]byte, 16), make([]byte, 16))
 	assertQueryPlanUses(t, store.reader, "program_observations_sync_instance_idx", completedReferenceQuery,
 		make([]byte, 16), make([]byte, 16))
@@ -1303,6 +1303,26 @@ func TestCurrentCatalogQueriesUseBoundedIndexes(t *testing.T) {
 	assertQueryPlanUses(t, store.reader, "sqlite_autoindex_program_revisions_2", `
 		SELECT COALESCE(MAX(revision_number), 0) + 1 FROM program_revisions
 		WHERE program_instance_id=?`, make([]byte, 16))
+	assertQueryPlanUses(t, store.reader, "catalog_syncs_completed_backend_idx", `
+		SELECT b.id FROM backend_instances b
+		WHERE b.id > ? AND EXISTS (
+			SELECT 1 FROM catalog_syncs AS cs INDEXED BY catalog_syncs_completed_backend_idx
+			WHERE cs.backend_instance_id=b.id AND cs.state='COMPLETED'
+		) ORDER BY b.id LIMIT ?`, make([]byte, 16), 16)
+	assertQueryPlanUses(t, store.reader, "catalog_syncs_completed_backend_idx", `
+		WITH current_sync AS (
+			SELECT id FROM catalog_syncs INDEXED BY catalog_syncs_completed_backend_idx
+			WHERE backend_instance_id=? AND state='COMPLETED'
+			ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1
+		)
+		SELECT po.program_instance_id, pr.id FROM program_observations po
+		JOIN current_sync cs ON cs.id=po.sync_id
+		JOIN program_revisions pr ON pr.id=po.program_revision_id
+		WHERE po.program_instance_id=? LIMIT 1`, make([]byte, 16), make([]byte, 16))
+	assertQueryPlanUses(t, store.reader, "catalog_syncs_completed_backend_idx", `
+		SELECT (SELECT id FROM catalog_syncs INDEXED BY catalog_syncs_completed_backend_idx
+			WHERE backend_instance_id=? AND state='COMPLETED'
+			ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1)`, make([]byte, 16))
 }
 
 func assertQueryPlanUses(t *testing.T, database *sql.DB, index, query string, arguments ...any) {

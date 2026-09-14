@@ -116,14 +116,15 @@ WITH candidate_syncs AS (
 	SELECT cs.id, cs.finished_at_utc_ms
 	FROM catalog_syncs AS cs INDEXED BY catalog_gc_sync_terminal_idx
 	WHERE cs.state IN ('COMPLETED', 'FAILED')
-	  AND (cs.state = 'FAILED' OR (
-		SELECT count(*)
+	  AND (cs.state = 'FAILED' OR EXISTS (
+		SELECT 1
 		FROM catalog_syncs AS newer INDEXED BY catalog_syncs_completed_backend_idx
 		WHERE newer.backend_instance_id = cs.backend_instance_id
 		  AND newer.state = 'COMPLETED'
 		  AND (newer.finished_at_utc_ms > cs.finished_at_utc_ms OR
 		       (newer.finished_at_utc_ms = cs.finished_at_utc_ms AND newer.id > cs.id))
-	  ) >= 3)
+		LIMIT 1 OFFSET 2
+	  ))
 	ORDER BY cs.finished_at_utc_ms ASC, cs.id ASC
 ), candidate AS (
 	SELECT po.sequence
@@ -141,14 +142,15 @@ WITH candidate_syncs AS (
 	SELECT cs.id, cs.finished_at_utc_ms
 	FROM catalog_syncs AS cs INDEXED BY catalog_gc_sync_terminal_idx
 	WHERE cs.state IN ('COMPLETED', 'FAILED')
-	  AND (cs.state = 'FAILED' OR (
-		SELECT count(*)
+	  AND (cs.state = 'FAILED' OR EXISTS (
+		SELECT 1
 		FROM catalog_syncs AS newer INDEXED BY catalog_syncs_completed_backend_idx
 		WHERE newer.backend_instance_id = cs.backend_instance_id
 		  AND newer.state = 'COMPLETED'
 		  AND (newer.finished_at_utc_ms > cs.finished_at_utc_ms OR
 		       (newer.finished_at_utc_ms = cs.finished_at_utc_ms AND newer.id > cs.id))
-	  ) >= 3)
+		LIMIT 1 OFFSET 2
+	  ))
 	ORDER BY cs.finished_at_utc_ms ASC, cs.id ASC
 ), candidate AS (
 	SELECT so.sequence
@@ -167,14 +169,15 @@ WITH candidate AS (
 	FROM catalog_syncs AS cs INDEXED BY catalog_gc_sync_terminal_idx
 	WHERE cs.state IN ('COMPLETED', 'FAILED')
 	  AND cs.finished_at_utc_ms < ?
-	  AND (cs.state = 'FAILED' OR (
-		SELECT count(*)
+	  AND (cs.state = 'FAILED' OR EXISTS (
+		SELECT 1
 		FROM catalog_syncs AS newer INDEXED BY catalog_syncs_completed_backend_idx
 		WHERE newer.backend_instance_id = cs.backend_instance_id
 		  AND newer.state = 'COMPLETED'
 		  AND (newer.finished_at_utc_ms > cs.finished_at_utc_ms OR
 		       (newer.finished_at_utc_ms = cs.finished_at_utc_ms AND newer.id > cs.id))
-	  ) >= 3)
+		LIMIT 1 OFFSET 2
+	  ))
 	  AND NOT EXISTS (
 		SELECT 1
 		FROM service_observations AS so INDEXED BY service_observations_sync_service_idx

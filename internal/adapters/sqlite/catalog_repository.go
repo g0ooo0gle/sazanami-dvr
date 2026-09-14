@@ -198,7 +198,7 @@ func (store *Store) ReconcileRunningSyncs(ctx context.Context, finishedAtMS int6
 // LatestCompletedGenerationは指定backendで最後に完了した番組表世代を返す。
 func (store *Store) LatestCompletedGeneration(ctx context.Context, backendID catalogmodel.ID) (catalogmodel.ID, error) {
 	var value []byte
-	err := store.reader.QueryRowContext(ctx, `SELECT id FROM catalog_syncs
+	err := store.reader.QueryRowContext(ctx, `SELECT id FROM catalog_syncs INDEXED BY catalog_syncs_completed_backend_idx
 		WHERE backend_instance_id=? AND state='COMPLETED'
 		ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1`, backendID.Bytes()).Scan(&value)
 	if err != nil {
@@ -339,7 +339,7 @@ func (store *Store) CurrentPrograms(ctx context.Context, backendID catalogmodel.
 	}
 	rows, err := store.reader.QueryContext(ctx, `
 		WITH current_sync AS (
-			SELECT id FROM catalog_syncs
+			SELECT id FROM catalog_syncs INDEXED BY catalog_syncs_completed_backend_idx
 			WHERE backend_instance_id=? AND state='COMPLETED'
 			ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1
 		)
@@ -368,7 +368,7 @@ func (store *Store) CurrentProgramsByService(ctx context.Context, backendID cata
 	}
 	rows, err := store.reader.QueryContext(ctx, `
 		WITH current_sync AS (
-			SELECT id FROM catalog_syncs
+			SELECT id FROM catalog_syncs INDEXED BY catalog_syncs_completed_backend_idx
 			WHERE backend_instance_id=? AND state='COMPLETED'
 			ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1
 		)
@@ -398,7 +398,7 @@ func (store *Store) CurrentProgramsForService(ctx context.Context, backendID cat
 	}
 	rows, err := store.reader.QueryContext(ctx, `
 		WITH current_sync AS (
-			SELECT id FROM catalog_syncs
+			SELECT id FROM catalog_syncs INDEXED BY catalog_syncs_completed_backend_idx
 			WHERE backend_instance_id=? AND state='COMPLETED'
 			ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1
 		)
@@ -427,7 +427,7 @@ func (store *Store) CurrentProgramsMatching(ctx context.Context, backendID catal
 	}
 	rows, err := store.reader.QueryContext(ctx, `
 		WITH current_sync AS (
-			SELECT id FROM catalog_syncs
+			SELECT id FROM catalog_syncs INDEXED BY catalog_syncs_completed_backend_idx
 			WHERE backend_instance_id=? AND state='COMPLETED'
 			ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1
 		)
@@ -457,7 +457,7 @@ func (store *Store) CurrentBackends(ctx context.Context, limit int, after catalo
 		SELECT b.id, b.provider_kind, b.reported_version, b.last_seen_at_utc_ms
 		FROM backend_instances b
 		WHERE b.id > ? AND EXISTS (
-			SELECT 1 FROM catalog_syncs cs
+			SELECT 1 FROM catalog_syncs AS cs INDEXED BY catalog_syncs_completed_backend_idx
 			WHERE cs.backend_instance_id=b.id AND cs.state='COMPLETED'
 		)
 		ORDER BY b.id LIMIT ?`, after.Bytes(), limit)
@@ -494,7 +494,7 @@ func (store *Store) CurrentServices(ctx context.Context, backendID catalogmodel.
 	}
 	rows, err := store.reader.QueryContext(ctx, `
 		WITH current_sync AS (
-			SELECT id FROM catalog_syncs
+			SELECT id FROM catalog_syncs INDEXED BY catalog_syncs_completed_backend_idx
 			WHERE backend_instance_id=? AND state='COMPLETED'
 			ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1
 		)
@@ -550,7 +550,7 @@ func (store *Store) CurrentProgramsInWindow(ctx context.Context, backendID catal
 	}
 	rows, err := store.reader.QueryContext(ctx, `
 		WITH current_sync AS (
-			SELECT id FROM catalog_syncs
+			SELECT id FROM catalog_syncs INDEXED BY catalog_syncs_completed_backend_idx
 			WHERE backend_instance_id=? AND state='COMPLETED'
 			ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1
 		)
@@ -837,7 +837,7 @@ func readCompletedProgramReference(ctx context.Context, tx *sql.Tx, backendID []
 	var validation string
 	err := tx.QueryRowContext(ctx, `
 		WITH current_sync AS (
-			SELECT id, started_at_utc_ms FROM catalog_syncs
+			SELECT id, started_at_utc_ms FROM catalog_syncs INDEXED BY catalog_syncs_completed_backend_idx
 			WHERE backend_instance_id=? AND state='COMPLETED'
 			ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1
 		)

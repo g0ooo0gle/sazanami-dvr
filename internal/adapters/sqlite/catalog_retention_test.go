@@ -326,6 +326,42 @@ func TestPruneCatalogBatchPreservesLatestThreeForEveryGenerationCount(t *testing
 	}
 }
 
+func TestPruneCatalogBatchBreaksLatestThreeTiesByID(t *testing.T) {
+	_, store := openMigratedStore(t)
+	backendID := retentionID(550)
+	insertRetentionBackend(t, store, backendID)
+	for index := 0; index < 4; index++ {
+		syncID := retentionID(uint64(551 + index))
+		insertRetentionSync(t, store, backendID, syncID, "COMPLETED", 9, 10)
+		insertRetentionProgramObservation(t, store, int64(7100+index), syncID, "tie-service", fmt.Sprintf("tie-event-%d", index), catalogmodel.ID{}, catalogmodel.ID{}, "INVALID")
+	}
+	pruneCatalogUntilEmpty(t, store, 0)
+
+	rows, err := store.reader.Query(`SELECT sequence FROM program_observations ORDER BY sequence`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for index, want := range []int64{7101, 7102, 7103} {
+		if !rows.Next() {
+			t.Fatalf("remaining tied observation %d is missing", index)
+		}
+		var got int64
+		if err := rows.Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("remaining tied observation %d sequence=%d want=%d", index, got, want)
+		}
+	}
+	if rows.Next() {
+		t.Fatal("tie-break前のobservationが残りました")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCatalogRetentionConvergesAfterOneHundredSyntheticSyncs(t *testing.T) {
 	_, store := openMigratedStore(t)
 	backendID := retentionID(600)
@@ -384,6 +420,80 @@ func TestCatalogRetentionConvergesAfterOneHundredSyntheticSyncs(t *testing.T) {
 		if len(finished) != 3 || finished[0] != 98 || finished[1] != 99 || finished[2] != 100 {
 			t.Fatalf("%s remaining syncs=%v", table, finished)
 		}
+	}
+}
+
+func TestPruneCatalogBatchBoundsLatestThreeCheckAtHighCardinality(t *testing.T) {
+	_, store := openMigratedStore(t)
+	const generationCount = 20_000
+	backendID := retentionID(20_000)
+	insertRetentionBackend(t, store, backendID)
+	tx, err := store.writer.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for generation := 1; generation <= generationCount; generation++ {
+		syncID := retentionID(uint64(20_000 + generation))
+		if _, err := tx.Exec(`INSERT INTO catalog_syncs
+			(id, backend_instance_id, state, started_at_utc_ms, finished_at_utc_ms, program_count, correlation_id)
+			VALUES (?, ?, 'COMPLETED', ?, ?, 1, ?)`, syncID.Bytes(), backendID.Bytes(), generation-1, generation, fmt.Sprintf("high-cardinality-%d", generation)); err != nil {
+			_ = tx.Rollback()
+			t.Fatal(err)
+		}
+		if generation == 1 || generation >= generationCount-2 {
+			if _, err := tx.Exec(`INSERT INTO program_observations
+				(sequence, sync_id, provider_service_locator, provider_event_locator, classification)
+				VALUES (?, ?, 'high-cardinality-service', 'high-cardinality-event', 'INVALID')`, generation, syncID.Bytes()); err != nil {
+				_ = tx.Rollback()
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := store.PruneCatalogBatch(ctx, 0)
+	if err != nil || result.ProgramObservationsDeleted != 1 || result.AllEmpty {
+		t.Fatalf("high-cardinality result=%+v err=%v", result, err)
+	}
+	var observations, syncs int
+	if err := store.reader.QueryRow(`SELECT count(*) FROM program_observations`).Scan(&observations); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.reader.QueryRow(`SELECT count(*) FROM catalog_syncs`).Scan(&syncs); err != nil {
+		t.Fatal(err)
+	}
+	if observations != 3 || syncs != generationCount {
+		t.Fatalf("high-cardinality observations=%d syncs=%d", observations, syncs)
+	}
+	rows, err := store.reader.Query(`SELECT cs.finished_at_utc_ms
+		FROM program_observations po
+		JOIN catalog_syncs cs ON cs.id=po.sync_id
+		ORDER BY cs.finished_at_utc_ms`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for index, want := range []int64{generationCount - 2, generationCount - 1, generationCount} {
+		if !rows.Next() {
+			t.Fatalf("remaining observation %d is missing", index)
+		}
+		var got int64
+		if err := rows.Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("remaining observation %d finished=%d want=%d", index, got, want)
+		}
+	}
+	if rows.Next() {
+		t.Fatal("latest3以外のobservationが残りました")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
 	}
 }
 
