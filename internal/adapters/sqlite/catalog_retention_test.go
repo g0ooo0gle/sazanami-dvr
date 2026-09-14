@@ -326,6 +326,67 @@ func TestPruneCatalogBatchPreservesLatestThreeForEveryGenerationCount(t *testing
 	}
 }
 
+func TestCatalogRetentionConvergesAfterOneHundredSyntheticSyncs(t *testing.T) {
+	_, store := openMigratedStore(t)
+	backendID := retentionID(600)
+	serviceID, instanceID, revisionID := retentionID(601), retentionID(602), retentionID(603)
+	insertRetentionBackend(t, store, backendID)
+	insertRetentionService(t, store, serviceID, backendID, "hundred-service", 1)
+	insertRetentionInstance(t, store, instanceID, serviceID, "hundred-event", 1)
+	insertRetentionRevision(t, store, revisionID, instanceID, 1, 1)
+	for generation := 1; generation <= 100; generation++ {
+		syncID := retentionID(uint64(610 + generation))
+		insertRetentionSync(t, store, backendID, syncID, "COMPLETED", int64(generation-1), int64(generation))
+		insertRetentionServiceObservation(t, store, int64(1000+generation), syncID, serviceID)
+		insertRetentionProgramObservation(t, store, int64(2000+generation), syncID, "hundred-service", "hundred-event", instanceID, revisionID, "SAME_CONTENT")
+	}
+
+	pruneCatalogUntilEmpty(t, store, 0)
+
+	var programObservations, serviceObservations, syncs int
+	if err := store.reader.QueryRow(`SELECT count(*) FROM program_observations`).Scan(&programObservations); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.reader.QueryRow(`SELECT count(*) FROM service_observations`).Scan(&serviceObservations); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.reader.QueryRow(`SELECT count(*) FROM catalog_syncs`).Scan(&syncs); err != nil {
+		t.Fatal(err)
+	}
+	if programObservations != 3 || serviceObservations != 3 || syncs != 100 {
+		t.Fatalf("observations program=%d service=%d syncs=%d", programObservations, serviceObservations, syncs)
+	}
+
+	for _, table := range []string{"program_observations", "service_observations"} {
+		rows, err := store.reader.Query(fmt.Sprintf(`SELECT DISTINCT cs.finished_at_utc_ms
+			FROM %s AS observations
+			JOIN catalog_syncs AS cs ON cs.id=observations.sync_id
+			ORDER BY cs.finished_at_utc_ms`, table))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var finished []int64
+		for rows.Next() {
+			var value int64
+			if err := rows.Scan(&value); err != nil {
+				_ = rows.Close()
+				t.Fatal(err)
+			}
+			finished = append(finished, value)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			t.Fatal(err)
+		}
+		if err := rows.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if len(finished) != 3 || finished[0] != 98 || finished[1] != 99 || finished[2] != 100 {
+			t.Fatalf("%s remaining syncs=%v", table, finished)
+		}
+	}
+}
+
 func TestPruneCatalogBatchUsesStrictCutoffForSummariesInstancesAndServices(t *testing.T) {
 	_, store := openMigratedStore(t)
 	backendID := retentionID(340)
