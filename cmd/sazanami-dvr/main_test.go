@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -24,6 +25,7 @@ import (
 	recordinghttpadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/recordinghttp"
 	sqliteadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/sqlite"
 	webuiadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/webui"
+	"github.com/g0ooo0gle/sazanami-dvr/internal/app/cataloggc"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/app/catalogsync"
 	ctrlcmdapp "github.com/g0ooo0gle/sazanami-dvr/internal/app/ctrlcmd"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/catalogmodel"
@@ -815,7 +817,10 @@ func TestMirakurunCatalogSyncIsExplicitRedactedAndVisibleInUI(t *testing.T) {
 	if code := run(arguments, &output, &diagnostic); code != 0 {
 		t.Fatalf("sync code=%d out=%q err=%q", code, output.String(), diagnostic.String())
 	}
-	if calls.Load() != 3 || !strings.Contains(output.String(), "result=completed services=1 programs=1") {
+	gcPosition := strings.Index(output.String(), "catalog_gc ")
+	refreshPosition := strings.Index(output.String(), "backend_id=")
+	if calls.Load() != 3 || !strings.Contains(output.String(), "result=completed services=1 programs=1") ||
+		gcPosition < 0 || refreshPosition < 0 || gcPosition > refreshPosition {
 		t.Fatalf("calls=%d output=%q", calls.Load(), output.String())
 	}
 	for _, secret := range []string{baseURL, root, "/private", privateTitle} {
@@ -899,6 +904,80 @@ func TestMirakurunCatalogSyncIsExplicitRedactedAndVisibleInUI(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("UI graceful shutdown timed out")
 	}
+}
+
+func TestCatalogSyncContinuesAfterGCOutcomeAndSkipsProviderOnCancellation(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		result cataloggc.Result
+		err    error
+	}{
+		{name: "zero", result: cataloggc.Result{Completed: true}},
+		{name: "partial", result: cataloggc.Result{More: true}},
+		{name: "database failure", err: errors.New("private sqlite path /private/catalog.sqlite3")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := migratedRoot(t)
+			var providerBeforeGC atomic.Bool
+			var gcFinished atomic.Bool
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				calls.Add(1)
+				if !gcFinished.Load() {
+					providerBeforeGC.Store(true)
+				}
+				switch request.URL.Path {
+				case "/api/version":
+					writeCommandJSON(writer, `{"current":"test","latest":"test"}`)
+				case "/api/services":
+					writeCommandJSON(writer, `[{"id":100003,"networkId":1,"serviceId":3,"name":"test","type":1}]`)
+				case "/api/programs":
+					writeCommandJSON(writer, `[{"id":10000300004,"networkId":1,"serviceId":3,"eventId":4,"startAt":1786237200000,"duration":1800000,"isFree":true,"name":"test","description":""}]`)
+				default:
+					http.NotFound(writer, request)
+				}
+			}))
+			defer server.Close()
+
+			var output, diagnostic bytes.Buffer
+			runGC := func(context.Context, *sqliteadapter.Store, cataloggc.Clock) (cataloggc.Result, error) {
+				gcFinished.Store(true)
+				return test.result, test.err
+			}
+			arguments := []string{"--data-root", root, "--provider", "mirakurun", "--base-url", server.URL}
+			if err := runCatalogSyncCommandWithGC(context.Background(), arguments, &output, &diagnostic, runGC); err != nil {
+				t.Fatalf("error=%v output=%q diagnostic=%q", err, output.String(), diagnostic.String())
+			}
+			if calls.Load() != 3 || providerBeforeGC.Load() {
+				t.Fatalf("provider calls=%d beforeGC=%v", calls.Load(), providerBeforeGC.Load())
+			}
+			if strings.Contains(output.String(), "private sqlite") || strings.Contains(diagnostic.String(), "private sqlite") {
+				t.Fatalf("raw GC error leaked: output=%q diagnostic=%q", output.String(), diagnostic.String())
+			}
+		})
+	}
+
+	t.Run("parent cancellation", func(t *testing.T) {
+		root := migratedRoot(t)
+		var calls atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			calls.Add(1)
+			writeCommandJSON(writer, `{}`)
+		}))
+		defer server.Close()
+		parent, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		runGC := func(context.Context, *sqliteadapter.Store, cataloggc.Clock) (cataloggc.Result, error) {
+			cancel()
+			return cataloggc.Result{}, context.Canceled
+		}
+		arguments := []string{"--data-root", root, "--provider", "mirakurun", "--base-url", server.URL}
+		var output, diagnostic bytes.Buffer
+		err := runCatalogSyncCommandWithGC(parent, arguments, &output, &diagnostic, runGC)
+		if err == nil || err.Error() != "catalog-sync-canceled" || calls.Load() != 0 {
+			t.Fatalf("error=%v provider calls=%d output=%q diagnostic=%q", err, calls.Load(), output.String(), diagnostic.String())
+		}
+	})
 }
 
 func writeCommandJSON(writer http.ResponseWriter, body string) {

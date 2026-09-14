@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	mirakurunadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/provider/mirakurun"
 	sqliteadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/sqlite"
 	autoreservationapp "github.com/g0ooo0gle/sazanami-dvr/internal/app/autoreservation"
+	"github.com/g0ooo0gle/sazanami-dvr/internal/app/cataloggc"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/app/catalogrefresh"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/app/catalogsync"
 	recordingapp "github.com/g0ooo0gle/sazanami-dvr/internal/app/recording"
@@ -40,8 +42,14 @@ func TestRecordingCatalogRefreshPublishesOnlyValidatedGeneration(t *testing.T) {
 		fail    bool
 		paths   []string
 	}
+	var providerBeforeGC atomic.Bool
+	var checkGCOrdering atomic.Bool
+	var gcCalls atomic.Int32
 	state.service, state.title = "更新前の局", "更新前の番組"
 	providerServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if checkGCOrdering.Load() && gcCalls.Load() == 0 {
+			providerBeforeGC.Store(true)
+		}
 		state.Lock()
 		defer state.Unlock()
 		state.paths = append(state.paths, request.URL.Path)
@@ -110,6 +118,10 @@ func TestRecordingCatalogRefreshPublishesOnlyValidatedGeneration(t *testing.T) {
 	observedAutomaticError := false
 	operation := &recordingCatalogRefresh{
 		dataRoot: root, channelMap: channelMap, provider: provider, store: store, holder: holder, clock: wallClock{},
+		gc: func(context.Context) (cataloggc.Result, error) {
+			gcCalls.Add(1)
+			return cataloggc.Result{}, errors.New("private gc failure")
+		},
 		follow: func(context.Context) (recordingapp.FollowResult, error) {
 			followCalls++
 			return recordingapp.FollowResult{}, nil
@@ -122,11 +134,37 @@ func TestRecordingCatalogRefreshPublishesOnlyValidatedGeneration(t *testing.T) {
 			observedAutomaticError = err != nil
 		},
 	}
+	checkGCOrdering.Store(true)
 	result, reason, err := operation.sync(context.Background())
 	if err != nil || reason != "" || result.Services != 1 || result.Programs != 1 || holder.Load() == initial ||
 		followCalls != 1 || automaticCalls != 1 || !observedAutomaticError {
 		t.Fatalf("result=%+v reason=%q switched=%v follows=%d automatic=%d observed=%v err=%v",
 			result, reason, holder.Load() != initial, followCalls, automaticCalls, observedAutomaticError, err)
+	}
+	if gcCalls.Load() != 1 || providerBeforeGC.Load() {
+		t.Fatalf("gcCalls=%d providerBeforeGC=%v", gcCalls.Load(), providerBeforeGC.Load())
+	}
+	state.Lock()
+	providerCallsBeforeCancel := len(state.paths)
+	state.Unlock()
+	cancelled, cancel := context.WithCancel(context.Background())
+	operation.gc = func(context.Context) (cataloggc.Result, error) {
+		gcCalls.Add(1)
+		cancel()
+		return cataloggc.Result{}, nil
+	}
+	if _, reason, err := operation.sync(cancelled); !errors.Is(err, context.Canceled) || reason != "catalog-refresh-canceled" {
+		t.Fatalf("cancelled refresh reason=%q err=%v", reason, err)
+	}
+	state.Lock()
+	providerCallsAfterCancel := len(state.paths)
+	state.Unlock()
+	if providerCallsAfterCancel != providerCallsBeforeCancel {
+		t.Fatalf("provider calls after GC cancellation before=%d after=%d", providerCallsBeforeCancel, providerCallsAfterCancel)
+	}
+	operation.gc = func(context.Context) (cataloggc.Result, error) {
+		gcCalls.Add(1)
+		return cataloggc.Result{}, errors.New("private gc failure")
 	}
 	operation.automatic = nil
 	value, err := holder.Load().Current(context.Background())
@@ -171,6 +209,9 @@ func TestRecordingCatalogRefreshPublishesOnlyValidatedGeneration(t *testing.T) {
 			t.Fatalf("cycle=%d reason=%q switched=%v err=%v", cycle+1, reason, holder.Load() != previous, err)
 		}
 		previous = holder.Load()
+	}
+	if gcCalls.Load() != 104 {
+		t.Fatalf("gc calls=%d want=104", gcCalls.Load())
 	}
 	if followCalls != 101 {
 		t.Fatalf("follow calls=%d", followCalls)

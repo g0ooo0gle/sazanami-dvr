@@ -27,6 +27,7 @@ import (
 	sqliteadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/sqlite"
 	webuiadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/webui"
 	autoreservationapp "github.com/g0ooo0gle/sazanami-dvr/internal/app/autoreservation"
+	"github.com/g0ooo0gle/sazanami-dvr/internal/app/cataloggc"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/app/catalogrefresh"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/app/catalogsync"
 	ctrlcmdapp "github.com/g0ooo0gle/sazanami-dvr/internal/app/ctrlcmd"
@@ -347,6 +348,7 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 	refreshOperation := &recordingCatalogRefresh{
 		dataRoot: *dataRoot, channelMap: *channelMap, provider: catalogAdapter,
 		store: store, holder: snapshots, clock: clock,
+		gc: newCatalogGC(store, clock), observeGC: observeCatalogGC(stdout, stderr),
 		follow: (recordingapp.FollowService{
 			Store: store, Clock: recordingClock, ExtensionOnly: *followExtensionOnly, OnUpdated: scheduler.Notify,
 		}).Run,
@@ -601,6 +603,12 @@ func validateCtrlCmdListen(config ctrlcmdapp.Config) error {
 }
 
 func runCatalogSyncCommand(ctx context.Context, arguments []string, stdout, stderr io.Writer) error {
+	return runCatalogSyncCommandWithGC(ctx, arguments, stdout, stderr, nil)
+}
+
+func runCatalogSyncCommandWithGC(ctx context.Context, arguments []string, stdout, stderr io.Writer,
+	runGC catalogGCRunner,
+) error {
 	flags := flag.NewFlagSet("catalog sync", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	dataRoot := flags.String("data-root", "", "owner-onlyのデータディレクトリ")
@@ -626,6 +634,16 @@ func runCatalogSyncCommand(ctx context.Context, arguments []string, stdout, stde
 	clock := wallClock{}
 	if _, err := (catalogsync.RecoveryService{Repository: store, Clock: clock}).Reconcile(syncContext); err != nil {
 		return errorsStable("startup-recovery-failed")
+	}
+	if runGC == nil {
+		runGC = func(gcContext context.Context, gcStore *sqliteadapter.Store, gcClock cataloggc.Clock) (cataloggc.Result, error) {
+			return newCatalogGC(gcStore, gcClock)(gcContext)
+		}
+	}
+	gcResult, gcErr := runGC(syncContext, store, clock)
+	observeCatalogGC(stdout, stderr)(gcResult, gcErr)
+	if syncContext.Err() != nil {
+		return errorsStable("catalog-sync-canceled")
 	}
 	adapter, err := mirakurunadapter.New(*baseURL)
 	if err != nil {
