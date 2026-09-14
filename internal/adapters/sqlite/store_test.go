@@ -1320,19 +1320,55 @@ func assertQueryPlanUsesAny(t *testing.T, database *sql.DB, indexes []string, qu
 	t.Fatalf("query planがindex %vを使いませんでした: %s", indexes, details)
 }
 
+func assertQueryPlanUsesAll(t *testing.T, database *sql.DB, indexes []string, query string, arguments ...any) {
+	t.Helper()
+	details := queryPlanDetails(t, database, query, arguments...)
+	for _, index := range indexes {
+		if !strings.Contains(details, index) {
+			t.Fatalf("query planがindex %sを使いませんでした: %s", index, details)
+		}
+	}
+}
+
 func assertQueryPlanHasNoTableScan(t *testing.T, database *sql.DB, tables []string, query string, arguments ...any) {
 	t.Helper()
 	details := queryPlanDetails(t, database, query, arguments...)
+	relevant := make(map[string]struct{}, len(tables))
+	for _, table := range tables {
+		relevant[table] = struct{}{}
+	}
 	for _, line := range strings.Split(details, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 2 || fields[0] != "SCAN" {
 			continue
 		}
-		for _, table := range tables {
-			if fields[1] == table {
-				t.Fatalf("query planがtable %sを全走査しました: %s", table, details)
-			}
+		relation := queryPlanRelationName(fields[1])
+		if _, ok := relevant[relation]; ok {
+			t.Fatalf("query planがtable %s（plan relation %s）を全走査しました: %s", relation, fields[1], details)
 		}
+	}
+}
+
+func queryPlanRelationName(name string) string {
+	switch name {
+	case "cs", "newer":
+		return "catalog_syncs"
+	case "po":
+		return "program_observations"
+	case "so":
+		return "service_observations"
+	case "pi":
+		return "program_instances"
+	case "pr", "referenced":
+		return "program_revisions"
+	case "r":
+		return "reservations"
+	case "arm":
+		return "automatic_reservation_matches"
+	case "s":
+		return "services"
+	default:
+		return name
 	}
 }
 

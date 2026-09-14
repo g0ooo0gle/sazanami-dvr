@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -46,22 +48,49 @@ func TestCatalogRetentionMigratesSchema13To14(t *testing.T) {
 		t.Fatalf("revision triggers delete=%d update=%d", deleteTrigger, updateTrigger)
 	}
 
-	for _, index := range []string{
-		"catalog_gc_sync_terminal_idx",
-		"catalog_gc_program_instance_cutoff_idx",
-		"catalog_gc_service_cutoff_idx",
-		"catalog_gc_program_observation_revision_idx",
-		"catalog_gc_program_observation_instance_idx",
-		"catalog_gc_service_observation_service_idx",
-		"catalog_gc_reservation_revision_idx",
-		"catalog_gc_reservation_instance_idx",
-	} {
-		var count int
-		if err := store.reader.QueryRow(`SELECT count(*) FROM sqlite_schema WHERE type='index' AND name=?`, index).Scan(&count); err != nil {
+	wantIndexes := map[string][]string{
+		"catalog_gc_sync_terminal_idx":                {"state", "finished_at_utc_ms", "id"},
+		"catalog_gc_program_instance_cutoff_idx":      {"last_seen_at_utc_ms", "id"},
+		"catalog_gc_service_cutoff_idx":               {"last_seen_at_utc_ms", "id"},
+		"catalog_gc_program_observation_revision_idx": {"program_revision_id", "sequence"},
+		"catalog_gc_program_observation_instance_idx": {"program_instance_id", "sequence"},
+		"catalog_gc_service_observation_service_idx":  {"service_id", "sequence"},
+		"catalog_gc_reservation_revision_idx":         {"program_revision_id", "id"},
+		"catalog_gc_reservation_instance_idx":         {"program_instance_id", "id"},
+	}
+	for index, wantColumns := range wantIndexes {
+		rows, err := store.reader.Query(`SELECT seqno, name FROM pragma_index_info(?) ORDER BY seqno`, index)
+		if err != nil {
 			t.Fatal(err)
 		}
-		if count != 1 {
-			t.Fatalf("index %s count=%d", index, count)
+		var gotColumns []string
+		for rows.Next() {
+			var seq int
+			var name string
+			if err := rows.Scan(&seq, &name); err != nil {
+				_ = rows.Close()
+				t.Fatal(err)
+			}
+			if seq != len(gotColumns) {
+				_ = rows.Close()
+				t.Fatalf("index %s sequence=%d want=%d", index, seq, len(gotColumns))
+			}
+			gotColumns = append(gotColumns, name)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			t.Fatal(err)
+		}
+		if err := rows.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if len(gotColumns) != len(wantColumns) {
+			t.Fatalf("index %s columns=%v want=%v", index, gotColumns, wantColumns)
+		}
+		for column, want := range wantColumns {
+			if gotColumns[column] != want {
+				t.Fatalf("index %s column %d=%s want=%s", index, column, gotColumns[column], want)
+			}
 		}
 	}
 }
@@ -426,7 +455,7 @@ func TestPruneCatalogBatchRollsBackOnFailureAndConvergesAfterRetry(t *testing.T)
 	insertRetentionInstance(t, store, instanceID, serviceID, "retry-event", 1)
 	insertRetentionServiceObservation(t, store, 421, syncID, serviceID)
 	if _, err := store.writer.Exec(`CREATE TRIGGER retention_test_abort_service
-		BEFORE DELETE ON service_observations
+		AFTER DELETE ON service_observations
 		BEGIN SELECT RAISE(ABORT, 'retry'); END`); err != nil {
 		t.Fatal(err)
 	}
@@ -461,6 +490,41 @@ func TestPruneCatalogBatchCancellationLeavesRowsForRetry(t *testing.T) {
 	if _, err := store.PruneCatalogBatch(ctx, 100); err == nil {
 		t.Fatal("cancel済みcontextのGCが成功しました")
 	}
+	var count int
+	if err := store.reader.QueryRow(`SELECT count(*) FROM program_observations`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("cancel後のobservations=%d err=%v", count, err)
+	}
+	result, err := store.PruneCatalogBatch(context.Background(), 100)
+	if err != nil || result.ProgramObservationsDeleted != 1 {
+		t.Fatalf("retry result=%+v err=%v", result, err)
+	}
+}
+
+func TestCommitCatalogPruneCancellationAfterWorkRollsBack(t *testing.T) {
+	_, store := openMigratedStore(t)
+	backendID, syncID := retentionID(435), retentionID(436)
+	insertRetentionBackend(t, store, backendID)
+	insertRetentionSync(t, store, backendID, syncID, "FAILED", 1, 1)
+	insertRetentionProgramObservation(t, store, 436, syncID, "cancel-after-work-service", "cancel-after-work-event", catalogmodel.ID{}, catalogmodel.ID{}, "INVALID")
+
+	tx, err := store.writer.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := pruneCatalogRows(context.Background(), tx, pruneProgramObservationsSQL)
+	if err != nil || deleted != 1 {
+		_ = tx.Rollback()
+		t.Fatalf("transaction内の削除=%d err=%v", deleted, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := commitCatalogPrune(ctx, tx, CatalogPruneResult{ProgramObservationsDeleted: deleted}); err == nil {
+		t.Fatal("作業後cancel済みcontextのcommitが成功しました")
+	}
+	if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+		t.Fatal(err)
+	}
+
 	var count int
 	if err := store.reader.QueryRow(`SELECT count(*) FROM program_observations`).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("cancel後のobservations=%d err=%v", count, err)
@@ -528,19 +592,19 @@ func TestPruneCatalogBatchCandidateQueryPlansUseRetentionIndexes(t *testing.T) {
 		tables  []string
 	}{
 		{name: "program observations", query: pruneProgramObservationsSQL,
-			indexes: []string{"catalog_gc_sync_terminal_idx", "program_observations_sync_instance_idx", "catalog_syncs_completed_backend_idx"},
+			indexes: []string{"catalog_gc_sync_terminal_idx", "catalog_syncs_completed_backend_idx", "program_observations_sync_instance_idx"},
 			tables:  []string{"catalog_syncs", "program_observations"}},
 		{name: "service observations", query: pruneServiceObservationsSQL,
-			indexes: []string{"catalog_gc_sync_terminal_idx", "service_observations_sync_service_idx", "catalog_syncs_completed_backend_idx"},
+			indexes: []string{"catalog_gc_sync_terminal_idx", "catalog_syncs_completed_backend_idx", "service_observations_sync_service_idx"},
 			tables:  []string{"catalog_syncs", "service_observations"}},
 		{name: "catalog syncs", query: pruneCatalogSyncsSQL, args: []any{100},
-			indexes: []string{"catalog_gc_sync_terminal_idx", "service_observations_sync_service_idx", "program_observations_sync_instance_idx", "catalog_syncs_completed_backend_idx"},
+			indexes: []string{"catalog_gc_sync_terminal_idx", "catalog_syncs_completed_backend_idx", "service_observations_sync_service_idx", "program_observations_sync_instance_idx"},
 			tables:  []string{"catalog_syncs", "service_observations", "program_observations"}},
 		{name: "program revisions", query: pruneProgramRevisionsSQL, args: []any{100},
-			indexes: []string{"catalog_gc_program_instance_cutoff_idx", "catalog_gc_program_observation_instance_idx", "catalog_gc_program_observation_revision_idx", "catalog_gc_reservation_instance_idx", "catalog_gc_reservation_revision_idx", "program_revisions_instance_number_idx"},
+			indexes: []string{"catalog_gc_program_instance_cutoff_idx", "program_revisions_instance_number_idx", "catalog_gc_program_observation_instance_idx", "catalog_gc_program_observation_revision_idx", "catalog_gc_reservation_instance_idx", "catalog_gc_reservation_revision_idx", "sqlite_autoindex_automatic_reservation_matches_1"},
 			tables:  []string{"program_instances", "program_revisions", "program_observations", "reservations", "automatic_reservation_matches"}},
 		{name: "program instances", query: pruneProgramInstancesSQL, args: []any{100},
-			indexes: []string{"catalog_gc_program_instance_cutoff_idx", "program_revisions_instance_number_idx", "catalog_gc_program_observation_instance_idx", "catalog_gc_reservation_instance_idx"},
+			indexes: []string{"catalog_gc_program_instance_cutoff_idx", "program_revisions_instance_number_idx", "catalog_gc_program_observation_instance_idx", "catalog_gc_reservation_instance_idx", "sqlite_autoindex_automatic_reservation_matches_1"},
 			tables:  []string{"program_instances", "program_revisions", "program_observations", "reservations", "automatic_reservation_matches"}},
 		{name: "services", query: pruneServicesSQL, args: []any{100},
 			indexes: []string{"catalog_gc_service_cutoff_idx", "catalog_gc_service_observation_service_idx", "program_instances_service_event_idx"},
@@ -548,7 +612,7 @@ func TestPruneCatalogBatchCandidateQueryPlansUseRetentionIndexes(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			assertQueryPlanUsesAny(t, store.reader, test.indexes, test.query, test.args...)
+			assertQueryPlanUsesAll(t, store.reader, test.indexes, test.query, test.args...)
 			assertQueryPlanHasNoTableScan(t, store.reader, test.tables, test.query, test.args...)
 		})
 	}
