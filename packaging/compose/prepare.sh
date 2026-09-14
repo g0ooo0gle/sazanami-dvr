@@ -67,4 +67,4 @@ if [ ! -e "$base_dir/config/konomitv.yaml" ]; then
     chmod 0600 "$base_dir/config/konomitv.yaml"
 fi
 
-printf '%s\n' '準備が完了しました。channels.jsonと接続先を設定してから明示DB操作を実行してください。'
+printf '%s\n' '準備が完了しました。.envのMIRAKURUN_URLを確認し、次に導入ガイドのsetupコマンドを実行してください。'

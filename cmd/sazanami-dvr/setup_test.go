@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -23,6 +24,17 @@ func TestSetupCreatesAndReusesChannelMapFromMirakurunURL(t *testing.T) {
 	startMS := time.Now().UTC().Add(time.Hour).UnixMilli()
 	var servicesCalls atomic.Int32
 	var streamCalls atomic.Int32
+	var probeMu sync.Mutex
+	var probeOrder []string
+	probeTargets := map[string]struct {
+		transportStreamID uint16
+		serviceID         uint16
+	}{
+		"100003": {transportStreamID: 11, serviceID: 3},
+		"100004": {transportStreamID: 12, serviceID: 4},
+		"200005": {transportStreamID: 13, serviceID: 5},
+		"300006": {transportStreamID: 14, serviceID: 6},
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/api/version":
@@ -30,22 +42,37 @@ func TestSetupCreatesAndReusesChannelMapFromMirakurunURL(t *testing.T) {
 		case "/api/services":
 			servicesCalls.Add(1)
 			writeCommandJSON(writer, `[`+
-				`{"id":100003,"networkId":1,"serviceId":3,"name":"private station","type":1},`+
-				`{"id":100004,"networkId":1,"serviceId":4,"name":"excluded radio","type":192}`+
+				`{"id":300006,"networkId":3,"serviceId":6,"name":"a1 station","type":161},`+
+				`{"id":400007,"networkId":4,"serviceId":7,"name":"excluded 4k","type":173},`+
+				`{"id":100004,"networkId":1,"serviceId":4,"name":"bs station","type":2,"remoteControlKeyId":4},`+
+				`{"id":100003,"networkId":1,"serviceId":3,"name":"gr station","type":1,"remoteControlKeyId":3},`+
+				`{"id":200005,"networkId":2,"serviceId":5,"name":"cs station","type":162,"remoteControlKeyId":5}`+
 				`]`)
 		case "/api/programs":
 			writeCommandJSON(writer, fmt.Sprintf(`[{"id":10000300005,"networkId":1,"serviceId":3,"eventId":5,"startAt":%d,"duration":1800000,"isFree":true,"name":"private program","description":""}]`, startMS))
-		case "/api/services/100003/stream":
+		default:
+			const streamPrefix = "/api/services/"
+			if !strings.HasPrefix(request.URL.Path, streamPrefix) || !strings.HasSuffix(request.URL.Path, "/stream") {
+				http.NotFound(writer, request)
+				return
+			}
+			locator := strings.TrimSuffix(strings.TrimPrefix(request.URL.Path, streamPrefix), "/stream")
+			target, ok := probeTargets[locator]
+			if !ok {
+				http.NotFound(writer, request)
+				return
+			}
 			streamCalls.Add(1)
+			probeMu.Lock()
+			probeOrder = append(probeOrder, locator)
+			probeMu.Unlock()
 			if request.URL.RawQuery != "decode=0" || request.Header.Get("Accept") != "video/MP2T" ||
 				request.Header.Get("X-Mirakurun-Priority") != "0" {
 				http.Error(writer, "bad request", http.StatusBadRequest)
 				return
 			}
 			writer.Header().Set("Content-Type", "video/MP2T")
-			_, _ = writer.Write(setupPAT(2, 3))
-		default:
-			http.NotFound(writer, request)
+			_, _ = writer.Write(setupPAT(target.transportStreamID, target.serviceID))
 		}
 	}))
 	defer server.Close()
@@ -56,17 +83,24 @@ func TestSetupCreatesAndReusesChannelMapFromMirakurunURL(t *testing.T) {
 		if code := runContext(context.Background(), arguments, &output, &diagnostic); code != 0 {
 			t.Fatalf("run %d code=%d output=%q diagnostic=%q", runIndex, code, output.String(), diagnostic.String())
 		}
-		if output.String() != "setup result=completed services=1 channel_map="+expectedState+"\n" {
+		if output.String() != "setup result=completed services=4 channel_map="+expectedState+"\n" {
 			t.Fatalf("run %d output=%q", runIndex, output.String())
 		}
-		for _, private := range []string{server.URL, root, "private station", "private program"} {
+		for _, private := range []string{server.URL, root, "gr station", "bs station", "cs station", "a1 station", "excluded 4k", "private program"} {
 			if strings.Contains(output.String(), private) || strings.Contains(diagnostic.String(), private) {
 				t.Fatalf("run %d leaked %q: output=%q diagnostic=%q", runIndex, private, output.String(), diagnostic.String())
 			}
 		}
 	}
-	if servicesCalls.Load() != 4 || streamCalls.Load() != 2 {
+	if servicesCalls.Load() != 4 || streamCalls.Load() != 8 {
 		t.Fatalf("services calls=%d stream calls=%d", servicesCalls.Load(), streamCalls.Load())
+	}
+	probeMu.Lock()
+	gotProbeOrder := append([]string(nil), probeOrder...)
+	probeMu.Unlock()
+	wantProbeOrder := []string{"100003", "100004", "200005", "300006", "100003", "100004", "200005", "300006"}
+	if fmt.Sprint(gotProbeOrder) != fmt.Sprint(wantProbeOrder) {
+		t.Fatalf("probe order=%v want=%v", gotProbeOrder, wantProbeOrder)
 	}
 
 	path := filepath.Join(root, "channels.json")
@@ -93,19 +127,41 @@ func TestSetupCreatesAndReusesChannelMapFromMirakurunURL(t *testing.T) {
 	if err := json.Unmarshal(data, &document); err != nil {
 		t.Fatal(err)
 	}
-	if document.Format != "sazanami-channel-map-v1" || len(document.Services) != 1 {
+	if document.Format != "sazanami-channel-map-v1" || len(document.Services) != 4 {
 		t.Fatalf("document=%+v", document)
 	}
-	service := document.Services[0]
-	if service.ProviderLocator != "100003" || service.NetworkID != 1 || service.ServiceID != 3 ||
-		service.TransportStreamID != 2 || service.RemoteControlKey != 0 || !service.EPGCapture || !service.Search {
-		t.Fatalf("service=%+v", service)
+	wantServices := []struct {
+		locator                     string
+		network, service, transport uint16
+		remote                      uint8
+	}{
+		{locator: "100003", network: 1, service: 3, transport: 11, remote: 3},
+		{locator: "100004", network: 1, service: 4, transport: 12, remote: 4},
+		{locator: "200005", network: 2, service: 5, transport: 13, remote: 5},
+		{locator: "300006", network: 3, service: 6, transport: 14, remote: 0},
+	}
+	for index, want := range wantServices {
+		service := document.Services[index]
+		if service.ProviderLocator != want.locator || service.NetworkID != want.network ||
+			service.ServiceID != want.service || service.TransportStreamID != want.transport ||
+			service.RemoteControlKey != want.remote || !service.EPGCapture || !service.Search {
+			t.Fatalf("service[%d]=%+v want=%+v", index, service, want)
+		}
 	}
 
 	var output, diagnostic bytes.Buffer
 	if code := runContext(context.Background(), []string{"ctrlcmd", "validate", "--data-root", root,
 		"--channel-map", path}, &output, &diagnostic); code != 0 {
 		t.Fatalf("validate code=%d output=%q diagnostic=%q", code, output.String(), diagnostic.String())
+	}
+}
+
+func TestSetupUsesFixedDefaultDataRootAndTimeout(t *testing.T) {
+	if defaultSetupDataRoot != "/var/lib/sazanami-dvr" {
+		t.Fatalf("default data root=%q", defaultSetupDataRoot)
+	}
+	if setupTimeout != 30*time.Minute {
+		t.Fatalf("setup timeout=%s", setupTimeout)
 	}
 }
 

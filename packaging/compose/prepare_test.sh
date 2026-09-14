@@ -35,7 +35,10 @@ expect_invalid() {
 
 normal="$work_dir/normal"
 copy_fixture "$normal"
-(cd "$normal" && sh ./prepare.sh >/dev/null)
+normal_output=$(cd "$normal" && sh ./prepare.sh)
+printf '%s\n' "$normal_output" | grep -Fqx \
+    '準備が完了しました。.envのMIRAKURUN_URLを確認し、次に導入ガイドのsetupコマンドを実行してください。'
+! printf '%s\n' "$normal_output" | grep -Fq 'channels.jsonを設定'
 lock="$normal/recordings/.sazanami-dvr.lock"
 test -f "$lock"
 test ! -L "$lock"

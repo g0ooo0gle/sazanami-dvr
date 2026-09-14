@@ -21,27 +21,27 @@ Sazanami DVRを、KonomiTV v0.14.1のEDCBバックエンドとして接続しま
 
 - Sazanami DVRが起動している
 - Mirakurunまたはmirakcへ接続できる
-- チャンネル設定と番組表を準備している
+- `setup`でチャンネル設定と番組表を準備している
 - KonomiTV v0.14.1を使用する
 - KonomiTVから録画保存先を読み取れる
 
 チャンネル設定と番組表の準備は、[チャンネルと番組表を準備する](../guides/channels-and-epg.md)を参照してください。
-Sazanami DVRの起動方法は、[Linuxに導入する](linux.md)または[Docker Composeで起動する](docker-compose.md)を参照してください。
+起動方法は、[Linuxに導入する](linux.md)または[Docker Composeで起動する](docker-compose.md)を参照してください。
 
 ## 接続の流れ
 
-通常は次の構成で動かします。
+標準設定では、ライブ視聴をMirakurunまたはmirakcへ直接渡します。
 
 ```text
 KonomiTV
   ├─ 番組表・予約 ──> Sazanami DVR
-  ├─ ライブ視聴 ────> Sazanami DVR
+  ├─ ライブ視聴 ────> Mirakurun / mirakc
   └─ 録画済み番組 ──> 録画保存先
 
-Sazanami DVR ──番組情報・放送ストリーム──> Mirakurun / mirakc
+Sazanami DVR ──番組情報・録画ストリーム──> Mirakurun / mirakc
 ```
 
-Sazanami DVRは、番組表の更新や録画、ライブ視聴が必要になったときだけMirakurunまたはmirakcへ接続します。
+番組表の更新と録画では、Sazanami DVRがMirakurunまたはmirakcへ接続します。
 
 ## KonomiTVの設定
 
@@ -52,7 +52,7 @@ KonomiTVの`config.yaml`で、バックエンドと接続先を設定します�
 ```yaml
 general:
     backend: 'EDCB'
-    always_receive_tv_from_mirakurun: false
+    always_receive_tv_from_mirakurun: true
     edcb_url: 'tcp://<sazanami-host>:4520/'
     mirakurun_url: '<mirakurun-url>'
 
@@ -69,9 +69,11 @@ video:
 | `edcb_url` | Sazanami DVRのCtrlCmd接続先 |
 | `mirakurun_url` | MirakurunまたはmirakcのURL |
 | `recorded_folders` | KonomiTVから読める録画保存先 |
-| `always_receive_tv_from_mirakurun` | `false`ならライブ視聴もSazanami DVRを経由する |
+| `always_receive_tv_from_mirakurun` | `true`ならライブ視聴をMirakurunまたはmirakcへ直接接続する |
 
-`always_receive_tv_from_mirakurun: true`にすると、ライブ視聴だけMirakurunまたはmirakcへ直接接続します。番組表と録画予約は、引き続きSazanami DVRへ接続します。
+標準は`always_receive_tv_from_mirakurun: true`です。番組表と録画予約は、引き続きSazanami DVRへ接続します。
+Sazanami DVRでライブを中継したい場合だけ、`false`を明示してください。この場合は、[ライブ視聴](../guides/live-viewing.md)の
+上限付き中継を使います。
 
 ## 一件確認する
 
@@ -88,14 +90,14 @@ video:
 
 ## 別のホストで動かす場合
 
-Sazanami DVRとKonomiTVを別のホストで動かす場合は、次の2点を確認してください。
+別のホストで動かす場合は、次の2点を確認してください。
 
 - `<sazanami-host>`にSazanami DVRホストのLANアドレスを指定する
 - 録画保存先をKonomiTVホストへ共有し、`recorded_folders`にはKonomiTVから見えるパスを指定する
 
-KonomiTVをDockerコンテナで動かす場合、コンテナ内の`127.0.0.1`はSazanami DVRホストを指しません。Sazanami DVRホストのLANアドレスを指定してください。
+KonomiTVをDockerコンテナで動かす場合、コンテナ内の`127.0.0.1`はSazanami DVRホストを指しません。接続先にはSazanami DVRホストのLANアドレスを指定してください。
 
-Sazanami DVRのCtrlCmdには認証とTLSがありません。信頼できる宅内LANだけで使用し、インターネットへ公開しないでください。
+CtrlCmdには認証とTLSがありません。信頼できる宅内LANだけで使用し、インターネットへ公開しないでください。
 
 ## 次に読むページ
 

@@ -11,7 +11,7 @@ Sazanami DVRとKonomiTVを、Linux上のDocker Composeで起動します。
 - [前提](#前提)
 - [Composeファイルを準備する](#composeファイルを準備する)
 - [設定する](#設定する)
-- [DBと番組表を準備する](#dbと番組表を準備する)
+- [チャンネルと番組表を自動準備する](#チャンネルと番組表を自動準備する)
 - [起動する](#起動する)
 - [保存先と接続先](#保存先と接続先)
 - [次に読む](#次に読む)
@@ -24,7 +24,6 @@ Sazanami DVRとKonomiTVを、Linux上のDocker Composeで起動します。
 - `docker compose`コマンド
 - Linuxホスト
 - 利用できるMirakurunまたはmirakc
-- チャンネル設定ファイル`channels.json`
 
 同梱のCompose例は、KonomiTVを`linux/amd64`でビルドする構成です。初回ビルドでは依存パッケージを取得するため、完了まで時間がかかることがあります。
 
@@ -54,7 +53,7 @@ cd <install-dir>
 
 録画ディレクトリには、管理用の`.sazanami-dvr.lock`を作成します。lockは実行ユーザー所有の通常ファイルとして扱われます。
 
-`.env`と`config/konomitv.yaml`は、存在しない場合だけ作成されます。`channels.json`は自動作成されません。
+`.env`と`config/konomitv.yaml`は、存在しない場合だけ作成されます。チャンネル設定は初回セットアップで自動作成します。
 
 ## 設定する
 
@@ -79,45 +78,41 @@ vi config/konomitv.yaml
 `general.mirakurun_url`を、`.env`の`MIRAKURUN_URL`と同じURLへ変更します。
 
 `general.backend`は`EDCB`、`general.edcb_url`は`tcp://127.0.0.1:4520/`のまま使用します。録画とキャプチャの保存先も、同梱の初期値をそのまま使えます。
+`always_receive_tv_from_mirakurun`は同梱例の`true`をそのまま使います。ライブ視聴をSazanami DVRで中継する場合だけ`false`へ変更してください。
 
-チャンネル設定を配置します。
+## チャンネルと番組表を自動準備する
 
-```sh
-cp <channels-json-path> data/sazanami/channels.json
-```
-
-## DBと番組表を準備する
-
-KonomiTVを起動する前に、Sazanami DVRのDBを準備します。
+KonomiTVを起動する前にKonomiTVをビルドし、Mirakurun URLだけを指定してSazanami DVRの初回セットアップを実行します。
 
 ```sh
 docker compose build konomitv
 
-docker compose run --rm sazanami db migrate --data-root /var/lib/sazanami-dvr
+docker compose run --rm sazanami setup \
+  --mirakurun-url "$(sed -n 's/^MIRAKURUN_URL=//p' .env)" \
+  --data-root /var/lib/sazanami-dvr
+```
 
+`setup`はDBの初期化または状態確認、起動前の復旧と古い番組表の自動整理、番組表同期、PATによるTSID確認、
+`data/sazanami/channels.json`の生成をまとめて行います。成功時は`result=completed`と表示されます。
+
+PAT確認では対象サービスのストリームを短時間開くため、録画やライブ視聴が動いていると空きチューナーが
+足りないことがあります。その場合は録画と視聴を止めてから、時間を置いて再実行してください。
+
+既存の`data/sazanami/channels.json`は上書きしません。同じ内容なら成功しますが、内容が異なる場合は既存ファイルを
+残したまま失敗します。チャンネル構成を更新する場合は、[更新・切り戻し・削除](../operations/update-and-remove.md)の
+明示手順を使ってください。
+
+DBが`BEHIND`の場合、`setup`は自動でmigrationしません。サービスを停止した状態で次の順に実行し、
+`setup`をやり直してください。
+
+```sh
+docker compose run --rm sazanami db status --data-root /var/lib/sazanami-dvr
+docker compose run --rm sazanami db migrate --data-root /var/lib/sazanami-dvr
 docker compose run --rm sazanami db status --data-root /var/lib/sazanami-dvr
 ```
 
-最後の表示が`state=CURRENT`になっていることを確認してください。
-
-次に、番組表を取得します。
-
-```sh
-docker compose run --rm sazanami catalog sync \
-  --data-root /var/lib/sazanami-dvr \
-  --provider mirakurun \
-  --base-url "$(sed -n 's/^MIRAKURUN_URL=//p' .env)"
-```
-
-チャンネル設定を確認します。
-
-```sh
-docker compose run --rm sazanami ctrlcmd validate \
-  --data-root /var/lib/sazanami-dvr \
-  --channel-map /var/lib/sazanami-dvr/channels.json
-```
-
-途中のコマンドが失敗した場合は、`docker compose up -d`へ進まず、表示されたエラーを確認してください。
+`CURRENT`にならない場合は
+`docker compose up -d`へ進まず、[バックアップと復元](../operations/backup-and-restore.md)を確認してください。
 
 ## 起動する
 
