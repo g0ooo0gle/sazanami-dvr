@@ -85,8 +85,16 @@ func TestProgramMetadataNullInsertOnlyAndCorruption(t *testing.T) {
 		t.Fatal("insert-only revisionのmetadataが更新されました")
 	}
 	if _, err := store.writer.Exec(`DELETE FROM program_revisions`); err == nil {
-		t.Fatal("insert-only revisionが削除されました")
+		t.Fatal("参照中revisionが削除されました")
 	}
+	if _, err := store.writer.Exec(`DELETE FROM program_observations`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.writer.Exec(`DELETE FROM program_revisions`); err != nil {
+		t.Fatalf("参照を外したrevisionを削除できません: %v", err)
+	}
+
+	storeMetadataGeneration(t, store, backendID, testID(t, 205), 30, "2", catalogmodel.ProgramMetadata{})
 
 	// 読取り境界が破損を空情報へ丸めないことを、隔離したテストDBで確認する。
 	if _, err := store.writer.Exec(`DROP TRIGGER program_revisions_no_update`); err != nil {

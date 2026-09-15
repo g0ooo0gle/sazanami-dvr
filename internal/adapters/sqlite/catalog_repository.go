@@ -198,7 +198,7 @@ func (store *Store) ReconcileRunningSyncs(ctx context.Context, finishedAtMS int6
 // LatestCompletedGenerationは指定backendで最後に完了した番組表世代を返す。
 func (store *Store) LatestCompletedGeneration(ctx context.Context, backendID catalogmodel.ID) (catalogmodel.ID, error) {
 	var value []byte
-	err := store.reader.QueryRowContext(ctx, `SELECT id FROM catalog_syncs
+	err := store.reader.QueryRowContext(ctx, `SELECT id FROM catalog_syncs INDEXED BY catalog_syncs_completed_backend_idx
 		WHERE backend_instance_id=? AND state='COMPLETED'
 		ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1`, backendID.Bytes()).Scan(&value)
 	if err != nil {
@@ -339,7 +339,7 @@ func (store *Store) CurrentPrograms(ctx context.Context, backendID catalogmodel.
 	}
 	rows, err := store.reader.QueryContext(ctx, `
 		WITH current_sync AS (
-			SELECT id FROM catalog_syncs
+			SELECT id FROM catalog_syncs INDEXED BY catalog_syncs_completed_backend_idx
 			WHERE backend_instance_id=? AND state='COMPLETED'
 			ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1
 		)
@@ -368,7 +368,7 @@ func (store *Store) CurrentProgramsByService(ctx context.Context, backendID cata
 	}
 	rows, err := store.reader.QueryContext(ctx, `
 		WITH current_sync AS (
-			SELECT id FROM catalog_syncs
+			SELECT id FROM catalog_syncs INDEXED BY catalog_syncs_completed_backend_idx
 			WHERE backend_instance_id=? AND state='COMPLETED'
 			ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1
 		)
@@ -398,7 +398,7 @@ func (store *Store) CurrentProgramsForService(ctx context.Context, backendID cat
 	}
 	rows, err := store.reader.QueryContext(ctx, `
 		WITH current_sync AS (
-			SELECT id FROM catalog_syncs
+			SELECT id FROM catalog_syncs INDEXED BY catalog_syncs_completed_backend_idx
 			WHERE backend_instance_id=? AND state='COMPLETED'
 			ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1
 		)
@@ -427,7 +427,7 @@ func (store *Store) CurrentProgramsMatching(ctx context.Context, backendID catal
 	}
 	rows, err := store.reader.QueryContext(ctx, `
 		WITH current_sync AS (
-			SELECT id FROM catalog_syncs
+			SELECT id FROM catalog_syncs INDEXED BY catalog_syncs_completed_backend_idx
 			WHERE backend_instance_id=? AND state='COMPLETED'
 			ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1
 		)
@@ -457,7 +457,7 @@ func (store *Store) CurrentBackends(ctx context.Context, limit int, after catalo
 		SELECT b.id, b.provider_kind, b.reported_version, b.last_seen_at_utc_ms
 		FROM backend_instances b
 		WHERE b.id > ? AND EXISTS (
-			SELECT 1 FROM catalog_syncs cs
+			SELECT 1 FROM catalog_syncs AS cs INDEXED BY catalog_syncs_completed_backend_idx
 			WHERE cs.backend_instance_id=b.id AND cs.state='COMPLETED'
 		)
 		ORDER BY b.id LIMIT ?`, after.Bytes(), limit)
@@ -494,7 +494,7 @@ func (store *Store) CurrentServices(ctx context.Context, backendID catalogmodel.
 	}
 	rows, err := store.reader.QueryContext(ctx, `
 		WITH current_sync AS (
-			SELECT id FROM catalog_syncs
+			SELECT id FROM catalog_syncs INDEXED BY catalog_syncs_completed_backend_idx
 			WHERE backend_instance_id=? AND state='COMPLETED'
 			ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1
 		)
@@ -550,7 +550,7 @@ func (store *Store) CurrentProgramsInWindow(ctx context.Context, backendID catal
 	}
 	rows, err := store.reader.QueryContext(ctx, `
 		WITH current_sync AS (
-			SELECT id FROM catalog_syncs
+			SELECT id FROM catalog_syncs INDEXED BY catalog_syncs_completed_backend_idx
 			WHERE backend_instance_id=? AND state='COMPLETED'
 			ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1
 		)
@@ -715,7 +715,14 @@ func storeProgram(ctx context.Context, tx *sql.Tx, syncID catalogmodel.ID, backe
 	}
 	var serviceID catalogmodel.ID
 	var serviceIDBytes []byte
-	if err := tx.QueryRowContext(ctx, `SELECT id FROM services WHERE backend_instance_id=? AND provider_locator=?`, backendID, observation.ServiceLocator).Scan(&serviceIDBytes); err != nil {
+	err := tx.QueryRowContext(ctx, `SELECT s.id FROM services s
+		JOIN service_observations o ON o.service_id=s.id
+		WHERE s.backend_instance_id=? AND o.sync_id=? AND s.provider_locator=?`,
+		backendID, syncID.Bytes(), observation.ServiceLocator).Scan(&serviceIDBytes)
+	if errors.Is(err, sql.ErrNoRows) {
+		return insertInvalidProgramObservation(ctx, tx, syncID, observation, "service-not-in-current-catalog")
+	}
+	if err != nil {
 		return sanitize("resolve-program-service", err)
 	}
 	if err := copyExact(serviceID[:], serviceIDBytes); err != nil {
@@ -723,19 +730,12 @@ func storeProgram(ctx context.Context, tx *sql.Tx, syncID catalogmodel.ID, backe
 	}
 	hash, hashErr := catalogmodel.HashRevision(observation.Material)
 	if hashErr != nil || observation.Material.Validation == catalogmodel.ValidationInvalid {
-		_, err := tx.ExecContext(ctx, `
-			INSERT INTO program_observations(sync_id, provider_service_locator, provider_event_locator,
-			 raw_event_id, classification, validation_reason) VALUES (?, ?, ?, ?, 'INVALID', ?)`,
-			syncID.Bytes(), observation.ServiceLocator, observation.EventLocator, observation.RawEventID, stableReason(observation.Reason, "invalid-material"))
-		if err != nil {
-			return sanitize("insert-invalid-program", err)
-		}
-		return nil
+		return insertInvalidProgramObservation(ctx, tx, syncID, observation, stableReason(observation.Reason, "invalid-material"))
 	}
 
 	var instanceID catalogmodel.ID
 	var instanceIDBytes []byte
-	err := tx.QueryRowContext(ctx, `SELECT id FROM program_instances
+	err = tx.QueryRowContext(ctx, `SELECT id FROM program_instances
 		WHERE service_id=? AND provider_event_locator=?`, serviceID.Bytes(), observation.EventLocator).
 		Scan(&instanceIDBytes)
 	switch {
@@ -837,7 +837,7 @@ func readCompletedProgramReference(ctx context.Context, tx *sql.Tx, backendID []
 	var validation string
 	err := tx.QueryRowContext(ctx, `
 		WITH current_sync AS (
-			SELECT id, started_at_utc_ms FROM catalog_syncs
+			SELECT id, started_at_utc_ms FROM catalog_syncs INDEXED BY catalog_syncs_completed_backend_idx
 			WHERE backend_instance_id=? AND state='COMPLETED'
 			ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1
 		)
@@ -911,6 +911,19 @@ func touchProgramInstance(ctx context.Context, tx *sql.Tx, instanceID catalogmod
 		return sanitize("touch-program-instance", err)
 	}
 	return requireOneRow(result, "touch-program-instance-conflict")
+}
+
+func insertInvalidProgramObservation(ctx context.Context, tx *sql.Tx, syncID catalogmodel.ID,
+	observation catalogmodel.ProgramObservation, reason string,
+) error {
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO program_observations(sync_id, provider_service_locator, provider_event_locator,
+		 raw_event_id, classification, validation_reason) VALUES (?, ?, ?, ?, 'INVALID', ?)`,
+		syncID.Bytes(), observation.ServiceLocator, observation.EventLocator, observation.RawEventID, reason)
+	if err != nil {
+		return sanitize("insert-invalid-program", err)
+	}
+	return nil
 }
 
 func insertNewProgram(ctx context.Context, tx *sql.Tx, syncID, serviceID catalogmodel.ID, verified bool, observation catalogmodel.ProgramObservation, hash [32]byte) error {

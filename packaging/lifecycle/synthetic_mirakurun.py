@@ -2,6 +2,7 @@
 import json
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 
 RESPONSES = {
@@ -32,9 +33,42 @@ RESPONSES = {
 }
 
 
+def mpeg_crc32(data: bytes) -> int:
+    crc = 0xFFFFFFFF
+    for value in data:
+        crc ^= value << 24
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x04C11DB7) & 0xFFFFFFFF if crc & 0x80000000 else (crc << 1) & 0xFFFFFFFF
+    return crc
+
+
+def make_pat() -> bytes:
+    section = bytearray((0x00, 0xB0, 0x0D, 0x00, 0x02, 0xC1, 0x00, 0x00, 0x00, 0x03, 0xE1, 0x00))
+    section.extend(mpeg_crc32(section).to_bytes(4, "big"))
+    packet = bytes((0x47, 0x40, 0x00, 0x10, 0x00)) + bytes(section)
+    pat_packet = packet + bytes((0xFF,)) * (188 - len(packet))
+    null_packet = bytes((0x47, 0x1F, 0xFF, 0x10)) + bytes((0xFF,)) * 184
+    return pat_packet + null_packet * 4
+
+
+STREAM_PAT = make_pat()
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        response = RESPONSES.get(self.path)
+        request = urlsplit(self.path)
+        if request.path == "/api/services/100003/stream":
+            if request.query != "decode=0":
+                self.send_error(400)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "video/MP2T")
+            self.send_header("Content-Length", str(len(STREAM_PAT)))
+            self.end_headers()
+            self.wfile.write(STREAM_PAT)
+            return
+
+        response = RESPONSES.get(request.path)
         if response is None:
             self.send_error(404)
             return

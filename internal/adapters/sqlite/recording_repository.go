@@ -156,7 +156,7 @@ func (store *Store) CurrentFollowTarget(ctx context.Context, backendID, instance
 		return nil, errors.New("sqlite: invalid follow target query")
 	}
 	row := store.reader.QueryRowContext(ctx, `WITH current_sync AS (
-		SELECT id FROM catalog_syncs WHERE backend_instance_id=? AND state='COMPLETED'
+		SELECT id FROM catalog_syncs INDEXED BY catalog_syncs_completed_backend_idx WHERE backend_instance_id=? AND state='COMPLETED'
 		ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1
 	)
 		SELECT po.program_instance_id, pr.id, pr.start_at_utc_ms, pr.duration_ms
@@ -221,7 +221,7 @@ func (store *Store) ApplyReservationFollow(ctx context.Context, request recordin
 			WHERE target.id=? AND target.program_instance_id=reservations.program_instance_id
 			  AND target.revision_number>previous.revision_number
 			  AND cs.backend_instance_id=reservations.backend_instance_id AND cs.state='COMPLETED'
-			  AND cs.id=(SELECT id FROM catalog_syncs WHERE backend_instance_id=reservations.backend_instance_id
+			  AND cs.id=(SELECT id FROM catalog_syncs INDEXED BY catalog_syncs_completed_backend_idx WHERE backend_instance_id=reservations.backend_instance_id
 				AND state='COMPLETED' ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1)
 		)`, request.TargetRevisionID.Bytes(), startMS, durationMS/1_000, request.Now.UnixMilli(),
 		request.ReservationID.Bytes(), request.ExpectedVersion, request.ExpectedRevisionID.Bytes(),
@@ -300,7 +300,7 @@ func applyActiveRecordingFollow(ctx context.Context, tx *sql.Tx, request recordi
 		WHERE target.id=? AND target.program_instance_id=r.program_instance_id
 		  AND target.revision_number>previous.revision_number
 		  AND cs.backend_instance_id=r.backend_instance_id AND cs.state='COMPLETED'
-		  AND cs.id=(SELECT id FROM catalog_syncs WHERE backend_instance_id=r.backend_instance_id
+		  AND cs.id=(SELECT id FROM catalog_syncs INDEXED BY catalog_syncs_completed_backend_idx WHERE backend_instance_id=r.backend_instance_id
 			AND state='COMPLETED' ORDER BY finished_at_utc_ms DESC, id DESC LIMIT 1)
 	)`, request.ExpectedRevisionID.Bytes(), request.ReservationID.Bytes(),
 		request.TargetRevisionID.Bytes()).Scan(&verified); err != nil {

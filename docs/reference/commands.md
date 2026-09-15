@@ -7,6 +7,7 @@
 ## 目次
 
 - [DB](#db)
+- [初回セットアップ](#初回セットアップ)
 - [番組表](#番組表)
 - [CtrlCmd](#ctrlcmd)
 - [録画サービス](#録画サービス)
@@ -33,6 +34,22 @@ sazanami-dvr db recover --data-root <data-root> --operation-id <uuid>
 
 `migrate`、`restore`、`recover`の前に、同じDBを使うサービスとWebUIを停止します。`CURRENT`以外の状態への対応は[バックアップと復元](../operations/backup-and-restore.md)を参照してください。
 
+## 初回セットアップ
+
+```sh
+sazanami-dvr setup \
+  --mirakurun-url <mirakurun-url> \
+  [--data-root <absolute-data-root>]
+```
+
+MirakurunまたはmirakcのURLから、DBの準備、番組表同期、PATによるTSID確認、KonomiTV向けの
+`<absolute-data-root>/channels.json`生成を一度に行います。`--data-root`には正規化した絶対パスを指定します。
+省略すると`/var/lib/sazanami-dvr`を使います。
+空のDBは初期化しますが、migrationが必要なDBは自動で変更しません。
+
+成功時は`result=completed`と`channel_map=created`または`channel_map=unchanged`を表示します。既存のチャンネル設定と内容が
+異なる場合は上書きせず失敗します。通常運転中にこのコマンドが自動実行されることはありません。
+
 ## 番組表
 
 ```sh
@@ -43,6 +60,7 @@ sazanami-dvr catalog sync \
 ```
 
 Mirakurunまたはmirakcからサービスと番組を取得し、DBへ保存します。同期に失敗した場合は、直前に成功した番組表を保持します。
+`catalog sync`は`channels.json`を更新しません。番組表の更新前には古いcatalogの自動整理を行います。
 
 ## CtrlCmd
 

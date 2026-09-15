@@ -8,6 +8,7 @@ Sazanami DVRの更新、切り戻し、アンインストールをまとめま�
 
 - [Linuxの更新](#linuxの更新)
 - [Composeの更新](#composeの更新)
+- [チャンネル設定を更新する](#チャンネル設定を更新する)
 - [切り戻し](#切り戻し)
 - [アンインストール](#アンインストール)
 - [録画ファイルを削除する](#録画ファイルを削除する)
@@ -78,7 +79,10 @@ tar -xzf /path/to/sazanami-dvr_<new-version>_linux_<arch>.tar.gz
    sudo systemctl status sazanami-dvr.service
    ```
 
-`state=BEHIND`以外の状態やコマンドエラーが出た場合は、サービスを起動せず、表示された理由を確認してください。`SAZANAMI_DATA_ROOT`や`SAZANAMI_CHANNEL_MAP`を変更している場合は、各コマンドのパスも同じ値に置き換えます。
+`state=BEHIND`以外の状態やコマンドエラーが出た場合は、サービスを起動せず、表示された理由を確認してください。
+`SAZANAMI_DATA_ROOT`を変更している場合は、各コマンドのパスも同じ値に置き換えます。
+`SAZANAMI_CHANNEL_MAP`を標準の`<data-root>/channels.json`以外へ変更している環境では、`setup`でそのファイルを生成できません。
+既存の手動設定を維持し、`ctrlcmd validate --channel-map`には実際のパスを指定してください。
 
 installer管理下の更新では、実行ファイルのシンボリックリンクを手動で切り替えません。
 
@@ -142,6 +146,56 @@ Composeではホスト側のデータを残したままイメージを入れ替�
    ```
 
 Composeの更新では、`.env`の保存先やKonomiTVの設定、チャンネル設定を上書きする必要はありません。`state=BEHIND`以外の状態では起動せず、エラーを確認してください。Compose構成に自動purgeはありません。
+
+## チャンネル設定を更新する
+
+Mirakurunまたはmirakc側でサービスを追加・削除した場合、Sazanami DVRは通常運転中に`channels.json`を自動更新しません。
+録画とライブ視聴を止め、既存のチャンネル設定を別名へ退避してから、`setup`を明示的に実行します。移動先は先に確認し、既存の退避ファイルを
+上書きしないでください。
+
+### Linux
+
+```sh
+sudo systemctl stop sazanami-dvr.service
+if sudo test -e /var/lib/sazanami-dvr/channels.json.previous; then
+  printf '%s\n' '退避先がすでに存在します。別名を選んでから再実行してください。' >&2
+  exit 1
+fi
+sudo mv /var/lib/sazanami-dvr/channels.json /var/lib/sazanami-dvr/channels.json.previous
+if ! sudo -u sazanami-dvr /usr/local/bin/sazanami-dvr setup \
+  --mirakurun-url "$(sudo sed -n 's/^SAZANAMI_MIRAKURUN_URL=//p' /etc/sazanami-dvr/sazanami-dvr.env)" \
+  --data-root /var/lib/sazanami-dvr; then
+  if sudo test ! -e /var/lib/sazanami-dvr/channels.json; then
+    sudo mv /var/lib/sazanami-dvr/channels.json.previous /var/lib/sazanami-dvr/channels.json
+  fi
+  exit 1
+fi
+sudo systemctl enable --now sazanami-dvr.service
+```
+
+### Compose
+
+```sh
+docker compose down
+if test -e data/sazanami/channels.json.previous; then
+  printf '%s\n' '退避先がすでに存在します。別名を選んでから再実行してください。' >&2
+  exit 1
+fi
+mv data/sazanami/channels.json data/sazanami/channels.json.previous
+if ! docker compose run --rm sazanami setup \
+  --mirakurun-url "$(sed -n 's/^MIRAKURUN_URL=//p' .env)" \
+  --data-root /var/lib/sazanami-dvr; then
+  if test ! -e data/sazanami/channels.json; then
+    mv data/sazanami/channels.json.previous data/sazanami/channels.json
+  fi
+  exit 1
+fi
+docker compose up -d
+```
+
+`setup`が失敗し、新しい`channels.json`がない場合は、退避した設定を元の場所へ戻します。新しいファイルが残っている場合は
+上書きせず、そのままサービスを停止して表示された理由を確認してください。空きチューナーが必要なため、録画や視聴を止めても
+失敗する場合は時間を置いて再実行します。この更新手順では既存ファイルを退避するため、成功時は`channel_map=created`になります。
 
 ## 切り戻し
 

@@ -354,6 +354,19 @@ PY
     fail "backup-id-missing"
 
   ensure_current "$candidate_root/sazanami-dvr"
+  rm -f -- "$data_root/channels.json"
+  require_absent "$data_root/channels.json"
+  setup_output=$(run_as_service "$candidate_root/sazanami-dvr" setup \
+    --mirakurun-url "$provider_url" --data-root "$data_root")
+  printf '%s\n' "$setup_output" | grep -Fx 'setup result=completed services=1 channel_map=created' >/dev/null ||
+    fail "url-only-setup-create-failed"
+  [ -f "$data_root/channels.json" ] || fail "url-only-setup-map-missing"
+  setup_output=$(run_as_service "$candidate_root/sazanami-dvr" setup \
+    --mirakurun-url "$provider_url" --data-root "$data_root")
+  printf '%s\n' "$setup_output" | grep -Fx 'setup result=completed services=1 channel_map=unchanged' >/dev/null ||
+    fail "url-only-setup-retry-failed"
+  run_as_service "$candidate_root/sazanami-dvr" ctrlcmd validate \
+    --data-root "$data_root" --channel-map "$data_root/channels.json" >/dev/null
   switch_release "$candidate_root"
   wait_for_service
   systemctl stop "$service_name"

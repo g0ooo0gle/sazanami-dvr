@@ -157,7 +157,7 @@ jobs:
           docker compose --env-file packaging/compose/.env.example \
             -f packaging/compose/compose.yaml -f packaging/compose/compose.konomitv-delete.yaml \
             config --format json > "$delete_json"
-          python3 packaging/compose/compose_test.py "$compose_json" "$delete_json"
+          python3 packaging/compose/compose_test.py "$compose_json" "$delete_json" packaging/compose/konomitv.yaml.example
           sh -n packaging/compose/prepare.sh
           sh packaging/compose/prepare_test.sh
           grep -qx "    edcb_url: 'tcp://127.0.0.1:4520/'" packaging/compose/konomitv.yaml.example
@@ -208,6 +208,9 @@ jobs:
           sh packaging/lifecycle/verify_test.sh
           sh packaging/install_test.sh
           sh -n packaging/lifecycle/installer_verify.sh
+
+      - name: URL-only setup focused test
+        run: go test -count=1 ./cmd/sazanami-dvr -run '^TestSetup'
 
       - name: candidate archiveを作成
         id: candidate

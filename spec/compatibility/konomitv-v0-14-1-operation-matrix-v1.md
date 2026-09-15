@@ -96,12 +96,15 @@ KonomiTV v0.14.1のサーバーに公開HTTP APIとして登録されている�
 
 ### `K5-007` Live boundary
 
+公開設定例では`always_receive_tv_from_mirakurun: true`を標準とし、ライブ視聴をMirakurunまたはmirakcへ直接接続する。
+番組表、予約、録画、録画済み番組は引き続きSazanami DVRを使う。
+
 `always_receive_tv_from_mirakurun: false`のEDCB経路では1073、301、1074を一続きで確認する。301は成功header後も
 MPEG-TSを同じ接続で流す長時間streamである。接続数、buffer、queue、期限、idle、closeの既存上限を維持し、
 停止後にlease、connection、timerを残さない。
 
-`always_receive_tv_from_mirakurun: true`のMirakurun直結は利用可能な別構成だが、SazanamiのCtrlCmdライブ成功の
-証拠に数えない。
+`always_receive_tv_from_mirakurun: false`は、Sazanamiの上限付きCtrlCmdライブ中継を明示的に選ぶ構成である。
+Mirakurun直結の成功は、SazanamiのCtrlCmdライブ成功の証拠には数えない。
 
 ### `K5-008` Completed-recording boundary
 

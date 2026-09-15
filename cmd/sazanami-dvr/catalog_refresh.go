@@ -11,6 +11,7 @@ import (
 	mirakurunadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/provider/mirakurun"
 	sqliteadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/sqlite"
 	autoreservationapp "github.com/g0ooo0gle/sazanami-dvr/internal/app/autoreservation"
+	"github.com/g0ooo0gle/sazanami-dvr/internal/app/cataloggc"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/app/catalogrefresh"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/app/catalogsync"
 	recordingapp "github.com/g0ooo0gle/sazanami-dvr/internal/app/recording"
@@ -25,6 +26,8 @@ type recordingCatalogRefresh struct {
 	store            *sqliteadapter.Store
 	holder           *ctrlcmdruntime.SnapshotHolder
 	clock            wallClock
+	gc               func(context.Context) (cataloggc.Result, error)
+	observeGC        func(cataloggc.Result, error)
 	follow           func(context.Context) (recordingapp.FollowResult, error)
 	automatic        func(context.Context) (autoreservationapp.Result, error)
 	observeAutomatic func(autoreservationapp.Result, error, time.Duration)
@@ -33,6 +36,17 @@ type recordingCatalogRefresh struct {
 func (operation *recordingCatalogRefresh) sync(ctx context.Context) (catalogrefresh.Result, string, error) {
 	if operation == nil || ctx == nil || operation.provider == nil || operation.store == nil || operation.holder == nil {
 		return catalogrefresh.Result{}, "catalog-refresh-internal", errors.New("catalog refresh is not configured")
+	}
+	runGC := operation.gc
+	if runGC == nil {
+		runGC = newCatalogGC(operation.store, operation.clock)
+	}
+	gcResult, gcErr := runGC(ctx)
+	if operation.observeGC != nil {
+		operation.observeGC(gcResult, gcErr)
+	}
+	if ctx.Err() != nil {
+		return catalogrefresh.Result{}, "catalog-refresh-canceled", ctx.Err()
 	}
 	identityHash := operation.provider.IdentityHash()
 	backendID := stableBackendID(identityHash)

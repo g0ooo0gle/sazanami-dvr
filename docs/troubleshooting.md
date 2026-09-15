@@ -5,6 +5,7 @@
 ## 目次
 
 - [接続できない](#接続できない)
+- [初回セットアップに失敗する](#初回セットアップに失敗する)
 - [DBエラーが出る](#dbエラーが出る)
 - [番組表が空](#番組表が空)
 - [録画が始まらない](#録画が始まらない)
@@ -30,6 +31,30 @@ ss -ltn
 
 CtrlCmdには認証とTLSがありません。インターネットへ公開しないでください。
 
+## 初回セットアップに失敗する
+
+初回は、MirakurunまたはmirakcのURLだけを指定して`setup`を実行します。
+
+```sh
+sazanami-dvr setup \
+  --mirakurun-url <mirakurun-url> \
+  --data-root <absolute-data-root>
+```
+
+`<absolute-data-root>`には、`..`や不要な末尾の`/`を含まない絶対パスを指定します。
+
+表示された固定理由に応じて、次を確認してください。
+
+| 状況 | 対応 |
+|---|---|
+| URLまたは接続エラー | URLのスキーム、ホスト、ポート、Mirakurunまたはmirakcの起動状態を確認する |
+| PATまたは空きチューナーのエラー | 録画とライブ視聴を止め、時間を置いて再実行する |
+| `BEHIND`で止まる | サービスを停止し、`db status`で確認してから必要な場合だけ`db migrate`を実行する |
+| 既存のチャンネル設定と異なる | 既存`channels.json`は保護されている。更新手順で別名へ退避してから再実行する |
+| サービスが0件 | Mirakurunまたはmirakcのサービス設定と、製品の対応範囲を確認する |
+
+`setup`に失敗しても、既存の`channels.json`は上書きされません。録画中や視聴中に実行せず、処理が終わってから再実行してください。
+
 ## DBエラーが出る
 
 ```sh
@@ -40,7 +65,7 @@ sazanami-dvr db status --data-root <data-root>
 
 | 状態 | 対応 |
 |---|---|
-| `EMPTY` | `db migrate`を実行する |
+| `EMPTY` | 初回は`setup`を実行する。手動で準備する場合は`db migrate`を実行する |
 | `BEHIND` | `db migrate`を実行する |
 | `FUTURE` | DB形式に対応する新しい実行ファイルを確認する |
 | `DRIFTED`、`GAPPED` | DBを変更せず、バックアップを確認する |
@@ -91,16 +116,17 @@ sazanami-dvr catalog sync \
 
 ## ライブ視聴ができない
 
-Sazanami DVR経由で視聴する場合は、KonomiTVで次の設定を使います。
+標準のライブ視聴はMirakurunまたはmirakcへ直接接続します。KonomiTVで次の設定を確認してください。
 
 ```yaml
 general:
-    always_receive_tv_from_mirakurun: false
+    always_receive_tv_from_mirakurun: true
 ```
 
-`true`にすると、ライブ視聴だけMirakurunまたはmirakcへ直接接続します。
+`true`が標準で、ライブ視聴だけMirakurunまたはmirakcへ直接接続します。Sazanami DVR経由の中継を使う場合だけ`false`を明示してください。
 
-Sazanami DVR経由で視聴できない場合は、`channels.json`のNetwork ID、TSID、Service IDと、Mirakurunまたはmirakcのストリーム応答を確認してください。
+直接接続できない場合はKonomiTVの`mirakurun_url`とMirakurunまたはmirakcへの到達性を確認してください。中継を選んでいる場合は、
+`setup`の完了、`channels.json`のNetwork ID、TSID、Service IDと、Mirakurunまたはmirakcのストリーム応答を確認してください。
 
 ## WebUIが開かない
 

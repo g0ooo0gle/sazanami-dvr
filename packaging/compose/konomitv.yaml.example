@@ -1,6 +1,6 @@
 general:
     backend: 'EDCB'
-    always_receive_tv_from_mirakurun: false
+    always_receive_tv_from_mirakurun: true
     edcb_url: 'tcp://127.0.0.1:4520/'
     mirakurun_url: 'http://127.0.0.1:40772/'
     encoder: 'FFmpeg'

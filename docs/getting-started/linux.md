@@ -3,14 +3,14 @@
 # Linuxに導入する
 
 Sazanami DVRを、systemdを利用できるLinuxへインストールします。
-初回導入では、インストール、接続先の設定、番組表の準備、サービス起動の順に進めます。
+初回導入では、インストール、Mirakurun URLの設定、自動セットアップ、サービス起動の順に進めます。
 
 ## 目次
 
 - [前提](#前提)
 - [インストール](#インストール)
-- [接続先とチャンネルを設定する](#接続先とチャンネルを設定する)
-- [DBと番組表を準備する](#dbと番組表を準備する)
+- [Mirakurun URLを設定する](#mirakurun-urlを設定する)
+- [チャンネルと番組表を自動準備する](#チャンネルと番組表を自動準備する)
 - [サービスを起動する](#サービスを起動する)
 - [次に読む](#次に読む)
 
@@ -21,7 +21,6 @@ Sazanami DVRを、systemdを利用できるLinuxへインストールします�
 - systemdが動くLinux
 - `sudo`を実行できるアカウント
 - 利用できるMirakurunまたはmirakc
-- チャンネル設定ファイル`channels.json`
 
 配布アーカイブの`<arch>`は、利用するCPUに合わせて`amd64`または`arm64`へ読み替えます。
 
@@ -45,7 +44,7 @@ sudo ./packaging/install.sh install
 - systemdのサービス定義
 - `/etc/sazanami-dvr/sazanami-dvr.env`
 
-インストーラは、DBの更新、番組表の取得、チャンネル設定の配置、サービスの起動は行いません。これらは次の手順で実行します。
+インストーラは、DB、番組表、チャンネル設定を変更せず、サービスも起動しません。初回の準備は次の手順で行います。
 
 同じ版を再インストールする場合も、先にサービスを停止してください。
 
@@ -56,7 +55,7 @@ sudo ./packaging/install.sh install
 
 別の版へ更新する場合は、[更新・切り戻し・削除](../operations/update-and-remove.md)を参照してください。
 
-## 接続先とチャンネルを設定する
+## Mirakurun URLを設定する
 
 環境設定を開き、MirakurunまたはmirakcのURLを設定します。
 
@@ -64,7 +63,7 @@ sudo ./packaging/install.sh install
 sudoedit /etc/sazanami-dvr/sazanami-dvr.env
 ```
 
-通常は`SAZANAMI_MIRAKURUN_URL`だけを変更します。
+通常は`SAZANAMI_MIRAKURUN_URL`だけを変更します。ここで設定したURLはサービス起動時にも使われます。
 
 | 設定 | 初期値 | 内容 |
 |---|---|---|
@@ -76,21 +75,33 @@ sudoedit /etc/sazanami-dvr/sazanami-dvr.env
 | `SAZANAMI_RECORDING_HTTP_LISTEN` | `127.0.0.1:4521` | 録画取得用HTTPの待受 |
 | `SAZANAMI_WEBUI_LISTEN` | `127.0.0.1:4522` | 手動起動するWebUIの待受 |
 
-チャンネル設定をデータディレクトリへ配置します。
-
-```sh
-sudo install -o root -g sazanami-dvr -m 0640 \
-  ./channels.json \
-  /var/lib/sazanami-dvr/channels.json
-```
-
 CtrlCmdは初期状態では`0.0.0.0:4520`で待ち受けます。認証とTLSはないため、信頼できるLAN内だけで使用してください。ルーターのポート転送は設定しないでください。
 
 同じPCからだけ接続する場合は、待受を`127.0.0.1:4520`に変更できます。別のPCからKonomiTVなどで接続する場合は、接続元から到達できるLANアドレスを指定してください。
 
-## DBと番組表を準備する
+## チャンネルと番組表を自動準備する
 
-サービスを起動する前に、DBの状態を確認してから更新します。
+サービスを起動する前に、Mirakurun URLだけを指定して初回セットアップを実行します。
+
+```sh
+sudo -u sazanami-dvr /usr/local/bin/sazanami-dvr setup \
+  --mirakurun-url "$(sudo sed -n 's/^SAZANAMI_MIRAKURUN_URL=//p' /etc/sazanami-dvr/sazanami-dvr.env)" \
+  --data-root /var/lib/sazanami-dvr
+```
+
+`setup`は、DBの初期化または状態確認、起動前の復旧と古い番組表の自動整理、Mirakurunからの番組表同期、
+サービスごとのPAT確認、`/var/lib/sazanami-dvr/channels.json`の生成をまとめて行います。
+成功時は`result=completed`と`channel_map=created`または`channel_map=unchanged`が表示されます。
+
+PAT確認では対象サービスのストリームを短時間開くため、録画やライブ視聴が動いていると空きチューナーが
+足りないことがあります。その場合は録画と視聴を止めてから、時間を置いて再実行してください。
+
+既存の`channels.json`は上書きしません。同じ内容なら`unchanged`で成功し、内容が異なる場合は既存ファイルを
+残したまま失敗します。チャンネル構成を更新する場合は、[更新・切り戻し・削除](../operations/update-and-remove.md)の
+明示手順を使ってください。
+
+DBが`BEHIND`の場合、`setup`は自動でmigrationしません。表示された状態を確認し、サービスを停止した状態で
+次のコマンドを実行してから`setup`をやり直してください。
 
 ```sh
 sudo -u sazanami-dvr /usr/local/bin/sazanami-dvr db status \
@@ -103,26 +114,7 @@ sudo -u sazanami-dvr /usr/local/bin/sazanami-dvr db status \
   --data-root /var/lib/sazanami-dvr
 ```
 
-最後の表示が`state=CURRENT`になっていることを確認してください。
-
-次に、Mirakurunまたはmirakcから番組表を取得します。`<mirakurun-url>`には、環境設定と同じURLを指定します。
-
-```sh
-sudo -u sazanami-dvr /usr/local/bin/sazanami-dvr catalog sync \
-  --data-root /var/lib/sazanami-dvr \
-  --provider mirakurun \
-  --base-url <mirakurun-url>
-```
-
-最後にチャンネル設定を確認します。
-
-```sh
-sudo -u sazanami-dvr /usr/local/bin/sazanami-dvr ctrlcmd validate \
-  --data-root /var/lib/sazanami-dvr \
-  --channel-map /var/lib/sazanami-dvr/channels.json
-```
-
-`db status`が`CURRENT`にならない場合は、サービスを起動せず、表示された理由を確認してください。
+`CURRENT`にならない場合はサービスを起動せず、[バックアップと復元](../operations/backup-and-restore.md)を確認してください。
 
 ## サービスを起動する
 
