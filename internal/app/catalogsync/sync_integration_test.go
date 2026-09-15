@@ -494,6 +494,36 @@ func TestUnknownTimeBecomesRevisionOnlyWithVerifiedFakeLineage(t *testing.T) {
 	}
 }
 
+func TestMissingServiceDisappearsAndReturnsWithoutChangingProgramIdentity(t *testing.T) {
+	_, store := migratedStore(t)
+	ctx := context.Background()
+	clock := &advancingClock{now: time.Date(2026, 8, 2, 0, 0, 0, 0, time.UTC)}
+	backendID := mustCatalogID(t, 203)
+	request := catalogsync.Request{Backend: catalogmodel.Backend{ID: backendID, Kind: "FAKE", IdentityHash: sha256.Sum256([]byte("service-return"))}, CorrelationID: "return", ServicePageLimit: 16, ProgramPageLimit: 16, VerifiedFakeLineage: true}
+	var first catalogmodel.CurrentProgram
+	for index, want := range []int{1, 0, 1} {
+		harness := newHarness(t, "same program", func(c *fake.Config) {
+			if index == 1 {
+				c.ServicePages[0].Items = nil
+			}
+		})
+		result, err := (catalogsync.Service{Provider: harness.Catalog, Repository: store, Clock: clock}).Sync(ctx, request)
+		if err != nil || result.Programs != 1 || result.Services != want {
+			t.Fatalf("sync %d: %+v %v", index, result, err)
+		}
+		current, err := store.CurrentPrograms(ctx, backendID, 10, catalogmodel.ID{})
+		if err != nil || len(current) != want {
+			t.Fatalf("current %d: %v %v", index, current, err)
+		}
+		if index == 0 {
+			first = current[0]
+		}
+		if index == 2 && (current[0].InstanceID != first.InstanceID || current[0].RevisionID != first.RevisionID) {
+			t.Fatal("return changed program identity")
+		}
+	}
+}
+
 func migratedStore(t *testing.T) (string, *sqliteadapter.Store) {
 	t.Helper()
 	root := t.TempDir()

@@ -606,7 +606,14 @@ func TestPruneCatalogBatchProtectsObservationReservationAndAutomaticMatchReferen
 	unreferencedRevision := retentionID(393)
 	insertRetentionInstance(t, store, unreferencedInstance, serviceID, "unreferenced-event", 1)
 	insertRetentionRevision(t, store, unreferencedRevision, unreferencedInstance, 1, 1)
+	failedSync := retentionID(394)
+	insertRetentionSync(t, store, backendID, failedSync, "FAILED", 1, 2)
+	insertRetentionProgramObservation(t, store, 394, failedSync, "missing", "unresolved", catalogmodel.ID{}, catalogmodel.ID{}, "INVALID")
 	pruneCatalogUntilEmpty(t, store, 100)
+	var unresolvedCount int
+	if err := store.reader.QueryRow(`SELECT count(*) FROM program_observations WHERE provider_event_locator='unresolved'`).Scan(&unresolvedCount); err != nil || unresolvedCount != 0 {
+		t.Fatalf("unresolved count=%d err=%v", unresolvedCount, err)
+	}
 
 	for _, id := range []catalogmodel.ID{protectedObservationInstance, reservationInstance, automaticInstance} {
 		var count int

@@ -715,7 +715,14 @@ func storeProgram(ctx context.Context, tx *sql.Tx, syncID catalogmodel.ID, backe
 	}
 	var serviceID catalogmodel.ID
 	var serviceIDBytes []byte
-	if err := tx.QueryRowContext(ctx, `SELECT id FROM services WHERE backend_instance_id=? AND provider_locator=?`, backendID, observation.ServiceLocator).Scan(&serviceIDBytes); err != nil {
+	err := tx.QueryRowContext(ctx, `SELECT s.id FROM services s
+		JOIN service_observations o ON o.service_id=s.id
+		WHERE s.backend_instance_id=? AND o.sync_id=? AND s.provider_locator=?`,
+		backendID, syncID.Bytes(), observation.ServiceLocator).Scan(&serviceIDBytes)
+	if errors.Is(err, sql.ErrNoRows) {
+		return insertInvalidProgramObservation(ctx, tx, syncID, observation, "service-not-in-current-catalog")
+	}
+	if err != nil {
 		return sanitize("resolve-program-service", err)
 	}
 	if err := copyExact(serviceID[:], serviceIDBytes); err != nil {
@@ -723,19 +730,12 @@ func storeProgram(ctx context.Context, tx *sql.Tx, syncID catalogmodel.ID, backe
 	}
 	hash, hashErr := catalogmodel.HashRevision(observation.Material)
 	if hashErr != nil || observation.Material.Validation == catalogmodel.ValidationInvalid {
-		_, err := tx.ExecContext(ctx, `
-			INSERT INTO program_observations(sync_id, provider_service_locator, provider_event_locator,
-			 raw_event_id, classification, validation_reason) VALUES (?, ?, ?, ?, 'INVALID', ?)`,
-			syncID.Bytes(), observation.ServiceLocator, observation.EventLocator, observation.RawEventID, stableReason(observation.Reason, "invalid-material"))
-		if err != nil {
-			return sanitize("insert-invalid-program", err)
-		}
-		return nil
+		return insertInvalidProgramObservation(ctx, tx, syncID, observation, stableReason(observation.Reason, "invalid-material"))
 	}
 
 	var instanceID catalogmodel.ID
 	var instanceIDBytes []byte
-	err := tx.QueryRowContext(ctx, `SELECT id FROM program_instances
+	err = tx.QueryRowContext(ctx, `SELECT id FROM program_instances
 		WHERE service_id=? AND provider_event_locator=?`, serviceID.Bytes(), observation.EventLocator).
 		Scan(&instanceIDBytes)
 	switch {
@@ -911,6 +911,19 @@ func touchProgramInstance(ctx context.Context, tx *sql.Tx, instanceID catalogmod
 		return sanitize("touch-program-instance", err)
 	}
 	return requireOneRow(result, "touch-program-instance-conflict")
+}
+
+func insertInvalidProgramObservation(ctx context.Context, tx *sql.Tx, syncID catalogmodel.ID,
+	observation catalogmodel.ProgramObservation, reason string,
+) error {
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO program_observations(sync_id, provider_service_locator, provider_event_locator,
+		 raw_event_id, classification, validation_reason) VALUES (?, ?, ?, ?, 'INVALID', ?)`,
+		syncID.Bytes(), observation.ServiceLocator, observation.EventLocator, observation.RawEventID, reason)
+	if err != nil {
+		return sanitize("insert-invalid-program", err)
+	}
+	return nil
 }
 
 func insertNewProgram(ctx context.Context, tx *sql.Tx, syncID, serviceID catalogmodel.ID, verified bool, observation catalogmodel.ProgramObservation, hash [32]byte) error {

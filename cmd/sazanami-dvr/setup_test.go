@@ -19,7 +19,7 @@ import (
 	"github.com/g0ooo0gle/sazanami-dvr/internal/mpegts"
 )
 
-func TestSetupCreatesAndReusesChannelMapFromMirakurunURL(t *testing.T) {
+func TestSetupCreatesAndReusesChannelMapWithUnresolvedPrograms(t *testing.T) {
 	root := ownerOnlyRoot(t)
 	startMS := time.Now().UTC().Add(time.Hour).UnixMilli()
 	var servicesCalls atomic.Int32
@@ -49,7 +49,10 @@ func TestSetupCreatesAndReusesChannelMapFromMirakurunURL(t *testing.T) {
 				`{"id":200005,"networkId":2,"serviceId":5,"name":"cs station","type":162,"remoteControlKeyId":5}`+
 				`]`)
 		case "/api/programs":
-			writeCommandJSON(writer, fmt.Sprintf(`[{"id":10000300005,"networkId":1,"serviceId":3,"eventId":5,"startAt":%d,"duration":1800000,"isFree":true,"name":"private program","description":""}]`, startMS))
+			writeCommandJSON(writer, fmt.Sprintf(`[
+				{"id":10000300005,"networkId":1,"serviceId":3,"eventId":5,"startAt":%d,"duration":1800000,"isFree":true,"name":"private program","description":""},
+				{"id":10000900005,"networkId":1,"serviceId":9,"eventId":5,"startAt":%d,"duration":1800000,"isFree":true,"name":"unresolved program","description":""}
+			]`, startMS, startMS))
 		default:
 			const streamPrefix = "/api/services/"
 			if !strings.HasPrefix(request.URL.Path, streamPrefix) || !strings.HasSuffix(request.URL.Path, "/stream") {
