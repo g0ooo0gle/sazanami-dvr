@@ -102,7 +102,7 @@ func decodeService(decoder *json.Decoder, provenance provider.Provenance) (catal
 			result.ServiceID = uint16(value)
 			hasService = err == nil
 		case "name":
-			result.DisplayName, err = readString(decoder, 4_096)
+			result.DisplayName, err = readDisplayString(decoder, 4_096)
 			hasName = err == nil
 		case "type":
 			serviceType, err = readUint(decoder, math.MaxUint16)
@@ -174,9 +174,9 @@ func decodeProgram(decoder *json.Decoder, provenance provider.Provenance) (catal
 			free, err = readBool(decoder)
 			hasFree = err == nil
 		case "name":
-			result.Title, err = readString(decoder, 4_096)
+			result.Title, err = readDisplayString(decoder, 4_096)
 		case "description":
-			result.Description, err = readString(decoder, 65_536)
+			result.Description, err = readDisplayString(decoder, 65_536)
 		case "extended":
 			result.Extended, err = decodeExtended(decoder)
 		case "genres":
@@ -233,7 +233,7 @@ func decodeExtended(decoder *json.Decoder) ([]catalog.ProgramExtended, error) {
 	}
 	items := make([]catalog.ProgramExtended, 0, 8)
 	for decoder.More() {
-		heading, keyErr := readObjectKey(decoder, seen)
+		heading, keyErr := readDisplayObjectKey(decoder, seen)
 		if keyErr != nil {
 			return nil, keyErr
 		}
@@ -243,7 +243,7 @@ func decodeExtended(decoder *json.Decoder) ([]catalog.ProgramExtended, error) {
 		if len(heading) > 4_096 {
 			return nil, provider.NewFailure(provider.ReasonOverLimit, "program-extended-heading-over-limit")
 		}
-		body, bodyErr := readString(decoder, 65_536)
+		body, bodyErr := readDisplayString(decoder, 65_536)
 		if bodyErr != nil {
 			return nil, bodyErr
 		}
@@ -518,12 +518,20 @@ func endObject(decoder *json.Decoder) error {
 }
 
 func readObjectKey(decoder *json.Decoder, seen map[string]struct{}) (string, error) {
+	return readObjectKeyWithValidation(decoder, seen, validJSONString)
+}
+
+func readDisplayObjectKey(decoder *json.Decoder, seen map[string]struct{}) (string, error) {
+	return readObjectKeyWithValidation(decoder, seen, validDisplayJSONString)
+}
+
+func readObjectKeyWithValidation(decoder *json.Decoder, seen map[string]struct{}, valid func(string) bool) (string, error) {
 	token, err := decoder.Token()
 	if err != nil {
 		return "", err
 	}
 	key, ok := token.(string)
-	if !ok || invalidJSONString(key) {
+	if !ok || !valid(key) {
 		return "", provider.NewFailure(provider.ReasonMalformed, "invalid-json-key")
 	}
 	if _, duplicate := seen[key]; duplicate {
@@ -534,12 +542,20 @@ func readObjectKey(decoder *json.Decoder, seen map[string]struct{}) (string, err
 }
 
 func readString(decoder *json.Decoder, limit int) (string, error) {
+	return readStringWithValidation(decoder, limit, validJSONString)
+}
+
+func readDisplayString(decoder *json.Decoder, limit int) (string, error) {
+	return readStringWithValidation(decoder, limit, validDisplayJSONString)
+}
+
+func readStringWithValidation(decoder *json.Decoder, limit int, valid func(string) bool) (string, error) {
 	token, err := decoder.Token()
 	if err != nil {
 		return "", err
 	}
 	value, ok := token.(string)
-	if !ok || invalidJSONString(value) {
+	if !ok || !valid(value) {
 		return "", provider.NewFailure(provider.ReasonMalformed, "json-string-required")
 	}
 	if len(value) > limit {
@@ -607,7 +623,7 @@ func skipValue(decoder *json.Decoder, depth int, count *int) error {
 		return err
 	}
 	*count = *count + 1
-	if text, ok := token.(string); ok && invalidJSONString(text) {
+	if text, ok := token.(string); ok && !validDisplayJSONString(text) {
 		return provider.NewFailure(provider.ReasonMalformed, "invalid-json-string")
 	}
 	delimiter, ok := token.(json.Delim)
@@ -647,6 +663,15 @@ func skipValue(decoder *json.Decoder, depth int, count *int) error {
 
 func invalidJSONString(value string) bool {
 	return !utf8.ValidString(value) || strings.ContainsRune(value, utf8.RuneError)
+}
+
+func validJSONString(value string) bool {
+	return !invalidJSONString(value)
+}
+
+func validDisplayJSONString(value string) bool {
+	// encoding/jsonが置換したU+FFFDも表示文字として保持し、構文エラーはdecoderに任せる。
+	return utf8.ValidString(value)
 }
 
 func serviceProviderID(networkID, serviceID uint16) uint64 {

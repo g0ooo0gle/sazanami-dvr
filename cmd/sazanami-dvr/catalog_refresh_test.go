@@ -45,7 +45,7 @@ func TestRecordingCatalogRefreshPublishesOnlyValidatedGeneration(t *testing.T) {
 	var providerBeforeGC atomic.Bool
 	var checkGCOrdering atomic.Bool
 	var gcCalls atomic.Int32
-	state.service, state.title = "更新前の局", "更新前の番組"
+	state.service, state.title = "更新前の局 �", "更新前の番組 �"
 	providerServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if checkGCOrdering.Load() && gcCalls.Load() == 0 {
 			providerBeforeGC.Store(true)
@@ -111,7 +111,7 @@ func TestRecordingCatalogRefreshPublishesOnlyValidatedGeneration(t *testing.T) {
 	}
 
 	state.Lock()
-	state.service = "更新後の局"
+	state.service = "更新後の局 �"
 	state.Unlock()
 	followCalls := 0
 	automaticCalls := 0
@@ -168,11 +168,11 @@ func TestRecordingCatalogRefreshPublishesOnlyValidatedGeneration(t *testing.T) {
 	}
 	operation.automatic = nil
 	value, err := holder.Load().Current(context.Background())
-	if err != nil || len(value.Services) != 1 || value.Services[0].ServiceName != "更新後の局" {
+	if err != nil || len(value.Services) != 1 || value.Services[0].ServiceName != "更新後の局 �" {
 		t.Fatalf("snapshot=%+v err=%v", value, err)
 	}
 	programs, err := holder.Load().CurrentProgramsForService(context.Background(), "100003", 16, "")
-	if err != nil || len(programs) != 1 || programs[0].Material.Title == nil || *programs[0].Material.Title != "更新前の番組" {
+	if err != nil || len(programs) != 1 || programs[0].Material.Title == nil || *programs[0].Material.Title != "更新前の番組 �" {
 		t.Fatalf("programs=%+v err=%v", programs, err)
 	}
 	accepted := holder.Load()

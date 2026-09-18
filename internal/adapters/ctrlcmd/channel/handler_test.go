@@ -138,6 +138,22 @@ func TestSyntheticGoldenResponses(t *testing.T) {
 	}
 }
 
+func TestReplacementCharacterServiceNamesPassCtrlCmdOutput(t *testing.T) {
+	service := syntheticService()
+	service.ProviderName = "提供 �"
+	service.ServiceName = "局 �"
+	service.NetworkName = "ネット �"
+	service.TransportStreamName = "TS �"
+	source := &fixedSource{snapshot: Snapshot{Key: "replacement", Services: []Service{service}}}
+	var destination bytes.Buffer
+	if err := (Handler{Source: source}).Handle(context.Background(), enumRequest(), &destination); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(destination.Bytes(), expectedServiceResponse(service)) {
+		t.Fatalf("response=%x want=%x", destination.Bytes(), expectedServiceResponse(service))
+	}
+}
+
 func TestCanonicalEmptyResponses(t *testing.T) {
 	for _, test := range []struct {
 		name    string

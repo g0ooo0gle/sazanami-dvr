@@ -121,8 +121,8 @@ func TestInvalidUTF8AndUnknownStructureLimits(t *testing.T) {
 	t.Run("invalid utf8", func(t *testing.T) {
 		server := newCatalogServer(t, func(writer http.ResponseWriter, _ *http.Request) {
 			writer.Header().Set("Content-Type", "application/json")
-			body := append([]byte(`[{"id":100002,"networkId":1,"serviceId":2,"name":"`), 0xff)
-			body = append(body, []byte(`","type":1}]`)...)
+			body := append([]byte(`[{"id":100002,"networkId":1,"serviceId":2,"name":"x","type":1,"`), 0xff)
+			body = append(body, []byte(`":"value"}]`)...)
 			_, _ = writer.Write(body)
 		})
 		defer server.Close()
@@ -322,7 +322,11 @@ func TestCursorReturnsPageBeforeWholeArrayArrives(t *testing.T) {
 			if index != 0 {
 				_, _ = io.WriteString(writer, `,`)
 			}
-			_, _ = fmt.Fprintf(writer, `{"id":%d,"networkId":1,"serviceId":%d,"name":"s","type":1}`, serviceProviderID(1, uint16(index)), index)
+			name := "s"
+			if index == 255 {
+				name = "�"
+			}
+			_, _ = fmt.Fprintf(writer, `{"id":%d,"networkId":1,"serviceId":%d,"name":"%s","type":1}`, serviceProviderID(1, uint16(index)), index, name)
 		}
 		writer.(http.Flusher).Flush()
 		close(pageWritten)
@@ -345,7 +349,7 @@ func TestCursorReturnsPageBeforeWholeArrayArrives(t *testing.T) {
 	}()
 	select {
 	case page := <-result:
-		if err := <-errorsFound; err != nil || len(page.Items) != 256 || page.End {
+		if err := <-errorsFound; err != nil || len(page.Items) != 256 || page.End || page.Items[255].DisplayName != "�" {
 			t.Fatalf("page=%+v err=%v", page, err)
 		}
 	case <-time.After(time.Second):
