@@ -235,6 +235,148 @@ func TestRecordingCatalogRefreshPublishesOnlyValidatedGeneration(t *testing.T) {
 	}
 }
 
+func TestMirakurunReplacementTextCatalogSyncKeeps257ProgramsAndReusesRevisions(t *testing.T) {
+	const (
+		networkID  = 1
+		serviceID  = 3
+		serviceKey = 100003
+		programID  = 10000300000
+	)
+	var programs bytes.Buffer
+	programs.WriteByte('[')
+	for index := 0; index < 257; index++ {
+		if index > 0 {
+			programs.WriteByte(',')
+		}
+		eventID := index + 1
+		startMS := int64(1786237200000) + int64(index)*1800000
+		fmt.Fprintf(&programs, `{"id":%d,"networkId":%d,"serviceId":%d,"eventId":%d,"startAt":%d,"duration":1800000,"isFree":true,"name":"`, programID+eventID, networkID, serviceID, eventID, startMS)
+		switch index {
+		case 0:
+			programs.WriteString("literal �")
+		case 1:
+			programs.WriteString(`escaped \uFFFD`)
+		case 254:
+			programs.WriteString("before-literal �")
+		case 255:
+			programs.WriteString("boundary-raw ")
+			programs.WriteByte(0xff)
+		case 256:
+			programs.WriteString(`after-high \ud800`)
+		default:
+			fmt.Fprintf(&programs, "program-%d", eventID)
+		}
+		programs.WriteString(`","description":"`)
+		switch index {
+		case 253:
+			programs.WriteString(`before-low \udc00`)
+		case 254:
+			programs.WriteString(`before-escaped \uFFFD`)
+		case 256:
+			programs.WriteString("after-literal �")
+		default:
+			programs.WriteString("description")
+		}
+		programs.WriteString(`"}`)
+	}
+	programs.WriteByte(']')
+	programJSON := programs.Bytes()
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/api/services":
+			_, _ = fmt.Fprint(writer, `[{"id":100003,"networkId":1,"serviceId":3,"name":"synthetic","type":1}]`)
+		case "/api/programs":
+			_, _ = writer.Write(programJSON)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	root := migratedRoot(t)
+	store, err := sqliteadapter.OpenStore(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	provider, err := mirakurunadapter.New(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer provider.CloseIdleConnections()
+	identityHash := provider.IdentityHash()
+	backendID := stableBackendID(identityHash)
+	service := catalogsync.Service{Provider: provider, Repository: store, Clock: wallClock{}}
+	request := catalogsync.Request{
+		Backend:       catalogmodel.Backend{ID: backendID, Kind: "MIRAKURUN", IdentityHash: identityHash},
+		CorrelationID: "replacement-text-first", ServicePageLimit: 256, ProgramPageLimit: 256,
+	}
+	firstResult, err := service.Sync(context.Background(), request)
+	if err != nil || firstResult.Services != 1 || firstResult.Programs != 257 {
+		t.Fatalf("first result=%+v err=%v", firstResult, err)
+	}
+
+	readCurrent := func() map[string]catalogmodel.CurrentProgram {
+		t.Helper()
+		current := make(map[string]catalogmodel.CurrentProgram, 257)
+		afterEvent := ""
+		for {
+			page, pageErr := store.CurrentProgramsForService(context.Background(), backendID, fmt.Sprint(serviceKey), 256, afterEvent)
+			if pageErr != nil {
+				t.Fatal(pageErr)
+			}
+			for _, program := range page {
+				current[program.EventLocator] = program
+			}
+			if len(page) < 256 {
+				break
+			}
+			afterEvent = page[len(page)-1].EventLocator
+		}
+		return current
+	}
+	first := readCurrent()
+	if len(first) != 257 {
+		t.Fatalf("first current program count=%d", len(first))
+	}
+	for eventID, want := range map[string]struct {
+		title       string
+		description string
+	}{
+		"10000300001": {title: "literal �", description: "description"},
+		"10000300002": {title: "escaped �", description: "description"},
+		"10000300254": {title: "program-254", description: "before-low �"},
+		"10000300255": {title: "before-literal �", description: "before-escaped �"},
+		"10000300256": {title: "boundary-raw �", description: "description"},
+		"10000300257": {title: "after-high �", description: "after-literal �"},
+	} {
+		program, ok := first[eventID]
+		if !ok || program.Material.Title == nil || *program.Material.Title != want.title ||
+			program.Material.Description == nil || *program.Material.Description != want.description {
+			t.Fatalf("event=%s program=%+v want=%+v present=%v", eventID, program, want, ok)
+		}
+	}
+
+	request.CorrelationID = "replacement-text-replay"
+	secondResult, err := service.Sync(context.Background(), request)
+	if err != nil || secondResult.Services != 1 || secondResult.Programs != 257 {
+		t.Fatalf("second result=%+v err=%v", secondResult, err)
+	}
+	second := readCurrent()
+	if len(second) != len(first) {
+		t.Fatalf("replay current program count=%d want=%d", len(second), len(first))
+	}
+	for eventID, before := range first {
+		after, ok := second[eventID]
+		if !ok || after.InstanceID != before.InstanceID || after.RevisionID != before.RevisionID ||
+			after.RevisionNumber != before.RevisionNumber {
+			t.Fatalf("event=%s before=%+v after=%+v present=%v", eventID, before, after, ok)
+		}
+	}
+}
+
 func openFileDescriptorCount() (int, bool) {
 	entries, err := os.ReadDir("/dev/fd")
 	if err != nil {

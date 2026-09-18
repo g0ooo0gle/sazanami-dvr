@@ -90,7 +90,7 @@ func TestSetupCreatesAndReusesChannelMapWithUnresolvedPrograms(t *testing.T) {
 		if output.String() != "setup result=completed services=4 channel_map="+expectedState+"\n" {
 			t.Fatalf("run %d output=%q", runIndex, output.String())
 		}
-		for _, private := range []string{server.URL, root, "gr station �", "bs station", "cs station", "a1 station", "excluded 4k", "private program"} {
+		for _, private := range []string{server.URL, root, "gr station", "bs station", "cs station", "a1 station", "excluded 4k", "private program"} {
 			if strings.Contains(output.String(), private) || strings.Contains(diagnostic.String(), private) {
 				t.Fatalf("run %d leaked %q: output=%q diagnostic=%q", runIndex, private, output.String(), diagnostic.String())
 			}
