@@ -16,6 +16,7 @@ import (
 	"time"
 
 	sqliteadapter "github.com/g0ooo0gle/sazanami-dvr/internal/adapters/sqlite"
+	"github.com/g0ooo0gle/sazanami-dvr/internal/core/catalogmodel"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/mpegts"
 )
 
@@ -45,7 +46,7 @@ func TestSetupCreatesAndReusesChannelMapWithUnresolvedPrograms(t *testing.T) {
 				`{"id":300006,"networkId":3,"serviceId":6,"name":"a1 station","type":161},`+
 				`{"id":400007,"networkId":4,"serviceId":7,"name":"excluded 4k","type":173},`+
 				`{"id":100004,"networkId":1,"serviceId":4,"name":"bs station","type":2,"remoteControlKeyId":4},`+
-				`{"id":100003,"networkId":1,"serviceId":3,"name":"gr station","type":1,"remoteControlKeyId":3},`+
+				`{"id":100003,"networkId":1,"serviceId":3,"name":"gr station �","type":1,"remoteControlKeyId":3},`+
 				`{"id":200005,"networkId":2,"serviceId":5,"name":"cs station","type":162,"remoteControlKeyId":5}`+
 				`]`)
 		case "/api/programs":
@@ -150,6 +151,29 @@ func TestSetupCreatesAndReusesChannelMapWithUnresolvedPrograms(t *testing.T) {
 			service.RemoteControlKey != want.remote || !service.EPGCapture || !service.Search {
 			t.Fatalf("service[%d]=%+v want=%+v", index, service, want)
 		}
+	}
+	store, err := sqliteadapter.OpenStore(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backends, err := store.CurrentBackends(context.Background(), 16, catalogmodel.ID{})
+	if err != nil || len(backends) != 1 {
+		_ = store.Close()
+		t.Fatalf("backends=%+v err=%v", backends, err)
+	}
+	currentServices, err := store.CurrentServices(context.Background(), backends[0].ID, 16, catalogmodel.ID{})
+	foundReplacementName := false
+	for _, service := range currentServices {
+		if service.ProviderLocator == "100003" && service.DisplayName == "gr station �" {
+			foundReplacementName = true
+		}
+	}
+	if err != nil || len(currentServices) != 5 || !foundReplacementName {
+		_ = store.Close()
+		t.Fatalf("services=%+v err=%v", currentServices, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
 	}
 
 	var output, diagnostic bytes.Buffer

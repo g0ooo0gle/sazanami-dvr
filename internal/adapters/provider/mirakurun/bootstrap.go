@@ -87,7 +87,7 @@ func decodeBootstrapService(decoder *json.Decoder) (BootstrapService, error) {
 			result.ServiceID = uint16(value)
 			hasService = err == nil
 		case "name":
-			result.Name, err = readString(decoder, 4_096)
+			result.Name, err = readDisplayString(decoder, 4_096)
 			hasName = err == nil
 		case "type":
 			serviceType, err = readUint(decoder, math.MaxUint16)

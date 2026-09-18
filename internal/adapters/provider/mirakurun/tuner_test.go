@@ -54,7 +54,7 @@ func TestObserveTunerCountRejectsInvalidJSON(t *testing.T) {
 		{name: "top level object", body: []byte(`{}`), reason: provider.ReasonMalformed},
 		{name: "non object", body: []byte(`[1]`), reason: provider.ReasonMalformed},
 		{name: "duplicate key", body: []byte(`[{"name":"a","name":"b"}]`), reason: provider.ReasonMalformed},
-		{name: "invalid utf8", body: append([]byte(`[{"name":"`), append([]byte{0xff}, []byte(`"}]`)...)...), reason: provider.ReasonMalformed},
+		{name: "invalid utf8 key", body: append([]byte(`[{"name":"x","`), append([]byte{0xff}, []byte(`":"value"}]`)...)...), reason: provider.ReasonMalformed},
 		{name: "depth", body: []byte(`[{"future":` + deep + `}]`), reason: provider.ReasonOverLimit},
 		{name: "tokens", body: []byte(`[{"future":[` + tokens + `]}]`), reason: provider.ReasonOverLimit},
 		{name: "trailing", body: []byte(`[{}] {}`), reason: provider.ReasonMalformed},

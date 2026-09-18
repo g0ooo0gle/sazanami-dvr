@@ -13,13 +13,13 @@ import (
 
 func TestEventMetadataMatchesKonomiTVReaderLayout(t *testing.T) {
 	start, duration, eventID := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC).UnixMilli(), int64(30*time.Minute/time.Millisecond), int64(4)
-	title, description := "番組", "概要"
+	title, description := "番組 �", "概要 �"
 	video := catalogmodel.Video{StreamContent: 1, ComponentType: 0xb3}
 	program := catalogmodel.CurrentProgram{RawEventID: &eventID, Material: catalogmodel.RevisionMaterial{
 		StartUTCMS: &start, DurationMS: &duration, Title: &title, Description: &description,
 		FreeAccess: catalogmodel.FreeYes, Validation: catalogmodel.ValidationValid,
 		Metadata: catalogmodel.ProgramMetadata{
-			Extended: []catalogmodel.ExtendedItem{{Heading: "Z", Body: "End"}, {Heading: "A\r\nB", Body: "Line1\r\nLine2"}},
+			Extended: []catalogmodel.ExtendedItem{{Heading: "Z �", Body: "End �"}, {Heading: "A\r\nB", Body: "Line1\r\nLine2"}},
 			Genres:   []catalogmodel.Genre{{Level1: 1, Level2: 2, User1: 3, User2: 4}},
 			Video:    &video,
 			Audios: []catalogmodel.Audio{
@@ -80,7 +80,7 @@ func TestEventMetadataMatchesKonomiTVReaderLayout(t *testing.T) {
 		}
 		if err := event.Structure(func(ext *codec.Reader) error {
 			got, err := ext.String()
-			want := "- A  B\r\nLine1\nLine2\r\n- Z\r\nEnd"
+			want := "- A  B\r\nLine1\nLine2\r\n- Z �\r\nEnd �"
 			if err != nil || got != want {
 				return fmt.Errorf("extended=%q want=%q err=%w", got, want, err)
 			}
