@@ -138,72 +138,98 @@ func (collector *PSICollector) Incomplete() bool {
 
 // Feed は一件のpacketを取り込み、そのpacketまでに完成したsectionを返す。
 func (collector *PSICollector) Feed(packet []byte) ([][]byte, error) {
-	parsed, err := ParsePacket(packet)
-	if err != nil {
+	var sections [][]byte
+	if err := collector.feedUntil(packet, func(section []byte) (bool, error) {
+		sections = append(sections, section)
+		return false, nil
+	}); err != nil {
 		return nil, err
 	}
+	return sections, nil
+}
+
+// FeedUntil は完成したsectionをemitへ渡し、emitが停止を返した時点で
+// 同じpacket内の残りを処理せずに戻る。通常のFeedは全sectionを処理する。
+func (collector *PSICollector) FeedUntil(packet []byte, emit func([]byte) (bool, error)) error {
+	if emit == nil {
+		return ErrPSI
+	}
+	return collector.feedUntil(packet, emit)
+}
+
+func (collector *PSICollector) feedUntil(packet []byte, emit func([]byte) (bool, error)) error {
+	parsed, err := ParsePacket(packet)
+	if err != nil {
+		return err
+	}
 	if collector.pidKnown && parsed.PID != collector.pid {
-		return nil, ErrPSI
+		return ErrPSI
 	}
 	if !collector.pidKnown {
 		collector.pid, collector.pidKnown = parsed.PID, true
 	}
 	if !parsed.HasPayload {
-		return nil, nil
+		return nil
 	}
 	if collector.continuityKnown && !parsed.Discontinuity && parsed.ContinuityCounter != (collector.continuity+1)&0x0f {
-		return nil, ErrPSI
+		return ErrPSI
 	}
 	collector.continuity, collector.continuityKnown = parsed.ContinuityCounter, true
 	payload := parsed.Payload
 	if len(payload) == 0 {
-		return nil, ErrPSI
+		return ErrPSI
 	}
 	if !parsed.PayloadUnitStart {
 		if len(collector.section) == 0 {
-			return nil, nil
+			return nil
 		}
 		completed, rest, err := collector.append(payload)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if len(rest) != 0 && !allStuffing(rest) {
-			return nil, ErrPSI
+			return ErrPSI
 		}
 		if completed == nil {
-			return nil, nil
+			return nil
 		}
-		return [][]byte{completed}, nil
+		_, err = emit(completed)
+		return err
 	}
 
 	pointer := int(payload[0])
 	if pointer > len(payload)-1 {
-		return nil, ErrPSI
+		return ErrPSI
 	}
-	var sections [][]byte
 	if len(collector.section) != 0 {
 		completed, rest, appendErr := collector.append(payload[1 : 1+pointer])
 		if appendErr != nil || completed == nil || len(rest) != 0 {
-			return nil, ErrPSI
+			return ErrPSI
 		}
-		sections = append(sections, completed)
+		stop, emitErr := emit(completed)
+		if emitErr != nil || stop {
+			return emitErr
+		}
 	}
 	payload = payload[1+pointer:]
 	if len(payload) == 0 || payload[0] == 0xff {
-		return nil, ErrPSI
+		return ErrPSI
 	}
 	for len(payload) != 0 && payload[0] != 0xff {
 		completed, rest, appendErr := collector.append(payload)
 		if appendErr != nil {
-			return nil, appendErr
+			return appendErr
 		}
 		if completed == nil {
 			break
 		}
-		sections = append(sections, completed)
+		stop, emitErr := emit(completed)
+		if emitErr != nil || stop {
+			return emitErr
+		}
 		payload = rest
 	}
-	return sections, nil
+	return nil
 }
 
 func (collector *PSICollector) append(data []byte) ([]byte, []byte, error) {

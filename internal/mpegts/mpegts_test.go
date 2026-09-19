@@ -169,6 +169,35 @@ func TestPSICollectorAcceptsNonzeroPointerAndMultipleSections(t *testing.T) {
 	}
 }
 
+func TestPSICollectorFeedUntilStopsBeforeLaterInvalidSection(t *testing.T) {
+	first := testPATSection(0, []uint16{1})
+	second := append([]byte(nil), first...)
+	second[1], second[2] = 0xbf, 0xff
+	packet := testPayloadPacket(0, 0)
+	packet[1] |= 0x40
+	packet[4] = 0
+	copy(packet[5:], first)
+	copy(packet[5+len(first):], second)
+	var collector PSICollector
+	count := 0
+	if err := collector.FeedUntil(packet, func(section []byte) (bool, error) {
+		count++
+		if !bytes.Equal(section, first) {
+			t.Fatalf("section=%x", section)
+		}
+		return true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("sections=%d", count)
+	}
+	collector = PSICollector{}
+	if _, err := collector.Feed(packet); !errors.Is(err, ErrPSI) {
+		t.Fatalf("regular feed err=%v", err)
+	}
+}
+
 func TestPATPMTAndVersionTracking(t *testing.T) {
 	patSection := testPATSection(31, []uint16{1})
 	pat, err := ParsePAT(patSection)

@@ -5,8 +5,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"os"
 	"runtime"
 	"strings"
@@ -225,6 +228,135 @@ func TestProbeTransportStreamIDFromChannelStopsAfterCompleteGeneration(t *testin
 	got, err := adapter.ProbeTransportStreamIDFromChannel(context.Background(), BootstrapChannel{Type: "GR", Channel: "13"}, 1, 2)
 	if err != nil || got != 0x1234 {
 		t.Fatalf("tsid=%x err=%v", got, err)
+	}
+}
+
+func TestProbeTransportStreamIDFromChannelStopsBeforeTrailingInvalidPacket(t *testing.T) {
+	complete := probeSDTSection(t, 0x42, 0x1234, 1, 3, true, 0, 0, 2)
+	body := append(probeSDTStream(t, complete), bytes.Repeat([]byte{0}, mpegts.PacketBytes)...)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "video/MP2T")
+		_, _ = writer.Write(body)
+	}))
+	defer server.Close()
+	adapter, err := NewStream(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer adapter.CloseIdleConnections()
+	got, err := adapter.ProbeTransportStreamIDFromChannel(context.Background(), BootstrapChannel{Type: "GR", Channel: "13"}, 1, 2)
+	if err != nil || got != 0x1234 {
+		t.Fatalf("tsid=%x err=%v", got, err)
+	}
+}
+
+func TestProbeTransportStreamIDFromChannelStopsBeforeLaterInvalidSectionInPacket(t *testing.T) {
+	complete := probeSDTSection(t, 0x42, 0x1234, 1, 3, true, 0, 0, 2)
+	invalid := append([]byte(nil), complete...)
+	invalid[1], invalid[2] = 0xbf, 0xff
+	body := append(probeSDTSectionPacket(t, complete, invalid), bytes.Repeat(probeNullPacket(), 4)...)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "video/MP2T")
+		_, _ = writer.Write(body)
+	}))
+	defer server.Close()
+	adapter, err := NewStream(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer adapter.CloseIdleConnections()
+	got, err := adapter.ProbeTransportStreamIDFromChannel(context.Background(), BootstrapChannel{Type: "GR", Channel: "13"}, 1, 2)
+	if err != nil || got != 0x1234 {
+		t.Fatalf("tsid=%x err=%v", got, err)
+	}
+}
+
+func TestSDTProbeUsesDeadlineAndReadBufferCap(t *testing.T) {
+	if probeDeadline != 15*time.Second || probeReadBytes != 32*1024 {
+		t.Fatalf("probe limits deadline=%v read=%d", probeDeadline, probeReadBytes)
+	}
+	body := &recordingProbeBody{reader: bytes.NewReader(probeSDTTransportStream(t, 0x1234, 1, 2))}
+	connection, peer := net.Pipe()
+	defer peer.Close()
+	deadlines := make(chan time.Time, 1)
+	adapter, err := NewStream("http://probe.invalid:80")
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter.client.Transport = &probeRoundTripper{body: body, connection: connection, deadlines: deadlines}
+	defer adapter.CloseIdleConnections()
+
+	got, err := adapter.ProbeTransportStreamIDFromChannel(context.Background(), BootstrapChannel{Type: "GR", Channel: "13"}, 1, 2)
+	if err != nil || got != 0x1234 {
+		t.Fatalf("tsid=%x err=%v", got, err)
+	}
+	deadline := <-deadlines
+	if remaining := time.Until(deadline); remaining <= probeDeadline-time.Second || remaining > probeDeadline {
+		t.Fatalf("deadline remaining=%v", remaining)
+	}
+	if body.maxRead != 32*1024 {
+		t.Fatalf("read buffer=%d", body.maxRead)
+	}
+}
+
+func TestProbeTransportStreamIDFromChannelStopsAt64MiB(t *testing.T) {
+	body := &patternProbeBody{remaining: sdtProbeMaxBytes, pattern: probeNullPacket()}
+	connection, peer := net.Pipe()
+	defer peer.Close()
+	adapter, err := NewStream("http://probe.invalid:80")
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter.client.Transport = &probeRoundTripper{body: body, connection: connection}
+	defer adapter.CloseIdleConnections()
+
+	if _, err := adapter.ProbeTransportStreamIDFromChannel(context.Background(), BootstrapChannel{Type: "GR", Channel: "13"}, 1, 2); !provider.IsReason(err, provider.ReasonOverLimit) {
+		t.Fatalf("err=%v remaining=%d maxRead=%d", err, body.remaining, body.maxRead)
+	}
+	if body.remaining != 0 || body.maxRead != 32*1024 {
+		t.Fatalf("remaining=%d maxRead=%d", body.remaining, body.maxRead)
+	}
+}
+
+func TestSDTGenerationResourceCeilings(t *testing.T) {
+	if sdtProbeMaxBytes != 64*1024*1024 || sdtProbeSectionBytes != 256*1024 || sdtProbeManagementBytes != 64*1024 {
+		t.Fatalf("probe bounds bytes=%d section=%d management=%d", sdtProbeMaxBytes, sdtProbeSectionBytes, sdtProbeManagementBytes)
+	}
+	section := bytes.Repeat([]byte{0x42}, mpegts.MaxSDTSectionBytes)
+	generation := sdtGeneration{}
+	for sectionNumber := 0; sectionNumber < sdtProbeMaxSections; sectionNumber++ {
+		table := mpegts.SDT{
+			TransportStreamID: 0x1234, OriginalNetworkID: 1, CurrentNext: true,
+			SectionNumber: byte(sectionNumber), LastSectionNumber: sdtProbeMaxSections - 1,
+		}
+		if sectionNumber == 0 {
+			table.ServiceIDs = []uint16{2}
+		}
+		transportStreamID, complete, err := generation.accept(table, section, 1, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sectionNumber == sdtProbeMaxSections-1 && (!complete || transportStreamID != 0x1234) {
+			t.Fatalf("complete=%v tsid=%x", complete, transportStreamID)
+		}
+	}
+	if generation.sectionBytes != sdtProbeSectionBytes {
+		t.Fatalf("section bytes=%d", generation.sectionBytes)
+	}
+	if managementBytes := generation.managementBytes(sdtProbeMaxSections, sdtProbeMaxServices); managementBytes != 20*1024 || managementBytes > sdtProbeManagementBytes {
+		t.Fatalf("management bytes=%d", managementBytes)
+	}
+
+	over := sdtGeneration{
+		initialized: true, transportStreamID: 0x1234, originalNetworkID: 1,
+		lastSection: 1, sectionCount: 1, sectionBytes: sdtProbeSectionBytes - len(section) + 1,
+	}
+	_, _, err := over.accept(mpegts.SDT{
+		TransportStreamID: 0x1234, OriginalNetworkID: 1, CurrentNext: true,
+		SectionNumber: 1, LastSectionNumber: 1,
+	}, section, 1, 2)
+	if !provider.IsReason(err, provider.ReasonOverLimit) {
+		t.Fatalf("section overflow err=%v", err)
 	}
 }
 
@@ -1046,4 +1178,81 @@ func probeSDTStream(t *testing.T, sections ...[]byte) []byte {
 		result = append(result, probeNullPacket()...)
 	}
 	return result
+}
+
+func probeSDTSectionPacket(t *testing.T, sections ...[]byte) []byte {
+	t.Helper()
+	packet := probeNullPacket()
+	packet[1], packet[2], packet[3] = 0x40, 0x11, 0x10
+	payload := []byte{0}
+	for _, section := range sections {
+		payload = append(payload, section...)
+	}
+	if len(payload) > mpegts.PacketBytes-4 {
+		t.Fatalf("section payload=%d", len(payload))
+	}
+	copy(packet[4:], payload)
+	return packet
+}
+
+type recordingProbeBody struct {
+	reader  io.Reader
+	maxRead int
+}
+
+func (body *recordingProbeBody) Read(data []byte) (int, error) {
+	if len(data) > body.maxRead {
+		body.maxRead = len(data)
+	}
+	return body.reader.Read(data)
+}
+
+func (body *recordingProbeBody) Close() error { return nil }
+
+type patternProbeBody struct {
+	remaining int
+	pattern   []byte
+	patternAt int
+	maxRead   int
+}
+
+func (body *patternProbeBody) Read(data []byte) (int, error) {
+	if len(data) > body.maxRead {
+		body.maxRead = len(data)
+	}
+	if body.remaining == 0 {
+		return 0, io.EOF
+	}
+	count := min(len(data), body.remaining)
+	for offset := 0; offset < count; {
+		patternAt := body.patternAt % len(body.pattern)
+		n := copy(data[offset:count], body.pattern[patternAt:])
+		offset += n
+		body.patternAt += n
+	}
+	body.remaining -= count
+	return count, nil
+}
+
+func (body *patternProbeBody) Close() error { return nil }
+
+type probeRoundTripper struct {
+	body       io.ReadCloser
+	connection net.Conn
+	deadlines  chan time.Time
+}
+
+func (transport *probeRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	if trace := httptrace.ContextClientTrace(request.Context()); trace != nil && trace.GotConn != nil {
+		trace.GotConn(httptrace.GotConnInfo{Conn: transport.connection})
+	}
+	if transport.deadlines != nil {
+		if deadline, ok := request.Context().Deadline(); ok {
+			transport.deadlines <- deadline
+		}
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"video/MP2T"}},
+		Body: transport.body, ContentLength: -1, Request: request,
+	}, nil
 }

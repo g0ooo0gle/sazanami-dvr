@@ -60,6 +60,8 @@ func TestObserveBootstrapServicesKeepsInvalidOptionalChannelUnavailable(t *testi
 		{name: "unsupported type", field: `"channel":{"type":"BS4K","channel":"13"}`},
 		{name: "invalid channel characters", field: `"channel":{"type":"GR","channel":"13/14"}`},
 		{name: "invalid channel bytes", field: `"channel":{"type":"GR","channel":"地上波"}`},
+		{name: "empty channel", field: `"channel":{"type":"GR","channel":""}`},
+		{name: "channel over limit", field: fmt.Sprintf(`"channel":{"type":"GR","channel":"%s"}`, strings.Repeat("A", 65))},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			field := ""
@@ -72,6 +74,30 @@ func TestObserveBootstrapServicesKeepsInvalidOptionalChannelUnavailable(t *testi
 			services, err := mustAdapter(t, server.URL).ObserveBootstrapServices(context.Background())
 			if err != nil || len(services) != 1 || services[0].Channel != nil {
 				t.Fatalf("services=%+v err=%v", services, err)
+			}
+		})
+	}
+}
+
+func TestObserveBootstrapServicesAcceptsSupportedChannelBoundaries(t *testing.T) {
+	for _, test := range []struct {
+		name, channelType, channel string
+	}{
+		{name: "BS", channelType: "BS", channel: "BS1"},
+		{name: "CS", channelType: "CS", channel: "CS1"},
+		{name: "64 bytes", channelType: "CS", channel: strings.Repeat("A", 64)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := fmt.Sprintf(`[{"id":%d,"networkId":1,"serviceId":2,"name":"x","type":1,"channel":{"type":"%s","channel":"%s"}}]`,
+				serviceProviderID(1, 2), test.channelType, test.channel)
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writeJSON(writer, body) }))
+			defer server.Close()
+			services, err := mustAdapter(t, server.URL).ObserveBootstrapServices(context.Background())
+			if err != nil || len(services) != 1 || services[0].Channel == nil {
+				t.Fatalf("services=%+v err=%v", services, err)
+			}
+			if services[0].Channel.Type != test.channelType || services[0].Channel.Channel != test.channel {
+				t.Fatalf("channel=%+v", services[0].Channel)
 			}
 		})
 	}

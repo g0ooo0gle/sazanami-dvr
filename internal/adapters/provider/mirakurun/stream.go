@@ -40,6 +40,8 @@ const (
 	sdtProbeServiceBitsetLen = 1 << 13
 )
 
+var errSDTProbeComplete = errors.New("sdt probe complete")
+
 // StreamAdapterはMirakurun互換のservice streamだけを開く専用HTTP clientを所有する。
 type StreamAdapter struct {
 	base   url.URL
@@ -229,33 +231,43 @@ func (adapter *StreamAdapter) ProbeTransportStreamIDFromChannel(ctx context.Cont
 		total += read
 		if read > 0 {
 			feedErr := packetizer.Feed(readBuffer[:read], func(packet []byte) error {
-				if completed {
-					return nil
-				}
 				if mpegts.PID(packet) != 0x0011 {
 					return nil
 				}
-				sections, sectionErr := collector.Feed(packet)
-				if sectionErr != nil {
-					return sectionErr
-				}
-				for _, section := range sections {
+				sectionErr := collector.FeedUntil(packet, func(section []byte) (bool, error) {
 					if len(section) == 0 || section[0] != 0x42 {
-						continue
+						return false, nil
 					}
 					sdt, parseErr := mpegts.ParseSDT(section)
 					if parseErr != nil {
-						return parseErr
+						return false, parseErr
 					}
 					if _, complete, acceptErr := generation.accept(sdt, section, networkID, serviceID); acceptErr != nil {
-						return acceptErr
+						return false, acceptErr
 					} else if complete {
 						completed = true
-						return nil
+						return true, nil
 					}
+					return false, nil
+				})
+				if sectionErr != nil {
+					return sectionErr
+				}
+				if completed {
+					return errSDTProbeComplete
 				}
 				return nil
 			})
+			if errors.Is(feedErr, errSDTProbeComplete) {
+				transportStreamID, complete, resultErr := generation.result(serviceID)
+				if !complete {
+					return 0, provider.NewFailure(provider.ReasonInternal, "probe-sdt-completion-state-invalid")
+				}
+				if resultErr != nil {
+					return 0, resultErr
+				}
+				return transportStreamID, nil
+			}
 			if feedErr != nil {
 				return 0, sdtParserFailure(feedErr)
 			}
