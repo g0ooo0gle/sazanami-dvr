@@ -183,6 +183,103 @@ func TestSetupCreatesAndReusesChannelMapWithUnresolvedPrograms(t *testing.T) {
 	}
 }
 
+func TestSetupUsesSDTChannelFallbackForIdleService(t *testing.T) {
+	root := ownerOnlyRoot(t)
+	startMS := time.Now().UTC().Add(time.Hour).UnixMilli()
+	var serviceCalls, channelCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/version":
+			writeCommandJSON(writer, `{"current":"test","latest":"test"}`)
+		case "/api/services":
+			writeCommandJSON(writer, `[{"id":100003,"networkId":1,"serviceId":3,"name":"idle service","type":1,"channel":{"type":"GR","channel":"13"}}]`)
+		case "/api/programs":
+			writeCommandJSON(writer, fmt.Sprintf(`[{"id":10000300005,"networkId":1,"serviceId":3,"eventId":5,"startAt":%d,"duration":1800000,"isFree":true,"name":"program","description":""}]`, startMS))
+		case "/api/services/100003/stream":
+			serviceCalls.Add(1)
+			writer.Header().Set("Content-Type", "video/MP2T")
+		case "/api/channels/GR/13/stream":
+			channelCalls.Add(1)
+			writer.Header().Set("Content-Type", "video/MP2T")
+			_, _ = writer.Write(setupSDT(0x1234, 1, 3))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	var output, diagnostic bytes.Buffer
+	if code := runContext(context.Background(), []string{"setup", "--mirakurun-url", server.URL, "--data-root", root}, &output, &diagnostic); code != 0 {
+		t.Fatalf("code=%d output=%q diagnostic=%q", code, output.String(), diagnostic.String())
+	}
+	if output.String() != "setup result=completed services=1 channel_map=created\n" {
+		t.Fatalf("output=%q", output.String())
+	}
+	if serviceCalls.Load() != 1 || channelCalls.Load() != 1 {
+		t.Fatalf("serviceCalls=%d channelCalls=%d", serviceCalls.Load(), channelCalls.Load())
+	}
+	data, err := os.ReadFile(filepath.Join(root, "channels.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document struct {
+		Services []struct {
+			TransportStreamID uint16 `json:"transport_stream_id"`
+		} `json:"services"`
+	}
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	if len(document.Services) != 1 || document.Services[0].TransportStreamID != 4660 {
+		t.Fatalf("channel map=%s", data)
+	}
+}
+
+func TestSetupDoesNotPublishPartialMapWhenOneServiceCannotBeConfirmed(t *testing.T) {
+	root := ownerOnlyRoot(t)
+	startMS := time.Now().UTC().Add(time.Hour).UnixMilli()
+	var serviceCalls, channelCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/version":
+			writeCommandJSON(writer, `{"current":"test","latest":"test"}`)
+		case "/api/services":
+			writeCommandJSON(writer, `[
+				{"id":100002,"networkId":1,"serviceId":2,"name":"confirmed","type":1,"channel":{"type":"GR","channel":"13"}},
+				{"id":100003,"networkId":1,"serviceId":3,"name":"unconfirmed","type":1,"channel":{"type":"GR","channel":"13/14"}}
+			]`)
+		case "/api/programs":
+			writeCommandJSON(writer, fmt.Sprintf(`[
+				{"id":10000200005,"networkId":1,"serviceId":2,"eventId":5,"startAt":%d,"duration":1800000,"isFree":true,"name":"confirmed program","description":""},
+				{"id":10000300005,"networkId":1,"serviceId":3,"eventId":5,"startAt":%d,"duration":1800000,"isFree":true,"name":"unconfirmed program","description":""}
+			]`, startMS, startMS))
+		case "/api/services/100002/stream", "/api/services/100003/stream":
+			serviceCalls.Add(1)
+			writer.Header().Set("Content-Type", "video/MP2T")
+			_, _ = writer.Write(setupNullPacket())
+		case "/api/channels/GR/13/stream":
+			channelCalls.Add(1)
+			writer.Header().Set("Content-Type", "video/MP2T")
+			_, _ = writer.Write(setupSDT(0x1234, 1, 2))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	var output, diagnostic bytes.Buffer
+	if code := runContext(context.Background(), []string{"setup", "--mirakurun-url", server.URL, "--data-root", root}, &output, &diagnostic); code != 1 {
+		t.Fatalf("code=%d output=%q diagnostic=%q", code, output.String(), diagnostic.String())
+	}
+	if !strings.Contains(diagnostic.String(), "channel-pat-probe-failed") {
+		t.Fatalf("diagnostic=%q", diagnostic.String())
+	}
+	if serviceCalls.Load() != 2 || channelCalls.Load() != 1 {
+		t.Fatalf("serviceCalls=%d channelCalls=%d", serviceCalls.Load(), channelCalls.Load())
+	}
+	if _, err := os.Stat(filepath.Join(root, "channels.json")); !os.IsNotExist(err) {
+		t.Fatalf("partial channel map stat error=%v", err)
+	}
+}
+
 func TestSetupUsesFixedDefaultDataRootAndTimeout(t *testing.T) {
 	if defaultSetupDataRoot != "/var/lib/sazanami-dvr" {
 		t.Fatalf("default data root=%q", defaultSetupDataRoot)
@@ -292,4 +389,29 @@ func setupPAT(transportStreamID, serviceID uint16) []byte {
 		result = append(result, nullPacket...)
 	}
 	return result
+}
+
+func setupSDT(transportStreamID, networkID, serviceID uint16) []byte {
+	section := []byte{0x42, 0xb0, 0, byte(transportStreamID >> 8), byte(transportStreamID), 0xc1, 0, 0,
+		byte(networkID >> 8), byte(networkID), 0xff, byte(serviceID >> 8), byte(serviceID), 0, 0xf0, 0}
+	length := len(section) + 4 - 3
+	section[1] = section[1]&0xf0 | byte(length>>8)
+	section[2] = byte(length)
+	crc := mpegts.CRC32(section)
+	section = append(section, byte(crc>>24), byte(crc>>16), byte(crc>>8), byte(crc))
+	packets, err := mpegts.PacketizeSection(0x11, 0, section)
+	if err != nil {
+		panic(err)
+	}
+	result := bytes.Join(packets, nil)
+	for len(result) < 5*mpegts.PacketBytes {
+		result = append(result, setupNullPacket()...)
+	}
+	return result
+}
+
+func setupNullPacket() []byte {
+	packet := bytes.Repeat([]byte{0xff}, mpegts.PacketBytes)
+	packet[0], packet[1], packet[2], packet[3] = 0x47, 0x1f, 0xff, 0x10
+	return packet
 }

@@ -615,12 +615,16 @@ func readNullableInt(decoder *json.Decoder) (*int64, error) {
 }
 
 func skipValue(decoder *json.Decoder, depth int, count *int) error {
-	if depth > maxJSONDepth || *count >= maxUnknownTokens {
-		return provider.NewFailure(provider.ReasonOverLimit, "unknown-json-structure-over-limit")
-	}
 	token, err := decoder.Token()
 	if err != nil {
 		return err
+	}
+	return skipJSONValueAfterToken(decoder, token, depth, count)
+}
+
+func skipJSONValueAfterToken(decoder *json.Decoder, token json.Token, depth int, count *int) error {
+	if depth > maxJSONDepth || *count >= maxUnknownTokens {
+		return provider.NewFailure(provider.ReasonOverLimit, "unknown-json-structure-over-limit")
 	}
 	*count = *count + 1
 	if text, ok := token.(string); ok && !validDisplayJSONString(text) {

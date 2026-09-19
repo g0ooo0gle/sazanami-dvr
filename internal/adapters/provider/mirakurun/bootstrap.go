@@ -18,6 +18,14 @@ type BootstrapService struct {
 	Name             string
 	ServiceType      uint16
 	RemoteControlKey uint8
+	Channel          *BootstrapChannel
+}
+
+// BootstrapChannelは初期設定のSDT補完にだけ使うprovider channel指定である。
+// APIの任意情報が不正な場合、BootstrapService.Channelはnilになる。
+type BootstrapChannel struct {
+	Type    string
+	Channel string
 }
 
 // ObserveBootstrapServicesは/api/servicesを一度だけ読み、初期channel生成用service一覧を返す。
@@ -96,6 +104,8 @@ func decodeBootstrapService(decoder *json.Decoder) (BootstrapService, error) {
 			value, valueErr := readNullableUint(decoder, math.MaxUint8)
 			err = valueErr
 			result.RemoteControlKey = uint8(value)
+		case "channel":
+			result.Channel, err = decodeBootstrapChannel(decoder)
 		default:
 			count := 0
 			err = skipValue(decoder, 0, &count)
@@ -122,6 +132,97 @@ func decodeBootstrapService(decoder *json.Decoder) (BootstrapService, error) {
 	result.Locator = strconv.FormatUint(id, 10)
 	result.ServiceType = uint16(serviceType)
 	return result, nil
+}
+
+func decodeBootstrapChannel(decoder *json.Decoder) (*BootstrapChannel, error) {
+	token, err := decoder.Token()
+	if err != nil {
+		return nil, err
+	}
+	if token == nil {
+		return nil, nil
+	}
+	delimiter, isDelimiter := token.(json.Delim)
+	if !isDelimiter || delimiter != '{' {
+		if isDelimiter {
+			count := 0
+			if err := skipJSONValueAfterToken(decoder, token, 0, &count); err != nil {
+				return nil, err
+			}
+		}
+		return nil, nil
+	}
+	seen := make(map[string]struct{}, 4)
+	var channelType, channelName string
+	var typeValid, nameValid bool
+	for decoder.More() {
+		key, keyErr := readObjectKey(decoder, seen)
+		if keyErr != nil {
+			return nil, keyErr
+		}
+		switch key {
+		case "type":
+			channelType, typeValid, err = readOptionalBootstrapChannelString(decoder)
+		case "channel":
+			channelName, nameValid, err = readOptionalBootstrapChannelString(decoder)
+		default:
+			count := 0
+			err = skipValue(decoder, 0, &count)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := endObject(decoder); err != nil {
+		return nil, err
+	}
+	if !typeValid || !nameValid {
+		return nil, nil
+	}
+	channel := &BootstrapChannel{Type: channelType, Channel: channelName}
+	if !validBootstrapChannel(channel) {
+		return nil, nil
+	}
+	return channel, nil
+}
+
+func readOptionalBootstrapChannelString(decoder *json.Decoder) (string, bool, error) {
+	token, err := decoder.Token()
+	if err != nil {
+		return "", false, err
+	}
+	value, ok := token.(string)
+	if ok {
+		return value, validBootstrapChannelString(value), nil
+	}
+	if delimiter, isDelimiter := token.(json.Delim); isDelimiter {
+		count := 0
+		if err := skipJSONValueAfterToken(decoder, json.Delim(delimiter), 0, &count); err != nil {
+			return "", false, err
+		}
+	}
+	return "", false, nil
+}
+
+func validBootstrapChannel(channel *BootstrapChannel) bool {
+	if channel == nil || (channel.Type != "GR" && channel.Type != "BS" && channel.Type != "CS") {
+		return false
+	}
+	return validBootstrapChannelString(channel.Channel)
+}
+
+func validBootstrapChannelString(value string) bool {
+	if len(value) < 1 || len(value) > 64 {
+		return false
+	}
+	for _, character := range []byte(value) {
+		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') || character == '_' || character == '-' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func readNullableUint(decoder *json.Decoder, maximum uint64) (uint64, error) {

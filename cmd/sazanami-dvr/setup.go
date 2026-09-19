@@ -76,7 +76,7 @@ func runSetupCommand(parent context.Context, arguments []string, stdout io.Write
 	defer stream.CloseIdleConnections()
 	generated := make([]ctrlcmdruntime.GeneratedService, 0, len(services))
 	for _, service := range services {
-		transportStreamID, probeErr := stream.ProbeTransportStreamID(ctx, service.Locator, service.ServiceID)
+		transportStreamID, probeErr := stream.ProbeTransportStreamIDWithSDTFallback(ctx, service)
 		if probeErr != nil {
 			return errorsStable("channel-pat-probe-failed")
 		}

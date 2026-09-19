@@ -90,11 +90,13 @@ sudo -u sazanami-dvr /usr/local/bin/sazanami-dvr setup \
 ```
 
 `setup`は、DBの初期化または状態確認、起動前の復旧と古い番組表の自動整理、Mirakurunからの番組表同期、
-サービスごとのPAT確認、`/var/lib/sazanami-dvr/channels.json`の生成をまとめて行います。
+サービスの自動確認、`/var/lib/sazanami-dvr/channels.json`の生成をまとめて行います。
 成功時は`result=completed`と`channel_map=created`または`channel_map=unchanged`が表示されます。
 
-PAT確認では対象サービスのストリームを短時間開くため、録画やライブ視聴が動いていると空きチューナーが
+サービス確認では一時的なストリーム接続を使うため、録画やライブ視聴が動いていると空きチューナーが
 足りないことがあります。その場合は録画と視聴を止めてから、時間を置いて再実行してください。
+
+確認方法とチャンネル設定の扱いは[チャンネルと番組表](../guides/channels-and-epg.md)を参照してください。
 
 既存の`channels.json`は上書きしません。同じ内容なら`unchanged`で成功し、内容が異なる場合は既存ファイルを
 残したまま失敗します。チャンネル構成を更新する場合は、[更新・切り戻し・削除](../operations/update-and-remove.md)の
