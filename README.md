@@ -17,7 +17,7 @@ Mirakurun / mirakcとKonomiTVをつなぐ、軽量なLinux録画バックエン�
 Sazanami DVRは、番組表、予約、録画、録画済み番組、ライブ視聴に必要な機能を提供します。
 KonomiTVからはEDCB互換バックエンドとして接続し、放送ストリームはMirakurun互換APIから取得します。
 
-現在の安定版はv1.3.2です。配布ファイルは[GitHub Releases](https://github.com/g0ooo0gle/sazanami-dvr/releases)で確認できます。
+現在の安定版はv1.3.3です。配布ファイルは[GitHub Releases](https://github.com/g0ooo0gle/sazanami-dvr/releases)で確認できます。
 
 ## 必要なもの
 
@@ -34,19 +34,19 @@ KonomiTVからはEDCB互換バックエンドとして接続し、放送スト�
 
 配布アーカイブのインストーラで、systemd環境へ導入できます。DBやチャンネルは明示的に準備してからサービスを起動します。
 
-[Linuxへインストールする](https://github.com/g0ooo0gle/sazanami-dvr/blob/v1.3.2/docs/getting-started/linux.md)
+[Linuxへインストールする](https://github.com/g0ooo0gle/sazanami-dvr/blob/v1.3.3/docs/getting-started/linux.md)
 
 ## Compose
 
 Sazanami DVRとKonomiTVを同じLinuxホストで起動する最小構成を用意しています。
 
-[Docker Composeで起動する](https://github.com/g0ooo0gle/sazanami-dvr/blob/v1.3.2/docs/getting-started/docker-compose.md)
+[Docker Composeで起動する](https://github.com/g0ooo0gle/sazanami-dvr/blob/v1.3.3/docs/getting-started/docker-compose.md)
 
 ## KonomiTV
 
 KonomiTVのバックエンドをEDCBに設定し、CtrlCmdの接続先をSazanami DVRへ向けます。
 
-[KonomiTVを接続する](https://github.com/g0ooo0gle/sazanami-dvr/blob/v1.3.2/docs/getting-started/konomitv.md)
+[KonomiTVを接続する](https://github.com/g0ooo0gle/sazanami-dvr/blob/v1.3.3/docs/getting-started/konomitv.md)
 
 ## 対応範囲
 
@@ -61,9 +61,9 @@ CtrlCmdには認証とTLSがないため、インターネットへ公開せず�
 
 ## 詳しい文書
 
-導入後の操作、設定、更新、復旧、トラブル対応は[ドキュメント一覧](https://github.com/g0ooo0gle/sazanami-dvr/blob/v1.3.2/docs/README.md)から探せます。
+導入後の操作、設定、更新、復旧、トラブル対応は[ドキュメント一覧](https://github.com/g0ooo0gle/sazanami-dvr/blob/v1.3.3/docs/README.md)から探せます。
 
-開発への参加は[CONTRIBUTING.md](https://github.com/g0ooo0gle/sazanami-dvr/blob/v1.3.2/CONTRIBUTING.md)、脆弱性の連絡は[SECURITY.md](https://github.com/g0ooo0gle/sazanami-dvr/blob/v1.3.2/SECURITY.md)を参照してください。
+開発への参加は[CONTRIBUTING.md](https://github.com/g0ooo0gle/sazanami-dvr/blob/v1.3.3/CONTRIBUTING.md)、脆弱性の連絡は[SECURITY.md](https://github.com/g0ooo0gle/sazanami-dvr/blob/v1.3.3/SECURITY.md)を参照してください。
 
 ## License
 
