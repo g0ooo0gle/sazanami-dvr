@@ -2,6 +2,7 @@
 package ctrlcmd
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -155,6 +156,7 @@ func (s *Server) serveConnection(parent context.Context, connection net.Conn) {
 	}
 	requestContext := parent
 	var destination io.Writer = connection
+	var buffered *bufio.Writer
 	var cancel context.CancelFunc
 	longLived, ok := s.handler.(LongLivedFrameHandler)
 	if ok && longLived.LongLived(request) {
@@ -166,11 +168,24 @@ func (s *Server) serveConnection(parent context.Context, connection net.Conn) {
 		destination = rollingDeadlineWriter{connection: connection, timeout: LongWriteTimeout}
 	} else {
 		requestContext, cancel = context.WithDeadline(parent, deadline)
+		// 文字列の2-byte書込みをまとめる。応答全体は保持せず、301は即時送信を維持する。
+		buffered = bufio.NewWriterSize(connection, 4*1024)
+		destination = buffered
 	}
 	defer cancel()
 	if err := s.handler.Handle(requestContext, request, destination); err != nil {
 		s.failed.Add(1)
 		return
+	}
+	if buffered != nil {
+		if requestContext.Err() != nil {
+			s.failed.Add(1)
+			return
+		}
+		if err := buffered.Flush(); err != nil {
+			s.failed.Add(1)
+			return
+		}
 	}
 	s.completed.Add(1)
 }
