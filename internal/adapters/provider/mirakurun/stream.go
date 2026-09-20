@@ -1,6 +1,7 @@
 package mirakurun
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -28,10 +29,18 @@ type streamLimits struct {
 var productionStreamLimits = streamLimits{connectHeader: 10 * time.Second, readIdle: 10 * time.Second}
 
 const (
-	probeDeadline  = 15 * time.Second
-	probeMaxBytes  = 1 << 20
-	probeReadBytes = 32 * 1024
+	probeDeadline            = 15 * time.Second
+	probeMaxBytes            = 1 << 20
+	probeReadBytes           = 32 * 1024
+	sdtProbeMaxBytes         = 64 * 1024 * 1024
+	sdtProbeMaxSections      = 256
+	sdtProbeMaxServices      = 4_096
+	sdtProbeSectionBytes     = 256 * 1024
+	sdtProbeManagementBytes  = 64 * 1024
+	sdtProbeServiceBitsetLen = 1 << 13
 )
+
+var errSDTProbeComplete = errors.New("sdt probe complete")
 
 // StreamAdapterはMirakurun互換のservice streamだけを開く専用HTTP clientを所有する。
 type StreamAdapter struct {
@@ -178,6 +187,233 @@ func (adapter *StreamAdapter) ProbeTransportStreamID(ctx context.Context, provid
 	return 0, provider.NewFailure(provider.ReasonOverLimit, "probe-byte-limit")
 }
 
+// ProbeTransportStreamIDWithSDTFallbackはservice PAT確認を先に一回だけ行い、
+// 許可された一時的失敗に限って同じproviderのchannel SDT actualを確認する。
+func (adapter *StreamAdapter) ProbeTransportStreamIDWithSDTFallback(ctx context.Context, service BootstrapService) (uint16, error) {
+	transportStreamID, err := adapter.ProbeTransportStreamID(ctx, service.Locator, service.ServiceID)
+	if err == nil || !allowsPATSDTFallback(ctx, err) || !validBootstrapChannel(service.Channel) {
+		return transportStreamID, err
+	}
+	return adapter.ProbeTransportStreamIDFromChannel(ctx, *service.Channel, service.NetworkID, service.ServiceID)
+}
+
+// ProbeTransportStreamIDFromChannelはchannel streamのSDT actualから対象serviceのTSIDを返す。
+func (adapter *StreamAdapter) ProbeTransportStreamIDFromChannel(ctx context.Context, channel BootstrapChannel,
+	networkID, serviceID uint16,
+) (uint16, error) {
+	response, err := adapter.openChannelStream(ctx, channel, "decode=0", probeDeadline)
+	if err != nil {
+		return 0, err
+	}
+	defer response.close()
+	if response.contentLength > sdtProbeMaxBytes {
+		return 0, provider.NewFailure(provider.ReasonOverLimit, "probe-sdt-content-length-over-limit")
+	}
+
+	var packetizer mpegts.Packetizer
+	var collector mpegts.PSICollector
+	generation := sdtGeneration{}
+	completed := false
+	buffer := make([]byte, probeReadBytes)
+	total := 0
+	for total < sdtProbeMaxBytes {
+		readBuffer := buffer
+		if remaining := sdtProbeMaxBytes - total; len(readBuffer) > remaining {
+			readBuffer = readBuffer[:remaining]
+		}
+		if err := response.connection.SetReadDeadline(time.Now().Add(response.idle)); err != nil {
+			return 0, provider.NewFailure(provider.ReasonUnavailable, "probe-sdt-read-deadline-failed")
+		}
+		read, readErr := response.body.Read(readBuffer)
+		if read < 0 || read > len(readBuffer) {
+			return 0, provider.NewFailure(provider.ReasonInternal, "probe-sdt-invalid-read-count")
+		}
+		total += read
+		if read > 0 {
+			feedErr := packetizer.Feed(readBuffer[:read], func(packet []byte) error {
+				if mpegts.PID(packet) != 0x0011 {
+					return nil
+				}
+				sectionErr := collector.FeedUntil(packet, func(section []byte) (bool, error) {
+					if len(section) == 0 || section[0] != 0x42 {
+						return false, nil
+					}
+					sdt, parseErr := mpegts.ParseSDT(section)
+					if parseErr != nil {
+						return false, parseErr
+					}
+					if _, complete, acceptErr := generation.accept(sdt, section, networkID, serviceID); acceptErr != nil {
+						return false, acceptErr
+					} else if complete {
+						completed = true
+						return true, nil
+					}
+					return false, nil
+				})
+				if sectionErr != nil {
+					return sectionErr
+				}
+				if completed {
+					return errSDTProbeComplete
+				}
+				return nil
+			})
+			if errors.Is(feedErr, errSDTProbeComplete) {
+				transportStreamID, complete, resultErr := generation.result(serviceID)
+				if !complete {
+					return 0, provider.NewFailure(provider.ReasonInternal, "probe-sdt-completion-state-invalid")
+				}
+				if resultErr != nil {
+					return 0, resultErr
+				}
+				return transportStreamID, nil
+			}
+			if feedErr != nil {
+				return 0, sdtParserFailure(feedErr)
+			}
+			if transportStreamID, complete, resultErr := generation.result(serviceID); complete {
+				if resultErr != nil {
+					return 0, resultErr
+				}
+				return transportStreamID, nil
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return 0, provider.NewFailure(provider.ReasonEarlyEOF, "probe-sdt-not-found")
+			}
+			return 0, classifyProbeReadFailure(response.ctx, readErr)
+		}
+		if read == 0 {
+			return 0, provider.NewFailure(provider.ReasonUnavailable, "probe-sdt-zero-progress")
+		}
+	}
+	return 0, provider.NewFailure(provider.ReasonOverLimit, "probe-sdt-byte-limit")
+}
+
+func allowsPATSDTFallback(ctx context.Context, err error) bool {
+	if provider.ContextFailure(ctx) != nil {
+		return false
+	}
+	var failure *provider.Failure
+	if !errors.As(err, &failure) {
+		return false
+	}
+	switch {
+	case failure.Reason == provider.ReasonTimeout && failure.Diagnostic == "http-timeout":
+		return true
+	case failure.Reason == provider.ReasonTimeout && failure.Diagnostic == "probe-read-timeout":
+		return true
+	case failure.Reason == provider.ReasonTimeout && failure.Diagnostic == "context-deadline":
+		return true
+	case failure.Reason == provider.ReasonEarlyEOF && failure.Diagnostic == "probe-pat-not-found":
+		return true
+	case failure.Reason == provider.ReasonOverLimit && failure.Diagnostic == "probe-byte-limit":
+		return true
+	default:
+		return false
+	}
+}
+
+type sdtGeneration struct {
+	initialized       bool
+	transportStreamID uint16
+	originalNetworkID uint16
+	version           byte
+	lastSection       byte
+	sections          [sdtProbeMaxSections][]byte
+	sectionCount      int
+	sectionBytes      int
+	serviceBits       [sdtProbeServiceBitsetLen]byte
+	serviceCount      int
+}
+
+func (generation *sdtGeneration) accept(table mpegts.SDT, section []byte, networkID, serviceID uint16) (uint16, bool, error) {
+	if !table.CurrentNext {
+		return 0, false, nil
+	}
+	if !generation.initialized {
+		if table.OriginalNetworkID != networkID {
+			return 0, false, provider.NewFailure(provider.ReasonMalformed, "probe-sdt-network-id-mismatch")
+		}
+		generation.initialized = true
+		generation.transportStreamID = table.TransportStreamID
+		generation.originalNetworkID = table.OriginalNetworkID
+		generation.version = table.Version
+		generation.lastSection = table.LastSectionNumber
+	} else if table.OriginalNetworkID != generation.originalNetworkID || table.TransportStreamID != generation.transportStreamID ||
+		table.Version != generation.version || table.LastSectionNumber != generation.lastSection {
+		return 0, false, provider.NewFailure(provider.ReasonMalformed, "probe-sdt-generation-changed")
+	}
+
+	if existing := generation.sections[table.SectionNumber]; existing != nil {
+		if !bytes.Equal(existing, section) {
+			return 0, false, provider.NewFailure(provider.ReasonMalformed, "probe-sdt-section-changed")
+		}
+		return generation.result(serviceID)
+	}
+	if generation.sectionCount >= sdtProbeMaxSections || generation.sectionBytes+len(section) > sdtProbeSectionBytes {
+		return 0, false, provider.NewFailure(provider.ReasonOverLimit, "probe-sdt-section-limit")
+	}
+	newServices := 0
+	for _, candidate := range table.ServiceIDs {
+		index, mask := candidate/8, byte(1<<uint(candidate%8))
+		if generation.serviceBits[index]&mask != 0 {
+			return 0, false, provider.NewFailure(provider.ReasonMalformed, "probe-sdt-service-duplicate")
+		}
+		newServices++
+	}
+	if generation.serviceCount+newServices > sdtProbeMaxServices {
+		return 0, false, provider.NewFailure(provider.ReasonOverLimit, "probe-sdt-service-limit")
+	}
+	if generation.managementBytes(generation.sectionCount+1, generation.serviceCount+newServices) > sdtProbeManagementBytes {
+		return 0, false, provider.NewFailure(provider.ReasonOverLimit, "probe-sdt-management-limit")
+	}
+	for _, candidate := range table.ServiceIDs {
+		index, mask := candidate/8, byte(1<<uint(candidate%8))
+		generation.serviceBits[index] |= mask
+		generation.serviceCount++
+	}
+	generation.sections[table.SectionNumber] = append([]byte(nil), section...)
+	generation.sectionCount++
+	generation.sectionBytes += len(section)
+	return generation.result(serviceID)
+}
+
+func (generation *sdtGeneration) result(serviceID uint16) (uint16, bool, error) {
+	if !generation.initialized || generation.sectionCount != int(generation.lastSection)+1 {
+		return 0, false, nil
+	}
+	for sectionNumber := 0; sectionNumber <= int(generation.lastSection); sectionNumber++ {
+		if generation.sections[sectionNumber] == nil {
+			return 0, false, nil
+		}
+	}
+	if !generation.hasService(serviceID) {
+		return 0, true, provider.NewFailure(provider.ReasonMalformed, "probe-sdt-service-not-found")
+	}
+	return generation.transportStreamID, true, nil
+}
+
+func (generation *sdtGeneration) hasService(serviceID uint16) bool {
+	return generation.serviceBits[serviceID/8]&(1<<uint(serviceID%8)) != 0
+}
+
+func (generation *sdtGeneration) managementBytes(sectionCount, serviceCount int) int {
+	return sdtProbeServiceBitsetLen + sectionCount*16 + serviceCount*2
+}
+
+func sdtParserFailure(err error) error {
+	var providerFailure *provider.Failure
+	if errors.As(err, &providerFailure) {
+		return providerFailure
+	}
+	if errors.Is(err, mpegts.ErrSync) || errors.Is(err, mpegts.ErrPacket) || errors.Is(err, mpegts.ErrPSI) {
+		return provider.NewFailure(provider.ReasonMalformed, "probe-sdt-invalid")
+	}
+	return provider.NewFailure(provider.ReasonInternal, "probe-sdt-parser-failed")
+}
+
 type streamResponse struct {
 	ctx           context.Context
 	body          io.ReadCloser
@@ -208,6 +444,31 @@ func (adapter *StreamAdapter) openServiceStream(ctx context.Context, providerLoc
 	if !canonicalStreamServiceID(providerLocator) {
 		return nil, provider.NewFailure(provider.ReasonRejected, "stream-request-out-of-profile")
 	}
+	return adapter.openStream(ctx, "/api/services/"+providerLocator+"/stream", query, deadline)
+}
+
+func (adapter *StreamAdapter) openChannelStream(ctx context.Context, channel BootstrapChannel, query string,
+	deadline time.Duration,
+) (*streamResponse, error) {
+	if adapter == nil || adapter.client == nil {
+		return nil, provider.NewFailure(provider.ReasonInternal, "nil-stream-adapter")
+	}
+	if err := provider.ContextFailure(ctx); err != nil {
+		return nil, err
+	}
+	if !validBootstrapChannel(&channel) {
+		return nil, provider.NewFailure(provider.ReasonRejected, "stream-channel-out-of-profile")
+	}
+	return adapter.openStream(ctx, "/api/channels/"+channel.Type+"/"+channel.Channel+"/stream", query, deadline)
+}
+
+func (adapter *StreamAdapter) openStream(ctx context.Context, suffix, query string, deadline time.Duration) (*streamResponse, error) {
+	if adapter == nil || adapter.client == nil {
+		return nil, provider.NewFailure(provider.ReasonInternal, "nil-stream-adapter")
+	}
+	if err := provider.ContextFailure(ctx); err != nil {
+		return nil, err
+	}
 	adapter.mu.Lock()
 	if adapter.active >= adapter.maximumConcurrent {
 		adapter.mu.Unlock()
@@ -231,7 +492,7 @@ func (adapter *StreamAdapter) openServiceStream(ctx context.Context, providerLoc
 		requestContext, cancel = context.WithCancel(ctx)
 	}
 	endpoint := adapter.base
-	endpoint.Path = strings.TrimRight(adapter.base.Path, "/") + "/api/services/" + providerLocator + "/stream"
+	endpoint.Path = strings.TrimRight(adapter.base.Path, "/") + suffix
 	endpoint.RawQuery = query
 	httpRequest, err := http.NewRequestWithContext(requestContext, http.MethodGet, endpoint.String(), nil)
 	if err != nil {

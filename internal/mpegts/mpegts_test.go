@@ -169,6 +169,69 @@ func TestPSICollectorAcceptsNonzeroPointerAndMultipleSections(t *testing.T) {
 	}
 }
 
+func TestPSICollectorFeedUntilStopsBeforeLaterInvalidSection(t *testing.T) {
+	first := testPATSection(0, []uint16{1})
+	second := append([]byte(nil), first...)
+	second[1], second[2] = 0xbf, 0xff
+	packet := testPayloadPacket(0, 0)
+	packet[1] |= 0x40
+	packet[4] = 0
+	copy(packet[5:], first)
+	copy(packet[5+len(first):], second)
+	var collector PSICollector
+	count := 0
+	if err := collector.FeedUntil(packet, func(section []byte) (bool, error) {
+		count++
+		if !bytes.Equal(section, first) {
+			t.Fatalf("section=%x", section)
+		}
+		return true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("sections=%d", count)
+	}
+	collector = PSICollector{}
+	if _, err := collector.Feed(packet); !errors.Is(err, ErrPSI) {
+		t.Fatalf("regular feed err=%v", err)
+	}
+}
+
+func TestPSICollectorFeedUntilEmitsBeforeCheckingContinuationStuffing(t *testing.T) {
+	section := testPMTSection(0, []ElementaryStream{{Type: 0x1b, PID: 0x101, Descriptor: bytes.Repeat([]byte{0xaa}, 300)}})
+	packets, err := PacketizeSection(0x100, 0, section)
+	if err != nil || len(packets) < 2 {
+		t.Fatalf("packets=%d err=%v", len(packets), err)
+	}
+	packets[1] = append([]byte(nil), packets[1]...)
+	sectionRest := len(section) - (PacketBytes - 5)
+	packets[1][4+sectionRest] = 0
+
+	var collector PSICollector
+	if _, err := collector.Feed(packets[0]); err != nil {
+		t.Fatal(err)
+	}
+	emitted := 0
+	if err := collector.FeedUntil(packets[1], func(got []byte) (bool, error) {
+		emitted++
+		if !bytes.Equal(got, section) {
+			t.Fatalf("section bytes=%d", len(got))
+		}
+		return true, nil
+	}); err != nil || emitted != 1 {
+		t.Fatalf("err=%v emitted=%d", err, emitted)
+	}
+
+	collector = PSICollector{}
+	if _, err := collector.Feed(packets[0]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := collector.Feed(packets[1]); !errors.Is(err, ErrPSI) {
+		t.Fatalf("regular feed err=%v", err)
+	}
+}
+
 func TestPATPMTAndVersionTracking(t *testing.T) {
 	patSection := testPATSection(31, []uint16{1})
 	pat, err := ParsePAT(patSection)

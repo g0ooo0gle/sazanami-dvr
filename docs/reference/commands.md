@@ -42,8 +42,9 @@ sazanami-dvr setup \
   [--data-root <absolute-data-root>]
 ```
 
-MirakurunまたはmirakcのURLから、DBの準備、番組表同期、PATによるTSID確認、KonomiTV向けの
-`<absolute-data-root>/channels.json`生成を一度に行います。`--data-root`には正規化した絶対パスを指定します。
+MirakurunまたはmirakcのURLから、DBの準備、番組表同期、サービスの自動確認、KonomiTV向けの
+`<absolute-data-root>/channels.json`生成を一度に行います。PATで確認できないサービスは、必要に応じて放送内の
+サービス一覧から自動確認します。確認できないサービスがある場合は設定を保存せず終了します。`--data-root`には正規化した絶対パスを指定します。
 省略すると`/var/lib/sazanami-dvr`を使います。
 空のDBは初期化しますが、migrationが必要なDBは自動で変更しません。
 

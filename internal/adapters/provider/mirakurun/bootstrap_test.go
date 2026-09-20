@@ -21,7 +21,7 @@ func TestObserveBootstrapServicesDecodesRequiredFields(t *testing.T) {
 			t.Errorf("request=%s %s accept=%q", request.Method, request.URL.Path, request.Header.Get("Accept"))
 		}
 		writeJSON(writer, fmt.Sprintf(`[
-			{"id":%d,"networkId":1,"serviceId":2,"name":"地上波","type":1,"remoteControlKeyId":7},
+			{"id":%d,"networkId":1,"serviceId":2,"name":"地上波","type":1,"remoteControlKeyId":7,"channel":{"type":"GR","channel":"13"}},
 			{"id":%d,"networkId":1,"serviceId":3,"name":"衛星","type":2,"remoteControlKeyId":null},
 			{"id":%d,"networkId":1,"serviceId":4,"name":"欠落","type":161}
 		]`, serviceProviderID(1, 2), serviceProviderID(1, 3), serviceProviderID(1, 4)))
@@ -38,9 +38,210 @@ func TestObserveBootstrapServicesDecodesRequiredFields(t *testing.T) {
 		services[0].Name != "地上波" || services[0].ServiceType != 1 || services[0].RemoteControlKey != 7 {
 		t.Fatalf("first=%+v", services[0])
 	}
+	if services[0].Channel == nil || services[0].Channel.Type != "GR" || services[0].Channel.Channel != "13" {
+		t.Fatalf("channel=%+v", services[0].Channel)
+	}
 	if services[1].RemoteControlKey != 0 || services[2].RemoteControlKey != 0 {
 		t.Fatalf("nullable remocon=%+v", services)
 	}
+}
+
+func TestObserveBootstrapServicesKeepsInvalidOptionalChannelUnavailable(t *testing.T) {
+	validID := serviceProviderID(1, 2)
+	for _, test := range []struct {
+		name  string
+		field string
+	}{
+		{name: "missing", field: ""},
+		{name: "null", field: `"channel":null`},
+		{name: "object missing type", field: `"channel":{"channel":"13"}`},
+		{name: "object missing channel", field: `"channel":{"type":"GR"}`},
+		{name: "wrong type", field: `"channel":{"type":1,"channel":"13"}`},
+		{name: "unsupported type", field: `"channel":{"type":"BS4K","channel":"13"}`},
+		{name: "invalid channel characters", field: `"channel":{"type":"GR","channel":"13/14"}`},
+		{name: "invalid channel bytes", field: `"channel":{"type":"GR","channel":"地上波"}`},
+		{name: "empty channel", field: `"channel":{"type":"GR","channel":""}`},
+		{name: "channel over limit", field: fmt.Sprintf(`"channel":{"type":"GR","channel":"%s"}`, strings.Repeat("A", 65))},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			field := ""
+			if test.field != "" {
+				field = "," + test.field
+			}
+			body := fmt.Sprintf(`[{"id":%d,"networkId":1,"serviceId":2,"name":"x","type":1%s}]`, validID, field)
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writeJSON(writer, body) }))
+			defer server.Close()
+			services, err := mustAdapter(t, server.URL).ObserveBootstrapServices(context.Background())
+			if err != nil || len(services) != 1 || services[0].Channel != nil {
+				t.Fatalf("services=%+v err=%v", services, err)
+			}
+		})
+	}
+}
+
+func TestObserveBootstrapServicesAcceptsSupportedChannelBoundaries(t *testing.T) {
+	for _, test := range []struct {
+		name, channelType, channel string
+	}{
+		{name: "BS", channelType: "BS", channel: "BS1"},
+		{name: "CS", channelType: "CS", channel: "CS1"},
+		{name: "64 bytes", channelType: "CS", channel: strings.Repeat("A", 64)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := fmt.Sprintf(`[{"id":%d,"networkId":1,"serviceId":2,"name":"x","type":1,"channel":{"type":"%s","channel":"%s"}}]`,
+				serviceProviderID(1, 2), test.channelType, test.channel)
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writeJSON(writer, body) }))
+			defer server.Close()
+			services, err := mustAdapter(t, server.URL).ObserveBootstrapServices(context.Background())
+			if err != nil || len(services) != 1 || services[0].Channel == nil {
+				t.Fatalf("services=%+v err=%v", services, err)
+			}
+			if services[0].Channel.Type != test.channelType || services[0].Channel.Channel != test.channel {
+				t.Fatalf("channel=%+v", services[0].Channel)
+			}
+		})
+	}
+}
+
+func TestObserveBootstrapServicesSharesChannelJSONTokenBudget(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		unknownCount int
+		knownFirst   bool
+		over         bool
+	}{
+		{name: "exactly 4096 known first", unknownCount: maxUnknownTokens - 3, knownFirst: true},
+		{name: "exactly 4096 known last", unknownCount: maxUnknownTokens - 3},
+		{name: "4097 known first", unknownCount: maxUnknownTokens - 2, knownFirst: true, over: true},
+		{name: "4097 known last", unknownCount: maxUnknownTokens - 2, over: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var channel strings.Builder
+			channel.WriteString(`"channel":{`)
+			if test.knownFirst {
+				channel.WriteString(`"type":"GR","channel":"13",`)
+			}
+			for index := 0; index < test.unknownCount; index++ {
+				if index != 0 {
+					channel.WriteByte(',')
+				}
+				fmt.Fprintf(&channel, `"unknown%d":0`, index)
+			}
+			if !test.knownFirst {
+				channel.WriteString(`,"type":"GR","channel":"13"`)
+			}
+			channel.WriteByte('}')
+			body := fmt.Sprintf(`[{
+                "id":%d,"networkId":1,"serviceId":2,"name":"x","type":1,%s
+            }]`, serviceProviderID(1, 2), channel.String())
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writeJSON(writer, body) }))
+			defer server.Close()
+			services, err := mustAdapter(t, server.URL).ObserveBootstrapServices(context.Background())
+			if test.over {
+				if !provider.IsReason(err, provider.ReasonOverLimit) {
+					t.Fatalf("err=%v services=%+v", err, services)
+				}
+				return
+			}
+			if err != nil || len(services) != 1 || services[0].Channel == nil {
+				t.Fatalf("err=%v services=%+v", err, services)
+			}
+		})
+	}
+}
+
+func TestObserveBootstrapServicesSharesInvalidKnownChannelStructureBudget(t *testing.T) {
+	for _, test := range []struct {
+		name                   string
+		typeElements, elements int
+		over                   bool
+	}{
+		{name: "exactly 4096", typeElements: maxUnknownTokens/2 - 2, elements: maxUnknownTokens/2 - 1},
+		{name: "4097", typeElements: maxUnknownTokens/2 - 1, elements: maxUnknownTokens/2 - 1, over: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			typeValues := strings.Repeat("0,", test.typeElements-1) + "0"
+			values := strings.Repeat("0,", test.elements-1) + "0"
+			body := fmt.Sprintf(`[{"id":%d,"networkId":1,"serviceId":2,"name":"x","type":1,"channel":{"type":[%s],"channel":[%s]}}]`,
+				serviceProviderID(1, 2), typeValues, values)
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writeJSON(writer, body) }))
+			defer server.Close()
+			services, err := mustAdapter(t, server.URL).ObserveBootstrapServices(context.Background())
+			if test.over {
+				if !provider.IsReason(err, provider.ReasonOverLimit) {
+					t.Fatalf("err=%v services=%+v", err, services)
+				}
+				return
+			}
+			if err != nil || len(services) != 1 || services[0].Channel != nil {
+				t.Fatalf("err=%v services=%+v", err, services)
+			}
+		})
+	}
+}
+
+func TestObserveBootstrapServicesCountsInvalidKnownChannelScalars(t *testing.T) {
+	for _, test := range []struct {
+		name, channelType, channel string
+		unknownCount               int
+		over                       bool
+	}{
+		{name: "exactly 4096 null and number", channelType: "null", channel: "13", unknownCount: maxUnknownTokens - 3},
+		{name: "4097 null and number", channelType: "null", channel: "13", unknownCount: maxUnknownTokens - 2, over: true},
+		{name: "exactly 4096 bool and string", channelType: "true", channel: `"13"`, unknownCount: maxUnknownTokens - 3},
+		{name: "4097 bool and string", channelType: "true", channel: `"13"`, unknownCount: maxUnknownTokens - 2, over: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var unknown strings.Builder
+			for index := 0; index < test.unknownCount; index++ {
+				fmt.Fprintf(&unknown, `,"unknown%d":0`, index)
+			}
+			body := fmt.Sprintf(`[{"id":%d,"networkId":1,"serviceId":2,"name":"x","type":1,"channel":{"type":%s%s,"channel":%s}}]`,
+				serviceProviderID(1, 2), test.channelType, unknown.String(), test.channel)
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writeJSON(writer, body) }))
+			defer server.Close()
+			services, err := mustAdapter(t, server.URL).ObserveBootstrapServices(context.Background())
+			if test.over {
+				if !provider.IsReason(err, provider.ReasonOverLimit) {
+					t.Fatalf("err=%v services=%+v", err, services)
+				}
+				return
+			}
+			if err != nil || len(services) != 1 || services[0].Channel != nil {
+				t.Fatalf("err=%v services=%+v", err, services)
+			}
+		})
+	}
+}
+
+func TestObserveBootstrapServicesEnforcesChannelDepthBudget(t *testing.T) {
+	for _, test := range []struct {
+		name, channel string
+		over          bool
+	}{
+		{name: "unknown member at limit", channel: `{"type":"GR","channel":"13","unknown":` + channelDepthValue(maxJSONDepth-1) + `}`},
+		{name: "known wrong type at limit", channel: `{"type":` + channelDepthValue(maxJSONDepth-1) + `,"channel":"13"}`},
+		{name: "unknown member one over", channel: `{"type":"GR","channel":"13","unknown":` + channelDepthValue(maxJSONDepth) + `}`, over: true},
+		{name: "known wrong type one over", channel: `{"type":` + channelDepthValue(maxJSONDepth) + `,"channel":"13"}`, over: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := fmt.Sprintf(`[{"id":%d,"networkId":1,"serviceId":2,"name":"x","type":1,"channel":%s}]`,
+				serviceProviderID(1, 2), test.channel)
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writeJSON(writer, body) }))
+			defer server.Close()
+			services, err := mustAdapter(t, server.URL).ObserveBootstrapServices(context.Background())
+			if test.over && !provider.IsReason(err, provider.ReasonOverLimit) {
+				t.Fatalf("err=%v", err)
+			}
+			if !test.over && (err != nil || len(services) != 1) {
+				t.Fatalf("err=%v services=%+v", err, services)
+			}
+		})
+	}
+}
+
+func channelDepthValue(depth int) string {
+	return strings.Repeat("[", depth) + "0" + strings.Repeat("]", depth)
 }
 
 func TestObserveBootstrapServicesRejectsInvalidAndDuplicateEntries(t *testing.T) {
@@ -55,6 +256,7 @@ func TestObserveBootstrapServicesRejectsInvalidAndDuplicateEntries(t *testing.T)
 		{name: "negative remocon", body: fmt.Sprintf(`[{"id":%d,"networkId":1,"serviceId":2,"name":"x","type":1,"remoteControlKeyId":-1}]`, validID), reason: provider.ReasonMalformed},
 		{name: "remocon overflow", body: fmt.Sprintf(`[{"id":%d,"networkId":1,"serviceId":2,"name":"x","type":1,"remoteControlKeyId":256}]`, validID), reason: provider.ReasonOverLimit},
 		{name: "duplicate locator", body: fmt.Sprintf(`[{"id":%d,"networkId":1,"serviceId":2,"name":"x","type":1},{"id":%d,"networkId":1,"serviceId":2,"name":"y","type":2}]`, validID, validID), reason: provider.ReasonMalformed},
+		{name: "channel duplicate key", body: fmt.Sprintf(`[{"id":%d,"networkId":1,"serviceId":2,"name":"x","type":1,"channel":{"type":"GR","type":"BS","channel":"13"}}]`, validID), reason: provider.ReasonMalformed},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
