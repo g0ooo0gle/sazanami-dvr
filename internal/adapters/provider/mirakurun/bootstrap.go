@@ -154,7 +154,7 @@ func decodeBootstrapChannel(decoder *json.Decoder) (*BootstrapChannel, error) {
 	}
 	seen := make(map[string]struct{}, 4)
 	const channelValueDepth = 1
-	count := 0
+	count := 1
 	var channelType, channelName string
 	var typeValid, nameValid bool
 	for decoder.More() {
@@ -192,14 +192,12 @@ func readOptionalBootstrapChannelString(decoder *json.Decoder, depth int, count 
 	if err != nil {
 		return "", false, err
 	}
+	if err := skipJSONValueAfterToken(decoder, token, depth, count); err != nil {
+		return "", false, err
+	}
 	value, ok := token.(string)
 	if ok {
 		return value, validBootstrapChannelString(value), nil
-	}
-	if delimiter, isDelimiter := token.(json.Delim); isDelimiter {
-		if err := skipJSONValueAfterToken(decoder, json.Delim(delimiter), depth, count); err != nil {
-			return "", false, err
-		}
 	}
 	return "", false, nil
 }

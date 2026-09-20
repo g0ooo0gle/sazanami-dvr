@@ -107,16 +107,28 @@ func TestObserveBootstrapServicesSharesChannelJSONTokenBudget(t *testing.T) {
 	for _, test := range []struct {
 		name         string
 		unknownCount int
+		knownFirst   bool
 		over         bool
 	}{
-		{name: "at limit", unknownCount: maxUnknownTokens},
-		{name: "one over", unknownCount: maxUnknownTokens + 1, over: true},
+		{name: "exactly 4096 known first", unknownCount: maxUnknownTokens - 3, knownFirst: true},
+		{name: "exactly 4096 known last", unknownCount: maxUnknownTokens - 3},
+		{name: "4097 known first", unknownCount: maxUnknownTokens - 2, knownFirst: true, over: true},
+		{name: "4097 known last", unknownCount: maxUnknownTokens - 2, over: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var channel strings.Builder
-			channel.WriteString(`"channel":{"type":"GR","channel":"13"`)
+			channel.WriteString(`"channel":{`)
+			if test.knownFirst {
+				channel.WriteString(`"type":"GR","channel":"13",`)
+			}
 			for index := 0; index < test.unknownCount; index++ {
-				fmt.Fprintf(&channel, `,"unknown%d":0`, index)
+				if index != 0 {
+					channel.WriteByte(',')
+				}
+				fmt.Fprintf(&channel, `"unknown%d":0`, index)
+			}
+			if !test.knownFirst {
+				channel.WriteString(`,"type":"GR","channel":"13"`)
 			}
 			channel.WriteByte('}')
 			body := fmt.Sprintf(`[{
@@ -140,17 +152,52 @@ func TestObserveBootstrapServicesSharesChannelJSONTokenBudget(t *testing.T) {
 
 func TestObserveBootstrapServicesSharesInvalidKnownChannelStructureBudget(t *testing.T) {
 	for _, test := range []struct {
-		name     string
-		elements int
-		over     bool
+		name                   string
+		typeElements, elements int
+		over                   bool
 	}{
-		{name: "at limit", elements: maxUnknownTokens/2 - 1},
-		{name: "one over", elements: maxUnknownTokens / 2, over: true},
+		{name: "exactly 4096", typeElements: maxUnknownTokens/2 - 2, elements: maxUnknownTokens/2 - 1},
+		{name: "4097", typeElements: maxUnknownTokens/2 - 1, elements: maxUnknownTokens/2 - 1, over: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			typeValues := strings.Repeat("0,", test.typeElements-1) + "0"
 			values := strings.Repeat("0,", test.elements-1) + "0"
 			body := fmt.Sprintf(`[{"id":%d,"networkId":1,"serviceId":2,"name":"x","type":1,"channel":{"type":[%s],"channel":[%s]}}]`,
-				serviceProviderID(1, 2), values, values)
+				serviceProviderID(1, 2), typeValues, values)
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writeJSON(writer, body) }))
+			defer server.Close()
+			services, err := mustAdapter(t, server.URL).ObserveBootstrapServices(context.Background())
+			if test.over {
+				if !provider.IsReason(err, provider.ReasonOverLimit) {
+					t.Fatalf("err=%v services=%+v", err, services)
+				}
+				return
+			}
+			if err != nil || len(services) != 1 || services[0].Channel != nil {
+				t.Fatalf("err=%v services=%+v", err, services)
+			}
+		})
+	}
+}
+
+func TestObserveBootstrapServicesCountsInvalidKnownChannelScalars(t *testing.T) {
+	for _, test := range []struct {
+		name, channelType, channel string
+		unknownCount               int
+		over                       bool
+	}{
+		{name: "exactly 4096 null and number", channelType: "null", channel: "13", unknownCount: maxUnknownTokens - 3},
+		{name: "4097 null and number", channelType: "null", channel: "13", unknownCount: maxUnknownTokens - 2, over: true},
+		{name: "exactly 4096 bool and string", channelType: "true", channel: `"13"`, unknownCount: maxUnknownTokens - 3},
+		{name: "4097 bool and string", channelType: "true", channel: `"13"`, unknownCount: maxUnknownTokens - 2, over: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var unknown strings.Builder
+			for index := 0; index < test.unknownCount; index++ {
+				fmt.Fprintf(&unknown, `,"unknown%d":0`, index)
+			}
+			body := fmt.Sprintf(`[{"id":%d,"networkId":1,"serviceId":2,"name":"x","type":1,"channel":{"type":%s%s,"channel":%s}}]`,
+				serviceProviderID(1, 2), test.channelType, unknown.String(), test.channel)
 			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writeJSON(writer, body) }))
 			defer server.Close()
 			services, err := mustAdapter(t, server.URL).ObserveBootstrapServices(context.Background())
