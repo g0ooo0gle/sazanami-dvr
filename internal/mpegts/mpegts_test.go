@@ -198,6 +198,40 @@ func TestPSICollectorFeedUntilStopsBeforeLaterInvalidSection(t *testing.T) {
 	}
 }
 
+func TestPSICollectorFeedUntilEmitsBeforeCheckingContinuationStuffing(t *testing.T) {
+	section := testPMTSection(0, []ElementaryStream{{Type: 0x1b, PID: 0x101, Descriptor: bytes.Repeat([]byte{0xaa}, 300)}})
+	packets, err := PacketizeSection(0x100, 0, section)
+	if err != nil || len(packets) < 2 {
+		t.Fatalf("packets=%d err=%v", len(packets), err)
+	}
+	packets[1] = append([]byte(nil), packets[1]...)
+	sectionRest := len(section) - (PacketBytes - 5)
+	packets[1][4+sectionRest] = 0
+
+	var collector PSICollector
+	if _, err := collector.Feed(packets[0]); err != nil {
+		t.Fatal(err)
+	}
+	emitted := 0
+	if err := collector.FeedUntil(packets[1], func(got []byte) (bool, error) {
+		emitted++
+		if !bytes.Equal(got, section) {
+			t.Fatalf("section bytes=%d", len(got))
+		}
+		return true, nil
+	}); err != nil || emitted != 1 {
+		t.Fatalf("err=%v emitted=%d", err, emitted)
+	}
+
+	collector = PSICollector{}
+	if _, err := collector.Feed(packets[0]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := collector.Feed(packets[1]); !errors.Is(err, ErrPSI) {
+		t.Fatalf("regular feed err=%v", err)
+	}
+}
+
 func TestPATPMTAndVersionTracking(t *testing.T) {
 	patSection := testPATSection(31, []uint16{1})
 	pat, err := ParsePAT(patSection)

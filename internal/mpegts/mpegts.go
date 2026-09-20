@@ -187,14 +187,17 @@ func (collector *PSICollector) feedUntil(packet []byte, emit func([]byte) (bool,
 		if err != nil {
 			return err
 		}
-		if len(rest) != 0 && !allStuffing(rest) {
-			return ErrPSI
-		}
 		if completed == nil {
 			return nil
 		}
-		_, err = emit(completed)
-		return err
+		stop, emitErr := emit(completed)
+		if emitErr != nil || stop {
+			return emitErr
+		}
+		if len(rest) != 0 && !allStuffing(rest) {
+			return ErrPSI
+		}
+		return nil
 	}
 
 	pointer := int(payload[0])

@@ -103,6 +103,100 @@ func TestObserveBootstrapServicesAcceptsSupportedChannelBoundaries(t *testing.T)
 	}
 }
 
+func TestObserveBootstrapServicesSharesChannelJSONTokenBudget(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		unknownCount int
+		over         bool
+	}{
+		{name: "at limit", unknownCount: maxUnknownTokens},
+		{name: "one over", unknownCount: maxUnknownTokens + 1, over: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var channel strings.Builder
+			channel.WriteString(`"channel":{"type":"GR","channel":"13"`)
+			for index := 0; index < test.unknownCount; index++ {
+				fmt.Fprintf(&channel, `,"unknown%d":0`, index)
+			}
+			channel.WriteByte('}')
+			body := fmt.Sprintf(`[{
+                "id":%d,"networkId":1,"serviceId":2,"name":"x","type":1,%s
+            }]`, serviceProviderID(1, 2), channel.String())
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writeJSON(writer, body) }))
+			defer server.Close()
+			services, err := mustAdapter(t, server.URL).ObserveBootstrapServices(context.Background())
+			if test.over {
+				if !provider.IsReason(err, provider.ReasonOverLimit) {
+					t.Fatalf("err=%v services=%+v", err, services)
+				}
+				return
+			}
+			if err != nil || len(services) != 1 || services[0].Channel == nil {
+				t.Fatalf("err=%v services=%+v", err, services)
+			}
+		})
+	}
+}
+
+func TestObserveBootstrapServicesSharesInvalidKnownChannelStructureBudget(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		elements int
+		over     bool
+	}{
+		{name: "at limit", elements: maxUnknownTokens/2 - 1},
+		{name: "one over", elements: maxUnknownTokens / 2, over: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			values := strings.Repeat("0,", test.elements-1) + "0"
+			body := fmt.Sprintf(`[{"id":%d,"networkId":1,"serviceId":2,"name":"x","type":1,"channel":{"type":[%s],"channel":[%s]}}]`,
+				serviceProviderID(1, 2), values, values)
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writeJSON(writer, body) }))
+			defer server.Close()
+			services, err := mustAdapter(t, server.URL).ObserveBootstrapServices(context.Background())
+			if test.over {
+				if !provider.IsReason(err, provider.ReasonOverLimit) {
+					t.Fatalf("err=%v services=%+v", err, services)
+				}
+				return
+			}
+			if err != nil || len(services) != 1 || services[0].Channel != nil {
+				t.Fatalf("err=%v services=%+v", err, services)
+			}
+		})
+	}
+}
+
+func TestObserveBootstrapServicesEnforcesChannelDepthBudget(t *testing.T) {
+	for _, test := range []struct {
+		name, channel string
+		over          bool
+	}{
+		{name: "unknown member at limit", channel: `{"type":"GR","channel":"13","unknown":` + channelDepthValue(maxJSONDepth-1) + `}`},
+		{name: "known wrong type at limit", channel: `{"type":` + channelDepthValue(maxJSONDepth-1) + `,"channel":"13"}`},
+		{name: "unknown member one over", channel: `{"type":"GR","channel":"13","unknown":` + channelDepthValue(maxJSONDepth) + `}`, over: true},
+		{name: "known wrong type one over", channel: `{"type":` + channelDepthValue(maxJSONDepth) + `,"channel":"13"}`, over: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := fmt.Sprintf(`[{"id":%d,"networkId":1,"serviceId":2,"name":"x","type":1,"channel":%s}]`,
+				serviceProviderID(1, 2), test.channel)
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writeJSON(writer, body) }))
+			defer server.Close()
+			services, err := mustAdapter(t, server.URL).ObserveBootstrapServices(context.Background())
+			if test.over && !provider.IsReason(err, provider.ReasonOverLimit) {
+				t.Fatalf("err=%v", err)
+			}
+			if !test.over && (err != nil || len(services) != 1) {
+				t.Fatalf("err=%v services=%+v", err, services)
+			}
+		})
+	}
+}
+
+func channelDepthValue(depth int) string {
+	return strings.Repeat("[", depth) + "0" + strings.Repeat("]", depth)
+}
+
 func TestObserveBootstrapServicesRejectsInvalidAndDuplicateEntries(t *testing.T) {
 	validID := serviceProviderID(1, 2)
 	tests := []struct {
