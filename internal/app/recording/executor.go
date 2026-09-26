@@ -353,6 +353,15 @@ func (executor Executor) publishFinal(ctx context.Context, attempt recording.Att
 	state, reason = finalization.State, finalization.Reason
 	ctx = context.WithoutCancel(ctx)
 	if err := executor.Files.LinkFinal(attempt.Plan); err != nil {
+		if errors.Is(err, errors.ErrUnsupported) {
+			finish := recording.FinishRequest{AttemptID: attempt.ID, State: recording.AttemptFailed,
+				Reason: recording.ReasonFinalPublicationFailed, ByteCount: byteCount,
+				Availability: recording.AvailabilityPartial, Now: executor.now()}
+			if err := executor.Store.FinishAttempt(ctx, finish); err != nil {
+				return Result{}, errors.New("recording: persist unsupported publication")
+			}
+			return Result{State: finish.State, Reason: finish.Reason}, nil
+		}
 		if errors.Is(err, recording.ErrFinalExists) {
 			return Result{State: recording.AttemptFinalizing, Reason: recording.ReasonFinalNameConflict}, err
 		}

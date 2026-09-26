@@ -197,10 +197,8 @@ func (root *Root) LinkFinal(plan recording.FilePlan) error {
 	if err != nil || !validRegularInfo(partialInfo, 1) {
 		return errors.New("recordingfs: invalid partial before publication")
 	}
-	if err := renameNoReplace(partial, final); errors.Is(err, os.ErrExist) {
-		return ErrFinalExists
-	} else if err != nil {
-		return errors.New("recordingfs: publish final file")
+	if err := renameNoReplace(partial, final); err != nil {
+		return finalPublicationError(err)
 	}
 	finalInfo, finalErr := os.Lstat(final)
 	_, partialErr := os.Lstat(partial)
@@ -209,6 +207,17 @@ func (root *Root) LinkFinal(plan recording.FilePlan) error {
 		return errors.New("recordingfs: final publication readback failed")
 	}
 	return nil
+}
+
+func finalPublicationError(err error) error {
+	if errors.Is(err, os.ErrExist) {
+		return ErrFinalExists
+	}
+	if errors.Is(err, errors.ErrUnsupported) || errors.Is(err, syscall.ENOSYS) ||
+		errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.EINVAL) {
+		return errors.ErrUnsupported
+	}
+	return errors.New("recordingfs: publish final file")
 }
 
 // SyncDirectoryは録画ファイル名を含む年月ディレクトリを永続化する。
