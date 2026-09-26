@@ -11,12 +11,29 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/recordinghttp"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/recording"
 )
+
+func TestPublicationErrorsDistinguishUnsupportedFromTransientFailures(t *testing.T) {
+	for _, code := range []error{syscall.ENOSYS, syscall.EOPNOTSUPP, syscall.EINVAL, errors.ErrUnsupported} {
+		if err := finalPublicationError(code); !errors.Is(err, errors.ErrUnsupported) {
+			t.Errorf("unsupported error lost: code=%v got=%v", code, err)
+		}
+	}
+	for _, code := range []error{syscall.EIO, syscall.EACCES, syscall.ENOSPC} {
+		if err := finalPublicationError(code); errors.Is(err, errors.ErrUnsupported) || errors.Is(err, ErrFinalExists) {
+			t.Errorf("retryable failure became permanent: code=%v got=%v", code, err)
+		}
+	}
+	if err := finalPublicationError(syscall.EEXIST); !errors.Is(err, ErrFinalExists) {
+		t.Fatalf("collision=%v", err)
+	}
+}
 
 func TestNoReplaceRenamePreservesBothFilesOnCollision(t *testing.T) {
 	directory := t.TempDir()

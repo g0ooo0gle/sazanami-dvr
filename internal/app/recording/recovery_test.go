@@ -204,6 +204,33 @@ func TestRecoveryResumesBothAtomicPublicationsBeforeDatabaseRecord(t *testing.T)
 	}
 }
 
+func TestRecoverySettlesUnsupportedPublicationWithoutBlockingStartup(t *testing.T) {
+	for _, oneSeg := range []bool{false, true} {
+		item := recoveryItem(t, core.AttemptFinalizing)
+		item.FileSynced = true
+		item.FinalizationToken = appID(t, 63)
+		if oneSeg {
+			addOneSegRecovery(t, &item, core.SegmentPartial, core.AvailabilityPartial)
+			item.OneSeg.FileSynced = true
+		}
+		memory := recoveryMemory{item: item, observation: core.FileObservation{Partial: regularFact(376)},
+			oneSegObservation: core.FileObservation{Partial: regularFact(376)}}
+		recovery := recoveryForTest(&memory)
+		recovery.Files.LinkFinal = func(core.FilePlan) error { return errors.ErrUnsupported }
+		if err := recovery.Run(context.Background()); err != nil {
+			t.Fatalf("unsupported publication blocked startup: %v", err)
+		}
+		if len(memory.finish) != 1 || memory.finish[0].State != core.AttemptFailed ||
+			memory.finish[0].Reason != core.ReasonFinalPublicationFailed ||
+			memory.finish[0].Availability != core.AvailabilityPartial || len(memory.operations) != 0 {
+			t.Fatalf("finish=%+v operations=%v", memory.finish, memory.operations)
+		}
+		if oneSeg && (memory.finish[0].OneSeg == nil || memory.finish[0].OneSeg.Availability != core.AvailabilityPartial) {
+			t.Fatalf("one-seg=%+v", memory.finish[0].OneSeg)
+		}
+	}
+}
+
 func TestRecoveryRejectsUnpreparedAtomicPublication(t *testing.T) {
 	for _, missing := range []string{"token", "file-sync", "partial-state", "partial-availability", "clean-integrity", "unrecorded-directory", "minimum-size", "exact-size", "regular", "safe"} {
 		t.Run(missing, func(t *testing.T) {

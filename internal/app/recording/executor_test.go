@@ -1621,6 +1621,37 @@ func TestCancelledFinalizationWithoutStopBecomesProcessShutdown(t *testing.T) {
 	}
 }
 
+func TestUnsupportedPublicationSettlesMainAndOneSegWithoutPostProcessing(t *testing.T) {
+	for _, oneSeg := range []bool{false, true} {
+		start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+		store := &attemptMemory{start: start, end: start.Add(time.Hour)}
+		called := 0
+		executor := Executor{
+			Store: store, Clock: &mutableClock{now: start}, NewID: func() (catalogmodel.ID, error) { return appID(t, 85), nil },
+			Files:         FileOperations{LinkFinal: func(core.FilePlan) error { return errors.ErrUnsupported }},
+			PostRecording: func(context.Context, PostRecordingRequest) string { called++; return "" },
+		}
+		if oneSeg {
+			executor.Store = &oneSegAttemptStore{AttemptStore: store, coordinator: &oneSegCoordinator{
+				joined: true, result: core.OneSegResult{ByteCount: 188, FileSynced: true, Publish: true,
+					Availability: core.AvailabilityPartial, Reason: core.ReasonCompleted},
+			}}
+		}
+		result, err := executor.publishAndPostProcess(context.Background(), core.Reservation{
+			Number: 1, PostRecording: core.PostRecordingSettings{Mode: core.PostRecordingShutdown, Script: "/allowed/finish.sh"},
+		}, core.Attempt{ID: appID(t, 86)}, 376, core.AttemptSucceeded, core.ReasonCompleted)
+		if err != nil || result.State != core.AttemptFailed || result.Reason != core.ReasonFinalPublicationFailed ||
+			store.finish.Availability != core.AvailabilityPartial || store.finish.ByteCount != 376 || called != 0 ||
+			result.PostRecording.ChangesPower() {
+			t.Fatalf("result=%+v finish=%+v post=%d err=%v", result, store.finish, called, err)
+		}
+		if oneSeg && (store.finish.OneSeg == nil || store.finish.OneSeg.Publish ||
+			store.finish.OneSeg.Availability != core.AvailabilityPartial) {
+			t.Fatalf("one-seg=%+v", store.finish.OneSeg)
+		}
+	}
+}
+
 func TestPostRecordingIsSkippedWithoutScriptOrWhenPublicationFails(t *testing.T) {
 	for _, test := range []struct {
 		name, script string

@@ -194,6 +194,9 @@ func (recovery Recovery) recoverMainFinalization(ctx context.Context, item core.
 	switch {
 	case partialMatches && !observation.Final.Exists && !item.FinalPublished && !item.DirectorySynced:
 		if err := recovery.Files.LinkFinal(item.Plan); err != nil {
+			if errors.Is(err, errors.ErrUnsupported) {
+				return finalizationFailure(item, core.ReasonFinalPublicationFailed, core.AvailabilityPartial), nil
+			}
 			return nil, errors.New("recording: resume final publication")
 		}
 		if err := recovery.Store.MarkFinalPublished(ctx, item.ID, recovery.now()); err != nil {

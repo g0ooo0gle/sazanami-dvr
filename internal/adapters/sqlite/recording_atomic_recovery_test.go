@@ -5,8 +5,11 @@ package sqlite
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,7 +21,7 @@ import (
 
 func TestAtomicPublicationBeforeDatabaseRecordSurvivesRestart(t *testing.T) {
 	for _, stopped := range []bool{false, true} {
-		for _, window := range []string{"main", "one-seg"} {
+		for _, window := range []string{"main", "one-seg", "unsupported-main", "unsupported-one-seg"} {
 			name := "normal/" + window
 			if stopped {
 				name = "user-stop/" + window
@@ -92,10 +95,12 @@ func TestAtomicPublicationBeforeDatabaseRecordSurvivesRestart(t *testing.T) {
 				}); err != nil {
 					t.Fatal(err)
 				}
-				if err := root.LinkFinal(claim.Plan); err != nil {
-					t.Fatal(err)
+				if window != "unsupported-main" {
+					if err := root.LinkFinal(claim.Plan); err != nil {
+						t.Fatal(err)
+					}
 				}
-				if window == "one-seg" {
+				if strings.HasSuffix(window, "one-seg") {
 					if err := store.MarkFinalPublished(ctx, claim.AttemptID, now.Add(6*time.Second)); err != nil {
 						t.Fatal(err)
 					}
@@ -105,8 +110,10 @@ func TestAtomicPublicationBeforeDatabaseRecordSurvivesRestart(t *testing.T) {
 					if err := store.MarkDirectorySynced(ctx, claim.AttemptID, now.Add(7*time.Second)); err != nil {
 						t.Fatal(err)
 					}
-					if err := root.LinkFinal(onePlan); err != nil {
-						t.Fatal(err)
+					if window == "one-seg" {
+						if err := root.LinkFinal(onePlan); err != nil {
+							t.Fatal(err)
+						}
 					}
 				}
 				// 対象のrenameだけが完了し、公開フラグを書かずに再起動する。
@@ -131,6 +138,9 @@ func TestAtomicPublicationBeforeDatabaseRecordSurvivesRestart(t *testing.T) {
 						CreatePartial: func(plan core.FilePlan) (apprecording.PartialFile, error) { return root.CreatePartial(plan) },
 						LinkFinal:     root.LinkFinal, SyncDirectory: root.SyncDirectory, RemovePartial: root.RemovePartial,
 					}}}
+				if strings.HasPrefix(window, "unsupported-") {
+					recovery.Files.LinkFinal = func(core.FilePlan) error { return errors.ErrUnsupported }
+				}
 				for range 2 {
 					if err := recovery.Run(ctx); err != nil {
 						t.Fatal(err)
@@ -140,16 +150,31 @@ func TestAtomicPublicationBeforeDatabaseRecordSurvivesRestart(t *testing.T) {
 				if stopped {
 					wantState, wantReason = core.AttemptPartial, core.ReasonUserRequestedStop
 				}
+				if window == "unsupported-main" {
+					wantState, wantReason = core.AttemptFailed, core.ReasonFinalPublicationFailed
+				}
 				history, err := store.RecordingHistoryItem(ctx, created.Number)
-				if err != nil || history == nil || !history.Playable() || history.State != wantState || history.Reason != wantReason {
+				if err != nil || history == nil || history.Playable() != (window != "unsupported-main") || history.State != wantState || history.Reason != wantReason {
 					t.Fatalf("history=%+v err=%v", history, err)
 				}
 				items, err := store.RecoveryAttempts(ctx, core.MaxRecoveryPage, catalogmodel.ID{})
-				if err != nil || len(items) != 1 || !items[0].Recovered || items[0].OneSeg == nil ||
-					items[0].OneSeg.State != core.SegmentFinalized || items[0].OneSeg.Availability != core.AvailabilityFinal {
+				oneState, oneAvailability := core.SegmentFinalized, core.AvailabilityFinal
+				if window == "unsupported-one-seg" {
+					oneState, oneAvailability = core.SegmentPartial, core.AvailabilityPartial
+				}
+				if err != nil || (window == "unsupported-main" && len(items) != 0) ||
+					(window != "unsupported-main" && (len(items) != 1 || !items[0].Recovered || items[0].OneSeg == nil ||
+						items[0].OneSeg.State != oneState || items[0].OneSeg.Availability != oneAvailability)) {
 					t.Fatalf("recovery=%+v err=%v", items, err)
 				}
 				for index, plan := range plans {
+					if window == "unsupported-main" || window == "unsupported-one-seg" && index == 1 {
+						got, err := os.ReadFile(filepath.Join(rootPath, plan.PartialPath))
+						if err != nil || !bytes.Equal(got, contents[index]) {
+							t.Fatalf("partial lost: segment=%d bytes=%d err=%v", index, len(got), err)
+						}
+						continue
+					}
 					file, err := root.OpenFinal(plan, int64(len(contents[index])))
 					if err != nil {
 						t.Fatal(err)
