@@ -87,7 +87,8 @@ func (file *FinalFile) Read(data []byte) (int, error) {
 		return 0, errors.New("recordingfs: invalid final read")
 	}
 	current, err := os.Lstat(file.path)
-	if err != nil || !validRegularInfo(current, 1) || !os.SameFile(file.identity, current) {
+	if err != nil || !validRegularInfo(current, 1) || !os.SameFile(file.identity, current) ||
+		current.Size() != file.identity.Size() {
 		return 0, errors.New("recordingfs: final file changed")
 	}
 	return file.file.Read(data)
@@ -181,7 +182,7 @@ func (root *Root) CreatePartial(plan recording.FilePlan) (*PartialFile, error) {
 	return &PartialFile{file: file}, nil
 }
 
-// LinkFinalは部分ファイルと同じinodeを完成名で公開し、既存の完成ファイルを置き換えない。
+// LinkFinalは部分名を完成名へ上書き禁止で移す。内部port名は旧link方式との互換のため維持する。
 func (root *Root) LinkFinal(plan recording.FilePlan) error {
 	partial, final, _, err := root.paths(plan)
 	if err != nil {
@@ -196,15 +197,15 @@ func (root *Root) LinkFinal(plan recording.FilePlan) error {
 	if err != nil || !validRegularInfo(partialInfo, 1) {
 		return errors.New("recordingfs: invalid partial before publication")
 	}
-	if err := os.Link(partial, final); errors.Is(err, os.ErrExist) {
+	if err := renameNoReplace(partial, final); errors.Is(err, os.ErrExist) {
 		return ErrFinalExists
 	} else if err != nil {
 		return errors.New("recordingfs: publish final file")
 	}
 	finalInfo, finalErr := os.Lstat(final)
-	partialInfo, partialErr := os.Lstat(partial)
-	if finalErr != nil || partialErr != nil || !validRegularInfo(finalInfo, 2) ||
-		!validRegularInfo(partialInfo, 2) || !os.SameFile(partialInfo, finalInfo) {
+	_, partialErr := os.Lstat(partial)
+	if finalErr != nil || !errors.Is(partialErr, os.ErrNotExist) || !validRegularInfo(finalInfo, 1) ||
+		finalInfo.Size() != partialInfo.Size() || !os.SameFile(partialInfo, finalInfo) {
 		return errors.New("recordingfs: final publication readback failed")
 	}
 	return nil
@@ -231,7 +232,7 @@ func (root *Root) SyncDirectory(plan recording.FilePlan) error {
 	return nil
 }
 
-// RemovePartialは完成名と同じinodeであることを確認してから部分名だけを除く。
+// RemovePartialは移動済みの完成名を確認し、旧link方式の中断状態なら同一inodeの部分名だけを除く。
 func (root *Root) RemovePartial(plan recording.FilePlan) error {
 	partial, final, _, err := root.paths(plan)
 	if err != nil {
@@ -239,12 +240,19 @@ func (root *Root) RemovePartial(plan recording.FilePlan) error {
 	}
 	partialInfo, partialErr := os.Lstat(partial)
 	finalInfo, finalErr := os.Lstat(final)
+	if errors.Is(partialErr, os.ErrNotExist) && finalErr == nil && validRegularInfo(finalInfo, 1) {
+		return nil
+	}
 	if partialErr != nil || finalErr != nil || !validRegularInfo(partialInfo, 2) ||
 		!validRegularInfo(finalInfo, 2) || !os.SameFile(partialInfo, finalInfo) {
 		return errors.New("recordingfs: partial and final files do not match")
 	}
 	if err := os.Remove(partial); err != nil {
 		return errors.New("recordingfs: remove partial name")
+	}
+	finalInfo, finalErr = os.Lstat(final)
+	if finalErr != nil || !validRegularInfo(finalInfo, 1) {
+		return errors.New("recordingfs: partial removal readback failed")
 	}
 	return nil
 }
@@ -285,6 +293,10 @@ func (root *Root) Inspect(plan recording.FilePlan) (recording.FileObservation, e
 	observation := recording.FileObservation{Partial: partialFact, Final: finalFact}
 	if partialInfo != nil && finalInfo != nil {
 		observation.SameFile = os.SameFile(partialInfo, finalInfo)
+	}
+	if !partialFact.Exists && finalInfo != nil {
+		// 完成名だけが残る場合は、HTTP配信と同じく単一リンクを要求する。
+		observation.Final.Regular = validRegularInfo(finalInfo, 1)
 	}
 	return observation, nil
 }

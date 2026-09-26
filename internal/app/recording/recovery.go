@@ -207,7 +207,17 @@ func (recovery Recovery) recoverMainFinalization(ctx context.Context, item core.
 			}
 		}
 		return nil, recovery.completeMainPublication(ctx, item, true)
-	case !observation.Partial.Exists && finalMatches && item.FinalPublished:
+	case !observation.Partial.Exists && finalMatches:
+		// 上書き禁止renameの直後、DBへの公開記録より前に停止した場合も再開する。
+		if !item.FinalPublished {
+			if item.DirectorySynced || item.SegmentState != core.SegmentPartial ||
+				item.Availability != core.AvailabilityPartial || item.IntegrityReason != "" {
+				return finalizationFailure(item, core.ReasonFileIntegrityMismatch, core.AvailabilityMismatched), nil
+			}
+			if err := recovery.Store.MarkFinalPublished(ctx, item.ID, recovery.now()); err != nil {
+				return nil, errors.New("recording: record moved final publication")
+			}
+		}
 		return nil, recovery.completeMainPublication(ctx, item, false)
 	case !observation.Partial.Exists && !observation.Final.Exists:
 		return finalizationFailure(item, core.ReasonFileMissing, core.AvailabilityMissing), nil
@@ -285,7 +295,12 @@ func (recovery Recovery) recoverOneSegFinalization(ctx context.Context, attemptI
 			}
 		}
 		return recovery.completeOneSegPublication(ctx, attemptID, segment, true)
-	case !observation.Partial.Exists && finalMatches && segment.FinalPublished:
+	case !observation.Partial.Exists && finalMatches && (segment.FinalPublished || !segment.DirectorySynced):
+		if !segment.FinalPublished {
+			if err := recovery.Store.MarkOneSegFinalPublished(ctx, attemptID, recovery.now()); err != nil {
+				return errors.New("recording: record moved one-seg publication")
+			}
+		}
 		return recovery.completeOneSegPublication(ctx, attemptID, segment, false)
 	case !observation.Partial.Exists && !observation.Final.Exists:
 		return recovery.saveOneSegOutcome(ctx, attemptID, core.OneSegResult{
