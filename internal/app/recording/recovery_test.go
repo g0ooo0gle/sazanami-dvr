@@ -142,6 +142,8 @@ func TestRecoveryResumesEverySafeFinalizationWindow(t *testing.T) {
 			want: []string{"link", "published", "directory-sync", "remove", "directory-sync", "directory-recorded"}},
 		{name: "after link", observation: core.FileObservation{Partial: regularFact(376), Final: regularFact(376), SameFile: true},
 			want: []string{"published", "directory-sync", "remove", "directory-sync", "directory-recorded"}},
+		{name: "after atomic rename", observation: core.FileObservation{Final: regularFact(376)},
+			want: []string{"published", "directory-sync", "directory-recorded"}},
 		{name: "after publication record", observation: core.FileObservation{Partial: regularFact(376), Final: regularFact(376), SameFile: true},
 			published: true, want: []string{"directory-sync", "remove", "directory-sync", "directory-recorded"}},
 		{name: "after partial removal", observation: core.FileObservation{Final: regularFact(376)}, published: true,
@@ -178,6 +180,65 @@ func TestRecoveryResumesEverySafeFinalizationWindow(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestRecoveryResumesBothAtomicPublicationsBeforeDatabaseRecord(t *testing.T) {
+	item := recoveryItem(t, core.AttemptFinalizing)
+	item.FileSynced = true
+	item.FinalizationToken = appID(t, 61)
+	addOneSegRecovery(t, &item, core.SegmentPartial, core.AvailabilityPartial)
+	item.OneSeg.FileSynced = true
+	memory := recoveryMemory{
+		item: item, observation: core.FileObservation{Final: regularFact(376)},
+		oneSegObservation: core.FileObservation{Final: regularFact(376)},
+	}
+	if err := recoveryForTest(&memory).Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"published", "directory-sync", "directory-recorded",
+		"one-published", "one-directory-sync", "one-directory-recorded"}
+	if !equalStrings(memory.operations, want) || len(memory.finish) != 1 ||
+		memory.finish[0].State != core.AttemptSucceeded || !memory.item.OneSeg.DirectorySynced {
+		t.Fatalf("operations=%v finish=%+v one-seg=%+v", memory.operations, memory.finish, memory.item.OneSeg)
+	}
+}
+
+func TestRecoveryRejectsUnpreparedAtomicPublication(t *testing.T) {
+	for _, missing := range []string{"token", "file-sync", "partial-state", "partial-availability", "clean-integrity", "unrecorded-directory", "minimum-size", "exact-size", "regular", "safe"} {
+		t.Run(missing, func(t *testing.T) {
+			item := recoveryItem(t, core.AttemptFinalizing)
+			item.FileSynced = missing != "file-sync"
+			if missing != "token" {
+				item.FinalizationToken = appID(t, 62)
+			}
+			memory := recoveryMemory{item: item, observation: core.FileObservation{Final: regularFact(376)}}
+			switch missing {
+			case "partial-state":
+				memory.item.SegmentState = core.SegmentWriting
+			case "partial-availability":
+				memory.item.Availability = core.AvailabilityMismatched
+			case "clean-integrity":
+				memory.item.IntegrityReason = core.ReasonFileIntegrityMismatch
+			case "unrecorded-directory":
+				memory.item.DirectorySynced = true
+			case "minimum-size":
+				memory.item.ByteCount = 187
+				memory.observation.Final.Size = 187
+			case "exact-size":
+				memory.observation.Final.Size = 188
+			case "regular":
+				memory.observation.Final.Regular = false
+			case "safe":
+				memory.observation.Unsafe = true
+			}
+			if err := recoveryForTest(&memory).Run(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if len(memory.finish) != 1 || memory.finish[0].State != core.AttemptFailed || len(memory.operations) != 0 {
+				t.Fatalf("unprepared final accepted: finish=%+v operations=%v", memory.finish, memory.operations)
+			}
+		})
 	}
 }
 
