@@ -335,15 +335,56 @@ func TestParsePacketReadsPCRRandomAccessAndWrap(t *testing.T) {
 	if delta := ProgramClockDelta(wrap-27_000_000, 27_000_000); delta != 54_000_000 {
 		t.Fatalf("wrap delta=%d", delta)
 	}
-	packet[10] &^= 0x7e
-	if _, err := ParsePacket(packet); !errors.Is(err, ErrPacket) {
-		t.Fatalf("reserved PCR bits err=%v", err)
-	}
 	packet = testPCRPacket(0x101, 3, clock, true, true)
 	packet[10] |= 1
 	packet[11] = 0x2c
 	if _, err := ParsePacket(packet); !errors.Is(err, ErrPacket) {
 		t.Fatalf("PCR extension err=%v", err)
+	}
+}
+
+func TestParsePacketIgnoresPCRReservedBits(t *testing.T) {
+	for _, clock := range []uint64{0, 1, 299, 300, 301, 123456789, (1<<33)*300 - 1} {
+		for reserved := byte(0); reserved <= 0x7e; reserved += 2 {
+			packet := testPCRPacket(0x101, 3, clock, true, true)
+			packet[5] |= 0x80
+			packet[10] = packet[10]&0x81 | reserved
+			before := append([]byte(nil), packet...)
+			parsed, err := ParsePacket(packet)
+			if err != nil || !parsed.HasProgramClock || parsed.ProgramClock27MHz != clock ||
+				parsed.PID != 0x101 || parsed.ContinuityCounter != 3 || !parsed.PayloadUnitStart ||
+				!parsed.RandomAccess || !parsed.Discontinuity || !bytes.Equal(parsed.Payload, before[12:]) {
+				t.Fatalf("clock=%d reserved=%#02x parsed=%+v err=%v", clock, reserved, parsed, err)
+			}
+			if !bytes.Equal(packet, before) {
+				t.Fatal("PCRの予約bitを含む入力packetが変更されました")
+			}
+		}
+	}
+}
+
+func TestParsePacketRejectsMalformedPCRWithNonstandardReservedBits(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func([]byte) []byte
+	}{
+		{"short packet", func(p []byte) []byte { return p[:187] }},
+		{"long packet", func(p []byte) []byte { return append(p, 0) }},
+		{"sync", func(p []byte) []byte { p[0] = 0; return p }},
+		{"transport error", func(p []byte) []byte { p[1] |= 0x80; return p }},
+		{"missing PCR byte", func(p []byte) []byte { p[4] = 6; return p }},
+		{"adaptation overflow", func(p []byte) []byte { p[4] = 184; return p }},
+		{"missing payload", func(p []byte) []byte { p[4] = 183; return p }},
+		{"extension 300", func(p []byte) []byte { p[10] |= 1; p[11] = 0x2c; return p }},
+		{"extension 511", func(p []byte) []byte { p[10] |= 1; p[11] = 0xff; return p }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			packet := testPCRPacket(0x101, 3, 299, true, true)
+			packet[10] &^= 0x7e
+			if _, err := ParsePacket(test.mutate(packet)); !errors.Is(err, ErrPacket) {
+				t.Fatalf("err=%v", err)
+			}
+		})
 	}
 }
 

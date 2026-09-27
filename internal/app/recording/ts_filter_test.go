@@ -180,6 +180,84 @@ func TestTSComponentFilterRejectsMalformedAndBoundaries(t *testing.T) {
 	}
 }
 
+func TestTSComponentFilterKeepsPCRReservedBitsAcrossDiscoveryAndRecording(t *testing.T) {
+	pcr := makePCRPacketForTest(0)
+	input := append([]byte(nil), pcr...)
+	input = append(input, packetizeSectionForTest(0, 0, makePATSection(t, []uint16{1}))...)
+	input = append(input, pcr...)
+	input = append(input, packetizeSectionForTest(0x100, 3, makePMTSection(t,
+		[]testStream{{0x1b, 0x101, nil}, {0x06, 0x102, nil}, {0x0d, 0x103, nil}}))...)
+	input = append(input, pcr...)
+	input = append(input, makePayloadPacket(0x102)...)
+	input = append(input, makePayloadPacket(0x103)...)
+	file := &tsBufferFile{}
+	filter := newTSComponentFilter(file, true, false)
+	for offset := 0; offset < len(input); {
+		end := min(len(input), offset+187)
+		if _, err := filter.Write(input[offset:end]); err != nil {
+			t.Fatal(err)
+		}
+		offset = end
+	}
+	if err := filter.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	if got := packetPIDsForTest(t, file.Bytes()); !equalPIDs(got, []uint16{0x101, 0, 0x101, 0x100, 0x101, 0x102}) ||
+		bytes.Count(file.Bytes(), pcr) != 3 {
+		t.Fatalf("pids=%#v PCR packet count=%d", got, bytes.Count(file.Bytes(), pcr))
+	}
+}
+
+func TestTSComponentFilterKeepsInterleavedPacketsDuringPMT(t *testing.T) {
+	for _, phase := range []string{"initial", "update"} {
+		t.Run(phase, func(t *testing.T) {
+			file := &tsBufferFile{}
+			filter := newTSComponentFilter(file, true, false)
+			continuity := byte(3)
+			var input []byte
+			wantPIDs := []uint16{0, 0x100, 0x100, 0x101, 0x102, 0x101}
+			if phase == "initial" {
+				input = packetizeSectionForTest(0, 0, makePATSection(t, []uint16{1}))
+			} else {
+				if _, err := filter.Write(testTransportStream(t, []testStream{{0x1b, 0x101, nil}})); err != nil {
+					t.Fatal(err)
+				}
+				file.Reset()
+				continuity = 4
+				wantPIDs = wantPIDs[1:]
+			}
+			pmt := packetizeSectionForTest(0x100, continuity, makePMTSection(t,
+				[]testStream{{0x1b, 0x101, bytes.Repeat([]byte{0xaa}, 200)}, {0x06, 0x102, nil}, {0x0d, 0x103, nil}}))
+			if len(pmt) != 2*tsPacketBytes {
+				t.Fatalf("PMT bytes=%d", len(pmt))
+			}
+			pcr := makePCRPacketForTest(0x7e)
+			caption, data, video := makePayloadPacket(0x102), makePayloadPacket(0x103), makePayloadPacket(0x101)
+			video[3] = 0x17 // 入力側で飛んだ映像の連番も書き換えない。
+			for _, part := range [][]byte{pmt[:tsPacketBytes], pcr, caption, data, video, pmt[tsPacketBytes:]} {
+				input = append(input, part...)
+			}
+			if _, err := filter.Write(input); err != nil {
+				t.Fatal(err)
+			}
+			if err := filter.Finish(); err != nil {
+				t.Fatal(err)
+			}
+			if got := packetPIDsForTest(t, file.Bytes()); !equalPIDs(got, wantPIDs) ||
+				!bytes.Contains(file.Bytes(), pcr) || !bytes.Contains(file.Bytes(), caption) || !bytes.Contains(file.Bytes(), video) {
+				t.Fatalf("pids=%#v want=%#v", got, wantPIDs)
+			}
+		})
+	}
+}
+
+func makePCRPacketForTest(reserved byte) []byte {
+	packet := makePayloadPacket(0x101)
+	packet[3], packet[4], packet[5] = 0x30, 7, 0x10
+	copy(packet[6:12], []byte{0, 0, 0, 0, 0x81 | reserved, 0x2b})
+	return packet
+}
+
 func invalidPointerPacket() []byte {
 	packet := makePayloadPacket(0)
 	packet[1] |= 0x40

@@ -84,9 +84,8 @@ func ParsePacket(packet []byte) (Packet, error) {
 					return Packet{}, ErrPacket
 				}
 				value := packet[6:12]
-				if value[4]&0x7e != 0x7e {
-					return Packet{}, ErrPacket
-				}
+				// 予約bitは時刻値ではないため、全1でない受信値も読み飛ばす。
+				// PCRの長さとextensionの範囲は引き続き検証する。
 				base := uint64(value[0])<<25 | uint64(value[1])<<17 | uint64(value[2])<<9 |
 					uint64(value[3])<<1 | uint64(value[4]>>7)
 				extension := uint64(value[4]&1)<<8 | uint64(value[5])

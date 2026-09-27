@@ -150,10 +150,10 @@ func (filter *tsComponentFilter) replayInitial(data []byte, found discoveredPMT,
 				return written, writeErr
 			}
 		}
-		if index >= found.firstPacket && index <= found.lastPacket {
+		packet := data[index*tsPacketBytes : (index+1)*tsPacketBytes]
+		if index >= found.firstPacket && index <= found.lastPacket && mpegts.PID(packet) == found.pmtPID {
 			continue
 		}
-		packet := data[index*tsPacketBytes : (index+1)*tsPacketBytes]
 		count, err := filter.writeSelected(packet)
 		written += count
 		if err != nil {
