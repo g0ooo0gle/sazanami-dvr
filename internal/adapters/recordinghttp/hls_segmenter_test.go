@@ -70,6 +70,44 @@ func TestHLSSegmenterAcceptsIndependentVersionWrapAndMarksDiscontinuity(t *testi
 	}
 }
 
+func TestHLSSegmenterKeepsPCRReservedBitsAndDurations(t *testing.T) {
+	boundaries := make([][]byte, 3)
+	for index, reserved := range []byte{0, 0x2a, 0x7e} {
+		boundary := testHLSBoundary(t, byte(index), 0, uint64(index)*hlsClockHz, 0x1b, true, []uint16{1})
+		for offset := 0; offset < len(boundary); offset += mpegts.PacketBytes {
+			packet := boundary[offset : offset+mpegts.PacketBytes]
+			if packet[3]&0x20 != 0 && packet[4] >= 7 && packet[5]&0x10 != 0 {
+				packet[10] = packet[10]&0x81 | reserved
+			}
+		}
+		boundaries[index] = boundary
+	}
+	var got []hlsSegment
+	segmenter, err := newHLSSegmenter(func(segment hlsSegment) error {
+		got = append(got, segment)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, boundary := range boundaries {
+		if _, err := segmenter.Write(boundary); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := segmenter.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("segments=%d", len(got))
+	}
+	for index, segment := range got {
+		if segment.Duration != time.Second || segment.Discontinuity || !bytes.Equal(segment.Data, boundaries[index]) {
+			t.Fatalf("segment=%+v", segmentSummary(got))
+		}
+	}
+}
+
 func TestHLSSegmenterAcceptsPMTVersionWrapIndependently(t *testing.T) {
 	first := testHLSBoundaryVersions(t, 0, 0, 7, 31, 0, 0x1b, true, []uint16{1})
 	second := testHLSBoundaryVersions(t, 1, 1, 7, 0, hlsClockHz, 0x1b, true, []uint16{1})

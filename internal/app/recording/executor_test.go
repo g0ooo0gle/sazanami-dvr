@@ -796,6 +796,28 @@ func TestExecutorFailsMalformedSelectedStreamWithoutReconnect(t *testing.T) {
 	}
 }
 
+func TestExecutorRecordsPCRWithNonstandardReservedBits(t *testing.T) {
+	start := time.Date(2026, 9, 28, 0, 0, 0, 0, time.UTC)
+	clock := &mutableClock{now: start}
+	store := &attemptMemory{start: start, end: start.Add(time.Minute)}
+	input := append(makePCRPacketForTest(0), testTransportStream(t,
+		[]testStream{{0x1b, 0x101, nil}, {0x06, 0x102, nil}, {0x0d, 0x103, nil}})...)
+	lease := &fakeLease{read: func(destination []byte) (int, providerstream.Terminal, error) {
+		copy(destination, input)
+		clock.now = store.end
+		return len(input), providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
+	}}
+	stream := &fakeProvider{lease: lease}
+	executor := executorForTest(t, store, stream, clock, false)
+	reservation := reservationForExecutor(t, start, time.Minute)
+	reservation.Components = core.ComponentDefault
+	result, err := executor.Execute(context.Background(), reservation)
+	if err != nil || result.State != core.AttemptSucceeded || result.Reason != core.ReasonCompleted ||
+		stream.opens != 1 || store.finish.ByteCount != 5*tsPacketBytes || store.finish.Availability != core.AvailabilityFinal {
+		t.Fatalf("result=%+v opens=%d finish=%+v err=%v", result, stream.opens, store.finish, err)
+	}
+}
+
 func TestExecutorUsesExtendedPlannedEnd(t *testing.T) {
 	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
 	initialEnd := start.Add(time.Minute)
