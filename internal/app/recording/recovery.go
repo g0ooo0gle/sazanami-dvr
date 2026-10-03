@@ -18,8 +18,8 @@ type RecoveryStore interface {
 	MarkOneSegDirectorySynced(context.Context, catalogmodel.ID, time.Time) error
 	SetOneSegOutcome(context.Context, catalogmodel.ID, core.OneSegResult, time.Time) error
 	FinishAttempt(context.Context, core.FinishRequest) error
-	SetRecordingAvailability(context.Context, catalogmodel.ID, core.Availability, core.TerminalReason, time.Time) error
-	SetOneSegAvailability(context.Context, catalogmodel.ID, core.Availability, core.TerminalReason, time.Time) error
+	SetRecordingAvailability(context.Context, catalogmodel.ID, core.Availability, core.TerminalReason, time.Time) (bool, error)
+	SetOneSegAvailability(context.Context, catalogmodel.ID, core.Availability, core.TerminalReason, time.Time) (bool, error)
 }
 
 // RecoveryFilesはDBに記録したパスの照合と、安全を確認できた完成処理の再開に必要な操作である。
@@ -418,7 +418,7 @@ func (recovery Recovery) reconcileSuccess(ctx context.Context, item core.Recover
 ) error {
 	availability, reason := completedAvailability(item.ByteCount, mainObservation)
 	if item.Availability != availability || item.IntegrityReason != reason {
-		if err := recovery.Store.SetRecordingAvailability(ctx, item.ID, availability, reason, recovery.now()); err != nil {
+		if _, err := recovery.Store.SetRecordingAvailability(ctx, item.ID, availability, reason, recovery.now()); err != nil {
 			return errors.New("recording: update completed file availability")
 		}
 	}
@@ -442,7 +442,7 @@ func (recovery Recovery) reconcileSettledOneSeg(ctx context.Context, attemptID c
 		return nil
 	}
 	if terminal {
-		if err := recovery.Store.SetOneSegAvailability(ctx, attemptID, availability, reason, recovery.now()); err != nil {
+		if _, err := recovery.Store.SetOneSegAvailability(ctx, attemptID, availability, reason, recovery.now()); err != nil {
 			return errors.New("recording: update completed one-seg availability")
 		}
 		return nil

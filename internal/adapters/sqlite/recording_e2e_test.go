@@ -735,7 +735,8 @@ func TestStopWhileOneSegSyncsFinalizesOnlyThatRecording(t *testing.T) {
 
 func waitRecordingHistory(t *testing.T, store *Store, number int32, schedulerDone <-chan error) core.HistoryItem {
 	t.Helper()
-	timeout := time.NewTimer(time.Second)
+	// 実ファイルとSQLiteの同期を待つ。1秒以内の完了は製品契約ではない。
+	timeout := time.NewTimer(10 * time.Second)
 	defer timeout.Stop()
 	ticker := time.NewTicker(time.Millisecond)
 	defer ticker.Stop()

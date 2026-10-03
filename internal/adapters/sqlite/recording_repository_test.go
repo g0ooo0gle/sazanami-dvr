@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	apprecording "github.com/g0ooo0gle/sazanami-dvr/internal/app/recording"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/catalogmodel"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/recording"
 )
@@ -914,6 +915,20 @@ func TestRecordingAttemptLifecycle(t *testing.T) {
 	if _, err := store.ClaimRecording(context.Background(), claim); !errors.Is(err, ErrAttemptExists) {
 		t.Fatalf("duplicate claim err=%v", err)
 	}
+	if changed, err := store.SetRecordingAvailability(context.Background(), claim.AttemptID,
+		recording.AvailabilityMissing, recording.ReasonFileMissing, now); err != nil || changed {
+		t.Fatalf("active update changed=%t err=%v", changed, err)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if changed, err := store.SetRecordingAvailability(canceled, claim.AttemptID,
+		recording.AvailabilityMissing, recording.ReasonFileMissing, now); err == nil || changed {
+		t.Fatalf("canceled update changed=%t err=%v", changed, err)
+	}
+	if changed, err := store.SetRecordingAvailability(context.Background(), claim.AttemptID,
+		recording.AvailabilityFinal, recording.ReasonFileMissing, now); err == nil || changed {
+		t.Fatalf("invalid update changed=%t err=%v", changed, err)
+	}
 	if err := store.StartAttempt(context.Background(), claim.AttemptID, now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
@@ -1008,13 +1023,35 @@ func TestRecordingAttemptLifecycle(t *testing.T) {
 		t.Fatalf("recovery=%+v err=%v", recoveryItems, err)
 	}
 	availabilityAt := now.Add(10 * time.Second)
-	if err := store.SetRecordingAvailability(context.Background(), claim.AttemptID, recording.AvailabilityMissing,
-		recording.ReasonFileMissing, availabilityAt); err != nil {
-		t.Fatal(err)
+	// 読出し後に別処理が同じ値を保存した場合、再照合自身の更新は0件になる。
+	reconciler := apprecording.CompletedReconciler{
+		Store: store, Clock: availabilityTestClock{availabilityAt},
+		Inspect: func(recording.FilePlan) (recording.FileObservation, error) {
+			if changed, err := store.SetRecordingAvailability(context.Background(), claim.AttemptID,
+				recording.AvailabilityMissing, recording.ReasonFileMissing, availabilityAt); err != nil {
+				return recording.FileObservation{}, err
+			} else if !changed {
+				t.Fatal("競合側のavailability更新が保存されませんでした")
+			}
+			return recording.FileObservation{}, nil
+		},
 	}
-	if err := store.SetRecordingAvailability(context.Background(), claim.AttemptID, recording.AvailabilityMissing,
-		recording.ReasonFileMissing, availabilityAt); err != nil {
-		t.Fatal(err)
+	if result, reason, err := reconciler.Run(context.Background()); err != nil || reason != "" ||
+		result.Checked != 1 || result.Changed != 0 || result.Missing != 1 {
+		t.Fatalf("concurrent no-op result=%+v reason=%q err=%v", result, reason, err)
+	}
+	if changed, err := store.SetRecordingAvailability(context.Background(), claim.AttemptID, recording.AvailabilityMissing,
+		recording.ReasonFileMissing, availabilityAt.Add(time.Second)); err != nil || changed {
+		t.Fatalf("idempotent update changed=%t err=%v", changed, err)
+	}
+	if changed, err := store.SetRecordingAvailability(context.Background(), claim.AttemptID, recording.AvailabilityMissing,
+		recording.ReasonFileMissing, availabilityAt.Add(2*time.Second)); err != nil || changed {
+		t.Fatalf("idempotent update changed=%t err=%v", changed, err)
+	}
+	var updatedAt int64
+	if err := store.reader.QueryRow(`SELECT updated_at_utc_ms FROM recording_segments WHERE attempt_id=?`,
+		claim.AttemptID.Bytes()).Scan(&updatedAt); err != nil || updatedAt != availabilityAt.UnixMilli() {
+		t.Fatalf("idempotent timestamp=%d err=%v", updatedAt, err)
 	}
 	var integrity string
 	if err := store.reader.QueryRow(`SELECT availability, integrity_reason FROM recording_segments WHERE attempt_id=?`,
@@ -1351,13 +1388,47 @@ func TestSettledOneSegAvailabilityCanReturnFromMissingToPartial(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.SetOneSegAvailability(context.Background(), attemptID, recording.AvailabilityMissing,
-		recording.ReasonFileMissing, now.Add(10*time.Second)); err != nil {
-		t.Fatal(err)
+	reconciler := apprecording.CompletedReconciler{
+		Store: store, Clock: availabilityTestClock{now.Add(10 * time.Second)},
+		Inspect: func(plan recording.FilePlan) (recording.FileObservation, error) {
+			if plan != oneSegPlan {
+				return recording.FileObservation{Final: recording.FileFact{Exists: true, Regular: true, Size: 376}}, nil
+			}
+			if changed, err := store.SetOneSegAvailability(context.Background(), attemptID, recording.AvailabilityMissing,
+				recording.ReasonFileMissing, now.Add(10*time.Second)); err != nil {
+				return recording.FileObservation{}, err
+			} else if !changed {
+				t.Fatal("競合側のワンセグavailability更新が保存されませんでした")
+			}
+			return recording.FileObservation{}, nil
+		},
 	}
-	if err := store.SetOneSegAvailability(context.Background(), attemptID, recording.AvailabilityPartial,
-		recording.ReasonFileMissing, now.Add(11*time.Second)); err != nil {
-		t.Fatal(err)
+	if result, reason, err := reconciler.Run(context.Background()); err != nil || reason != "" ||
+		result.Checked != 2 || result.Changed != 0 || result.Missing != 1 {
+		t.Fatalf("concurrent one-seg no-op result=%+v reason=%q err=%v", result, reason, err)
+	}
+	if changed, err := store.SetOneSegAvailability(context.Background(), attemptID, recording.AvailabilityMissing,
+		recording.ReasonFileMissing, now.Add(11*time.Second)); err != nil || changed {
+		t.Fatalf("idempotent one-seg update changed=%t err=%v", changed, err)
+	}
+	var updatedAt int64
+	if err := store.reader.QueryRow(`SELECT updated_at_utc_ms FROM recording_segments WHERE attempt_id=? AND ordinal=1`,
+		attemptID.Bytes()).Scan(&updatedAt); err != nil || updatedAt != now.Add(10*time.Second).UnixMilli() {
+		t.Fatalf("idempotent one-seg timestamp=%d err=%v", updatedAt, err)
+	}
+	if changed, err := store.SetOneSegAvailability(context.Background(), attemptID, recording.AvailabilityFinal,
+		"", now.Add(11*time.Second)); err != nil || changed {
+		t.Fatalf("unpublished one-seg promotion changed=%t err=%v", changed, err)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if changed, err := store.SetOneSegAvailability(canceled, attemptID, recording.AvailabilityPartial,
+		recording.ReasonFileMissing, now.Add(11*time.Second)); err == nil || changed {
+		t.Fatalf("canceled one-seg update changed=%t err=%v", changed, err)
+	}
+	if changed, err := store.SetOneSegAvailability(context.Background(), attemptID, recording.AvailabilityPartial,
+		recording.ReasonFileMissing, now.Add(12*time.Second)); err != nil || !changed {
+		t.Fatalf("restored one-seg update changed=%t err=%v", changed, err)
 	}
 	items, err := store.RecoveryAttempts(context.Background(), recording.MaxRecoveryPage, catalogmodel.ID{})
 	if err != nil || len(items) != 1 || items[0].OneSeg == nil ||
@@ -1367,6 +1438,10 @@ func TestSettledOneSegAvailabilityCanReturnFromMissingToPartial(t *testing.T) {
 		t.Fatalf("items=%+v err=%v", items, err)
 	}
 }
+
+type availabilityTestClock struct{ now time.Time }
+
+func (clock availabilityTestClock) Now() time.Time { return clock.now }
 
 func TestRecoveryRejectsMissingMainAndUnsupportedOrdinal(t *testing.T) {
 	for _, test := range []struct {

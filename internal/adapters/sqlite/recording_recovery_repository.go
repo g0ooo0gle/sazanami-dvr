@@ -128,29 +128,30 @@ func (store *Store) RecoveryAttempts(ctx context.Context, limit int, after catal
 }
 
 // SetRecordingAvailabilityは録画結果を変えず、公開済みファイルの現在の利用状態だけを更新する。
-func (store *Store) SetRecordingAvailability(ctx context.Context, attemptID catalogmodel.ID, availability recording.Availability, reason recording.TerminalReason, now time.Time) error {
+// 戻り値はDBを1行更新した場合だけtrueとなる。同値の再設定はfalse, nilを返す。
+func (store *Store) SetRecordingAvailability(ctx context.Context, attemptID catalogmodel.ID, availability recording.Availability, reason recording.TerminalReason, now time.Time) (bool, error) {
 	if store == nil || store.writer == nil || ctx == nil || attemptID == (catalogmodel.ID{}) ||
 		now.IsZero() || now.Location() != time.UTC || now.UnixMilli() < 0 {
-		return errors.New("sqlite: invalid recording availability update")
+		return false, errors.New("sqlite: invalid recording availability update")
 	}
 	var integrity any
 	switch availability {
 	case recording.AvailabilityFinal:
 		if reason != "" {
-			return errors.New("sqlite: final recording must not have integrity reason")
+			return false, errors.New("sqlite: final recording must not have integrity reason")
 		}
 	case recording.AvailabilityMissing:
 		if reason != recording.ReasonFileMissing {
-			return errors.New("sqlite: missing recording requires stable reason")
+			return false, errors.New("sqlite: missing recording requires stable reason")
 		}
 		integrity = reason
 	case recording.AvailabilityMismatched:
 		if reason != recording.ReasonFileIntegrityMismatch {
-			return errors.New("sqlite: mismatched recording requires stable reason")
+			return false, errors.New("sqlite: mismatched recording requires stable reason")
 		}
 		integrity = reason
 	default:
-		return errors.New("sqlite: invalid successful recording availability")
+		return false, errors.New("sqlite: invalid successful recording availability")
 	}
 	integrityText := ""
 	if integrity != nil {
@@ -163,45 +164,46 @@ func (store *Store) SetRecordingAvailability(ctx context.Context, attemptID cata
 		AND (availability<>? OR COALESCE(integrity_reason,'')<>?)`, availability, integrity, now.UnixMilli(),
 		attemptID.Bytes(), attemptID.Bytes(), availability, integrityText)
 	if err != nil {
-		return sanitize("update-recording-availability", err)
+		return false, sanitize("update-recording-availability", err)
 	}
-	if count := affected(result); count < 0 || count > 1 {
-		return errors.New("sqlite: recording availability update count mismatch")
+	count := affected(result)
+	if count < 0 || count > 1 {
+		return false, errors.New("sqlite: recording availability update count mismatch")
 	}
-	return nil
+	return count == 1, nil
 }
 
 // SetOneSegAvailabilityは終了済み録画のordinal 1だけを再照合結果へ更新する。
 func (store *Store) SetOneSegAvailability(ctx context.Context, attemptID catalogmodel.ID,
 	availability recording.Availability, reason recording.TerminalReason, now time.Time,
-) error {
+) (bool, error) {
 	if store == nil || store.writer == nil || ctx == nil || attemptID == (catalogmodel.ID{}) ||
 		now.IsZero() || now.Location() != time.UTC || now.UnixMilli() < 0 {
-		return errors.New("sqlite: invalid one-seg availability update")
+		return false, errors.New("sqlite: invalid one-seg availability update")
 	}
 	var integrity any
 	switch availability {
 	case recording.AvailabilityFinal:
 		if reason != "" {
-			return errors.New("sqlite: final one-seg must not have integrity reason")
+			return false, errors.New("sqlite: final one-seg must not have integrity reason")
 		}
 	case recording.AvailabilityPartial:
 		if !reason.Valid() {
-			return errors.New("sqlite: partial one-seg requires stable reason")
+			return false, errors.New("sqlite: partial one-seg requires stable reason")
 		}
 		integrity = reason
 	case recording.AvailabilityMissing:
 		if reason != recording.ReasonFileMissing {
-			return errors.New("sqlite: missing one-seg requires stable reason")
+			return false, errors.New("sqlite: missing one-seg requires stable reason")
 		}
 		integrity = reason
 	case recording.AvailabilityMismatched:
 		if reason != recording.ReasonFileIntegrityMismatch {
-			return errors.New("sqlite: mismatched one-seg requires stable reason")
+			return false, errors.New("sqlite: mismatched one-seg requires stable reason")
 		}
 		integrity = reason
 	default:
-		return errors.New("sqlite: invalid completed one-seg availability")
+		return false, errors.New("sqlite: invalid completed one-seg availability")
 	}
 	integrityText := ""
 	if integrity != nil {
@@ -216,12 +218,13 @@ func (store *Store) SetOneSegAvailability(ctx context.Context, attemptID catalog
 		AND (availability<>? OR COALESCE(integrity_reason,'')<>?)`, availability, integrity, now.UnixMilli(),
 		attemptID.Bytes(), attemptID.Bytes(), availability, availability, availability, integrityText)
 	if err != nil {
-		return sanitize("update-one-seg-availability", err)
+		return false, sanitize("update-one-seg-availability", err)
 	}
-	if count := affected(result); count < 0 || count > 1 {
-		return errors.New("sqlite: one-seg availability update count mismatch")
+	count := affected(result)
+	if count < 0 || count > 1 {
+		return false, errors.New("sqlite: one-seg availability update count mismatch")
 	}
-	return nil
+	return count == 1, nil
 }
 
 func validateRecoveryValues(item recording.RecoveryItem, startMS, endMS, byteCount, mainByteCount, recovered,

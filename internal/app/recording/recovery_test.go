@@ -76,20 +76,20 @@ func (memory *recoveryMemory) FinishAttempt(_ context.Context, request core.Fini
 
 func (memory *recoveryMemory) SetRecordingAvailability(_ context.Context, _ catalogmodel.ID,
 	availability core.Availability, reason core.TerminalReason, _ time.Time,
-) error {
+) (bool, error) {
 	memory.availability = append(memory.availability, availability)
 	memory.item.Availability = availability
 	memory.item.IntegrityReason = reason
-	return nil
+	return true, nil
 }
 
 func (memory *recoveryMemory) SetOneSegAvailability(_ context.Context, _ catalogmodel.ID,
 	availability core.Availability, reason core.TerminalReason, _ time.Time,
-) error {
+) (bool, error) {
 	memory.oneSegAvailability = append(memory.oneSegAvailability, availability)
 	memory.item.OneSeg.Availability = availability
 	memory.item.OneSeg.IntegrityReason = reason
-	return nil
+	return true, nil
 }
 
 func TestRecoverySettlesInterruptedAttemptsWithoutOpeningStream(t *testing.T) {
