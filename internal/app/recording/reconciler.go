@@ -17,14 +17,14 @@ const (
 // CompletedReconcileStoreは完了録画の現在の利用状態だけを読み書きする。
 type CompletedReconcileStore interface {
 	RecoveryAttempts(context.Context, int, catalogmodel.ID) ([]core.RecoveryItem, error)
-	SetRecordingAvailability(context.Context, catalogmodel.ID, core.Availability, core.TerminalReason, time.Time) error
-	SetOneSegAvailability(context.Context, catalogmodel.ID, core.Availability, core.TerminalReason, time.Time) error
+	SetRecordingAvailability(context.Context, catalogmodel.ID, core.Availability, core.TerminalReason, time.Time) (bool, error)
+	SetOneSegAvailability(context.Context, catalogmodel.ID, core.Availability, core.TerminalReason, time.Time) (bool, error)
 }
 
 // CompletedReconcileResultは一回の完了録画照合で観測したboundedな件数である。
 type CompletedReconcileResult struct {
 	Checked    int
-	Changed    int
+	Changed    int // DBを実際に更新したsegment数。競合によるno-opは含まない。
 	Missing    int
 	Mismatched int
 }
@@ -90,10 +90,13 @@ func (reconciler *CompletedReconciler) reconcileItem(ctx context.Context, item c
 	availability, reason := completedAvailability(item.ByteCount, observation)
 	result.observe(availability)
 	if item.Availability != availability || item.IntegrityReason != reason {
-		if err := reconciler.Store.SetRecordingAvailability(ctx, item.ID, availability, reason, reconciler.now()); err != nil {
+		changed, err := reconciler.Store.SetRecordingAvailability(ctx, item.ID, availability, reason, reconciler.now())
+		if err != nil {
 			return "recording-reconcile-update-failed", errors.New("recording: update completed file availability")
 		}
-		result.Changed++
+		if changed {
+			result.Changed++
+		}
 	}
 	if item.OneSeg == nil {
 		return "", nil
@@ -107,10 +110,13 @@ func (reconciler *CompletedReconciler) reconcileItem(ctx context.Context, item c
 	if item.OneSeg.Availability == oneSegAvailability && item.OneSeg.IntegrityReason == oneSegReason {
 		return "", nil
 	}
-	if err := reconciler.Store.SetOneSegAvailability(ctx, item.ID, oneSegAvailability, oneSegReason, reconciler.now()); err != nil {
+	changed, err := reconciler.Store.SetOneSegAvailability(ctx, item.ID, oneSegAvailability, oneSegReason, reconciler.now())
+	if err != nil {
 		return "recording-reconcile-update-failed", errors.New("recording: update completed one-seg availability")
 	}
-	result.Changed++
+	if changed {
+		result.Changed++
+	}
 	return "", nil
 }
 

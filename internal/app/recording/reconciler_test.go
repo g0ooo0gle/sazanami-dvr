@@ -56,24 +56,24 @@ func (memory *reconcileMemory) RecoveryAttempts(ctx context.Context, limit int,
 
 func (memory *reconcileMemory) SetRecordingAvailability(_ context.Context, id catalogmodel.ID,
 	availability core.Availability, reason core.TerminalReason, _ time.Time,
-) error {
+) (bool, error) {
 	if memory.updateErr != nil {
-		return memory.updateErr
+		return false, memory.updateErr
 	}
 	memory.updates = append(memory.updates, reconcileUpdate{id: id, availability: availability, reason: reason})
-	return nil
+	return true, nil
 }
 
 func (memory *reconcileMemory) SetOneSegAvailability(_ context.Context, id catalogmodel.ID,
 	availability core.Availability, reason core.TerminalReason, _ time.Time,
-) error {
+) (bool, error) {
 	if memory.updateErr != nil {
-		return memory.updateErr
+		return false, memory.updateErr
 	}
 	memory.updates = append(memory.updates, reconcileUpdate{
 		id: id, availability: availability, reason: reason, oneSeg: true,
 	})
-	return nil
+	return true, nil
 }
 
 func TestCompletedReconcilerBoundsCursorAndWrap(t *testing.T) {
