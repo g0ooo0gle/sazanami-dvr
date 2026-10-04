@@ -127,7 +127,7 @@ if !mainQuality.SelectionUnverified || oneSegQuality.SelectionUnverified { t.Fat
 - objectのstatusは三値、selection_unverified／observation_limited／counters_saturatedと仕様の15 counterは固定field。旧UNKNOWN／0も省略せず、未測定を正常と説明しない。内部token、planned field、pathは公開しない。
 - HTTP、REST、resolver、CtrlCmd 2017／2024はHistoryItem.Playableと同じ判定。CtrlCmd fixedItemSize=73とwire writer、drop／scramble値を変更しない。main品質だけをNative履歴へ投影し、補助品質は独立保存のままにする。
 
-- [ ] **Step 1: TestQualityAllReadSurfacesAgree、TestQualityFinalizeCrashReadback、TestQualityConcurrentActorsを書く。** 安全に確定した正常・劣化・通信partial・停止と、証跡欠落・旧partialを同じfixtureでHTTP GET／HEAD／full・先頭／中間／末尾Range、REST、resolver、2017／2024へ通す。予約の2013→2011→2015→1014も維持する。
+- [x] **Step 1: TestQualityAllReadSurfacesAgree、TestQualityFinalizeCrashReadback、TestQualityConcurrentActorsを書く。** 安全に確定した正常・劣化・通信partial・停止と、証跡欠落・旧partialを同じfixtureでHTTP GET／HEAD／full・先頭／中間／末尾Range、REST、resolver、2017／2024へ通す。予約の2013→2011→2015→1014も維持する。
 
 ```go
 if rest.Playable != item.Playable() || ctrlcmdCount != wantCount { t.Fatalf("surface mismatch") }
@@ -135,10 +135,10 @@ if !bytes.Equal(actualRange, expectedRange) { t.Fatalf("range mismatch") }
 if restored.Quality != persisted.Quality { t.Fatalf("quality lost") }
 ```
 
-- [ ] **Step 2: REDを確認する。** Run `go test -count=1 ./internal/adapters/recordinghttp ./internal/adapters/ctrlcmd/recorded ./internal/adapters/sqlite ./internal/app/recording -run 'TestQuality'`。summary不足・判定差を記録する。
-- [ ] **Step 3: projectionと回帰をそろえる。** rename／directory sync／終端の前後で再起動し、新規FINALIZINGだけをplanned resultへ冪等収束させる。周期reconcileはavailabilityだけを更新し、no-opのChanged=0を維持する。偽providerに視聴・EPG・tuner不足・priority拒否を注入し、他actorの解放で予約録画が取消されないことを検査する。
-- [ ] **Step 4: 全体GREENを確認する。** Run `go test -count=1 ./...`、`go test -count=1 -shuffle=on ./...`、`go test -count=1 -race -p 1 ./...`、`go vet ./...`、`go mod verify`、`go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...`。CGO無効でlinux／darwin各amd64／arm64をbuildする。command・exit・最終SHAを保存し、実機成功へ読み替えない。
-- [ ] **Step 5: Commit。** projectionと統合回帰をcommitする。この時点ではfeature PRを統合しない。schema15を含むcandidateにはTask 5の旧版更新helperが必要なため、全体独立review・PR・main CIはその変更もそろってから行う。
+- [x] **Step 2: REDを確認する。** Run `go test -count=1 ./internal/adapters/recordinghttp ./internal/adapters/ctrlcmd/recorded ./internal/adapters/sqlite ./internal/app/recording -run 'TestQuality'`。summary不足・判定差を記録する。
+- [x] **Step 3: projectionと回帰をそろえる。** rename／directory sync／終端の前後で再起動し、新規FINALIZINGだけをplanned resultへ冪等収束させる。周期reconcileはavailabilityだけを更新し、no-opのChanged=0を維持する。偽providerに視聴・EPG・tuner不足・priority拒否を注入し、他actorの解放で予約録画が取消されないことを検査する。
+- [x] **Step 4: 全体GREENを確認する。** Run `go test -count=1 ./...`、`go test -count=1 -shuffle=on ./...`、`go test -count=1 -race -p 1 ./...`、`go vet ./...`、`go mod verify`、`go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...`。CGO無効でlinux／darwin各amd64／arm64をbuildする。command・exit・最終SHAを保存し、実機成功へ読み替えない。
+- [x] **Step 5: Commit。** projectionと統合回帰をcommitする。この時点ではfeature PRを統合しない。schema15を含むcandidateにはTask 5の旧版更新helperが必要なため、全体独立review・PR・main CIはその変更もそろってから行う。
 
 ## Task 5: 旧版更新試験・公開文書・v1.4.0配布
 
@@ -173,7 +173,7 @@ if restored.Quality != persisted.Quality { t.Fatalf("quality lost") }
 - Implementation plan review: 2026-10-04にProject ownerが直接承認
 - Plan self-review: 2026-10-04に仕様全項目、型・呼出し署名、五つのReview Focus、文量を照合した。旧版更新helperより先にPRを統合する依存順を修正し、main／oneSegの独立性fixtureを具体化した。
 - Baseline full test: `4eebb9d`で`go test -count=1 ./...`成功
-- Product changes so far: Task 1は`259b910`、Task 2は`a312f12`。Task 3では終了優先順位、許可通信partialの安全確定、独立したワンセグ処理、上限付き品質ログを実装した。
-- New behavior RED / GREEN: 型・品質保存・公開条件の不足、取消しの誤公開、再接続時の停止・終了・件数、補助期限の誤分類を再現後に修正。Task 3の最終treeで全体`go test -count=1 -timeout 300s ./...`成功。Task 4以降は未完了。
+- Product changes so far: Task 1は`259b910`、Task 2は`a312f12`、Task 3は`5bcce02`。Task 4でNative履歴の品質object、CtrlCmdの既存wire維持、21ケースの確定中断・再起動、視聴・EPGと録画の独立性を確認した。
+- New behavior RED / GREEN: 型・品質保存・公開条件の不足、取消しの誤公開、再接続時の停止・終了・件数、補助期限の誤分類、Native履歴の品質不足を再現後に修正。Task 4の最終Go sourceでfull、shuffle、race（`-p 1`）各36 package、vet、module verify、govulncheck、CGO無効のlinux／darwin各amd64／arm64 buildが成功。Task 5は未完了。
 - Feature / release-prep PR、main／Release SHA: UNCREATED
 - Production update instruction: NOT SENT（新公開物のreadback後）

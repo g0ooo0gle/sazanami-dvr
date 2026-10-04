@@ -493,6 +493,7 @@ type listResponse struct {
 	NextBefore *int32              `json:"next_before"`
 }
 type recordingResponse struct {
+	Quality           qualityResponse          `json:"quality"`
 	ID                int32                    `json:"id"`
 	State             recording.AttemptState   `json:"state"`
 	Reason            recording.TerminalReason `json:"reason"`
@@ -511,11 +512,44 @@ type recordingResponse struct {
 	PlaybackURL       *string                  `json:"playback_url"`
 }
 
+type qualityResponse struct {
+	Status                  string `json:"status"`
+	SelectionUnverified     bool   `json:"selection_unverified"`
+	ObservationLimited      bool   `json:"observation_limited"`
+	CountersSaturated       bool   `json:"counters_saturated"`
+	CCGapEvents             int64  `json:"cc_gap_events"`
+	CCDuplicateEvents       int64  `json:"cc_duplicate_events"`
+	TEIPackets              int64  `json:"tei_packets"`
+	MalformedPacketEvents   int64  `json:"malformed_packet_events"`
+	PSIContinuityEvents     int64  `json:"psi_continuity_events"`
+	PSICRCEvents            int64  `json:"psi_crc_events"`
+	PSIStructureEvents      int64  `json:"psi_structure_events"`
+	PSILimitEvents          int64  `json:"psi_limit_events"`
+	SyncLossEvents          int64  `json:"sync_loss_events"`
+	SyncRecoveredEvents     int64  `json:"sync_recovered_events"`
+	SyncDiscardedBytes      int64  `json:"sync_discarded_bytes"`
+	TrailingIncompleteBytes int64  `json:"trailing_incomplete_bytes"`
+	UnfinishedPSIEvents     int64  `json:"unfinished_psi_events"`
+	FallbackEvents          int64  `json:"fallback_events"`
+	ReconnectCount          int64  `json:"reconnect_count"`
+}
+
+func projectQuality(q recording.QualitySummary) qualityResponse {
+	return qualityResponse{Status: q.Status.String(), SelectionUnverified: q.SelectionUnverified,
+		ObservationLimited: q.ObservationLimited, CountersSaturated: q.CountersSaturated,
+		CCGapEvents: q.CCGapEvents, CCDuplicateEvents: q.CCDuplicateEvents, TEIPackets: q.TEIPackets,
+		MalformedPacketEvents: q.MalformedPacketEvents, PSIContinuityEvents: q.PSIContinuityEvents,
+		PSICRCEvents: q.PSICRCEvents, PSIStructureEvents: q.PSIStructureEvents, PSILimitEvents: q.PSILimitEvents,
+		SyncLossEvents: q.SyncLossEvents, SyncRecoveredEvents: q.SyncRecoveredEvents, SyncDiscardedBytes: q.SyncDiscardedBytes,
+		TrailingIncompleteBytes: q.TrailingIncompleteBytes, UnfinishedPSIEvents: q.UnfinishedPSIEvents,
+		FallbackEvents: q.FallbackEvents, ReconnectCount: q.ReconnectCount}
+}
+
 func project(item recording.HistoryItem) (recordingResponse, bool) {
 	if item.Validate() != nil {
 		return recordingResponse{}, false
 	}
-	value := recordingResponse{ID: item.Number, State: item.State, Reason: item.Reason, Title: item.Title, StationName: item.StationName,
+	value := recordingResponse{Quality: projectQuality(item.Quality), ID: item.Number, State: item.State, Reason: item.Reason, Title: item.Title, StationName: item.StationName,
 		NetworkID: item.NetworkID, TransportStreamID: item.TransportStreamID, ServiceID: item.ServiceID, EventID: item.EventID,
 		PlannedStart: item.PlannedStart.Format(time.RFC3339), PlannedEnd: item.PlannedEnd.Format(time.RFC3339), ByteCount: item.ByteCount, Playable: item.Playable()}
 	if item.ActualStart != nil {

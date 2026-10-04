@@ -31,7 +31,7 @@ func qualityRunningAttempt(t *testing.T, store *Store) (core.ClaimRequest, core.
 	claim := core.ClaimRequest{ReservationID: r.ID, ReservationVersion: r.Version,
 		AttemptID: testID(t, 200), SegmentID: testID(t, 201), OneSegSegmentID: testID(t, 202),
 		OwnerID: testID(t, 203), OwnerGeneration: 1, Now: now,
-		Plan: core.FilePlan{PartialPath: "main.ts.partial", FinalPath: "main.ts"}, OneSegPlan: &plan}
+		Plan: core.FilePlan{PartialPath: "2026/08/main.ts.partial", FinalPath: "2026/08/main.ts"}, OneSegPlan: &plan}
 	if _, err := store.ClaimRecording(ctx, claim); err != nil {
 		t.Fatal(err)
 	}

@@ -6,6 +6,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/provider/mirakurun"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/recordingfs"
 	apprecording "github.com/g0ooo0gle/sazanami-dvr/internal/app/recording"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/catalogmodel"
@@ -502,6 +506,165 @@ func TestReservationToFinalFileSurvivesRestart(t *testing.T) {
 	if next, err := store.NextActiveReservation(context.Background(), time.Now().UTC()); err != nil || next != nil {
 		t.Fatalf("next=%+v err=%v", next, err)
 	}
+}
+
+func TestQualityConcurrentActors(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, store := openMigratedStore(t)
+	reservation, err := store.CreateReservation(ctx, reservationForTest(t, store))
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := &finalizationRaceClock{now: reservation.Program.Start}
+	firstWritten, releaseRecording, probeStarted := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var writtenOnce, releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseRecording) }) }
+	t.Cleanup(release)
+	packet := e2ePayloadPacket()
+	packet[1] |= 0x80 // TEIは警告に留まり、元のbyte列が保存される。
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/services/1006/stream":
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		case "/api/services/1007/stream":
+			w.WriteHeader(http.StatusForbidden)
+			return
+		case "/api/services/1003/stream", "/api/services/1004/stream", "/api/services/1005/stream":
+		default:
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "video/MP2T")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		if r.URL.Path != "/api/services/1003/stream" {
+			if r.URL.Path == "/api/services/1005/stream" {
+				close(probeStarted)
+			}
+			<-r.Context().Done()
+			return
+		}
+		_, _ = w.Write(packet)
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+			return
+		case <-releaseRecording:
+		}
+		clock.set(reservation.PlannedEnd())
+		_, _ = w.Write(e2ePayloadPacket())
+	}))
+	defer func() { cancel(); release(); server.Close() }()
+	adapter, err := mirakurun.NewStreamWithLimit(server.URL, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer adapter.CloseIdleConnections()
+	root, err := recordingfs.OpenRoot(filepath.Join(t.TempDir(), "recordings"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	ids, nextID := []catalogmodel.ID{testID(t, 240), testID(t, 241), testID(t, 242)}, 0
+	executor := apprecording.Executor{Store: store, Stream: adapter, Clock: clock, OwnerID: testID(t, 243), Generation: 1,
+		NewID: func() (catalogmodel.ID, error) { id := ids[nextID]; nextID++; return id, nil },
+		WithDeadline: func(ctx context.Context, _ time.Time) (context.Context, context.CancelFunc) {
+			return context.WithCancel(ctx)
+		},
+		Files: apprecording.FileOperations{
+			CreatePartial: func(plan core.FilePlan) (apprecording.PartialFile, error) {
+				file, err := root.CreatePartial(plan)
+				return &qualitySignalPartial{PartialFile: file, written: func() { writtenOnce.Do(func() { close(firstWritten) }) }}, err
+			},
+			LinkFinal: root.LinkFinal, SyncDirectory: root.SyncDirectory, RemovePartial: root.RemovePartial}}
+	done := make(chan error, 1)
+	go func() { _, err := executor.Execute(ctx, reservation); done <- err }()
+	select {
+	case <-firstWritten:
+	case <-time.After(10 * time.Second):
+		t.Fatal("録画の最初のpacketが保存されませんでした")
+	}
+	liveRequest := providerstream.Request{Target: provider.TuningTarget{Opaque: "1004"}, Usage: providerstream.UsageLive,
+		PriorityPolicy: "0", RequireDescrambled: true, CorrelationID: "quality-live"}
+	live, err := adapter.OpenStream(ctx, liveRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer live.Close()
+	probeCtx, cancelProbe := context.WithCancel(ctx)
+	defer cancelProbe()
+	probeDone := make(chan error, 1)
+	go func() { _, err := adapter.ProbeTransportStreamID(probeCtx, "1005", 5); probeDone <- err }()
+	select {
+	case <-probeStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("番組表用probeが開始されませんでした")
+	}
+	for _, rejected := range []struct {
+		target string
+		reason provider.Reason
+	}{{"1006", provider.ReasonUnavailable}, {"1007", provider.ReasonRejected}} {
+		request := liveRequest
+		request.Target.Opaque = rejected.target
+		if lease, err := adapter.OpenStream(ctx, request); lease != nil || !provider.IsReason(err, rejected.reason) {
+			t.Fatalf("拒否分類: lease=%v err=%v", lease, err)
+		}
+	}
+	if err := live.Cancel(); err != nil {
+		t.Fatal(err)
+	}
+	if err := live.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cancelProbe()
+	select {
+	case <-probeDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("番組表用probeが停止しませんでした")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("他actorの終了で録画が終わりました: %v", err)
+	default:
+	}
+	release()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("録画が確定しませんでした")
+	}
+	history, err := store.RecordingHistoryItem(ctx, reservation.Number)
+	if err != nil || history == nil || !history.Playable() || history.Reason != core.ReasonCompleted ||
+		history.Quality.Status != core.QualityDegraded || history.Quality.TEIPackets != 1 || history.Quality.ReconnectCount != 0 {
+		t.Fatalf("history=%+v err=%v", history, err)
+	}
+	file, err := root.OpenFinal(history.Plan, history.ByteCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	actual, err := io.ReadAll(file)
+	if err != nil || !bytes.Equal(actual, append(packet, e2ePayloadPacket()...)) {
+		t.Fatalf("保存byte列が変化しました: bytes=%d err=%v", len(actual), err)
+	}
+}
+
+type qualitySignalPartial struct {
+	apprecording.PartialFile
+	written func()
+}
+
+func (file *qualitySignalPartial) Write(data []byte) (int, error) {
+	n, err := file.PartialFile.Write(data)
+	if n > 0 {
+		file.written()
+	}
+	return n, err
 }
 
 func TestTwoRecordingsUseSeparateDatabaseRowsAndFiles(t *testing.T) {
