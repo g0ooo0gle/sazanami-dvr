@@ -50,11 +50,18 @@ func (store *oneSegAttemptStore) BeginFinalization(ctx context.Context,
 ) (core.FinalizeRequest, error) {
 	oneSeg := store.coordinator.join(request.Reason, true)
 	if ctx.Err() != nil {
-		request.State = core.AttemptPartial
-		request.Reason = core.ReasonUserRequestedStop
+		stop, err := store.AttemptStore.AttemptStopRequested(context.WithoutCancel(ctx), request.AttemptID)
+		if err != nil {
+			return core.FinalizeRequest{}, err
+		}
+		if !stop {
+			return core.FinalizeRequest{}, core.ErrFinalizationUnavailable
+		}
+		request.State, request.Reason = core.AttemptPartial, core.ReasonUserRequestedStop
 		if oneSeg.Publish {
 			oneSeg.Reason = core.ReasonUserRequestedStop
 		}
+		ctx = context.WithoutCancel(ctx)
 	}
 	request.OneSeg = &oneSeg
 	resolved, err := store.AttemptStore.BeginFinalization(ctx, request)
@@ -79,7 +86,8 @@ func (store *oneSegAttemptStore) MarkDirectorySynced(ctx context.Context, attemp
 // FinishAttemptは失敗したメインより先に補助処理を止め、ワンセグの部分状態も同時に確定する。
 func (store *oneSegAttemptStore) FinishAttempt(ctx context.Context, request core.FinishRequest) error {
 	successful := request.State == core.AttemptSucceeded ||
-		(request.State == core.AttemptPartial && request.Reason == core.ReasonUserRequestedStop)
+		(request.State == core.AttemptPartial && (request.Reason == core.ReasonUserRequestedStop ||
+			core.IsCommunicationPartialReason(request.Reason) && request.Availability == core.AvailabilityFinal))
 	if !successful {
 		oneSeg := store.coordinator.join(request.Reason, false)
 		request.OneSeg = &oneSeg
@@ -115,7 +123,7 @@ func (coordinator *oneSegCoordinator) start(ctx context.Context, plannedEnd time
 	coordinator.cancel = cancel
 	coordinator.started = true
 	go func() {
-		coordinator.done <- coordinator.executor.runOneSeg(streamContext, coordinator.reservation,
+		coordinator.done <- coordinator.executor.runOneSeg(ctx, streamContext, coordinator.reservation,
 			coordinator.attempt, plannedEnd, maximumEnd)
 	}()
 }
@@ -164,6 +172,11 @@ func (coordinator *oneSegCoordinator) join(mainReason core.TerminalReason, allow
 			result.Reason = core.ReasonUserRequestedStop
 		}
 		result.Availability = core.AvailabilityPartial
+	}
+	if allowPublish && usefulStoppedFile && result.ByteCount%188 == 0 && mainStoppedAuxiliary &&
+		core.IsCommunicationPartialReason(mainReason) {
+		result.Publish, result.Reason, result.Availability = true, mainReason, core.AvailabilityPartial
+		result.Quality.Status = core.QualityDegraded
 	}
 	if !allowPublish && result.Publish {
 		result.Publish = false
@@ -243,7 +256,7 @@ func (coordinator *oneSegCoordinator) close() {
 }
 
 // runOneSegは一つの補助streamを独立したleaseと再接続回数で部分fileへ保存する。
-func (executor Executor) runOneSeg(ctx context.Context, reservation core.Reservation, attempt core.Attempt,
+func (executor Executor) runOneSeg(parentCtx, ctx context.Context, reservation core.Reservation, attempt core.Attempt,
 	plannedEnd, maximumEnd time.Time,
 ) core.OneSegResult {
 	missing := core.OneSegResult{Availability: core.AvailabilityMissing, Reason: core.ReasonFileCreateFailed}
@@ -259,25 +272,74 @@ func (executor Executor) runOneSeg(ctx context.Context, reservation core.Reserva
 		return executor.closeOneSeg(file, attempt, streamCopyResult{Reason: core.ReasonStreamNotFound}, false, false)
 	}
 	result := streamCopyResult{LastProgress: executor.now(), PlannedEnd: plannedEnd, MaximumEnd: maximumEnd}
+	result.observation = &qualityObservationState{observe: executor.ObserveQuality, ordinal: 1, lastTime: executor.now()}
+	result.observation.emit("start", result.Quality, executor.now())
+	defer func() { result.observation.emit("final", result.Quality, executor.now()) }()
 	started, reconnected := false, false
 	for connection := 0; ; connection++ {
+		if parentCtx.Err() != nil {
+			if reason, err := executor.cancelReason(parentCtx, attempt.ID); err == nil {
+				result.Reason = reason
+			} else {
+				result.Reason = core.ReasonProcessInterrupted
+			}
+			return executor.closeOneSeg(file, attempt, result, started, false)
+		}
+		if errors.Is(ctx.Err(), context.Canceled) {
+			result.Reason = core.ReasonStreamCancelled
+			return executor.closeOneSeg(file, attempt, result, started, false)
+		}
+		stop, stopErr := executor.Store.AttemptStopRequested(context.WithoutCancel(parentCtx), attempt.ID)
+		if stopErr != nil {
+			result.Reason = core.ReasonProcessInterrupted
+			return executor.closeOneSeg(file, attempt, result, started, false)
+		}
+		if stop {
+			result.Reason = core.ReasonUserRequestedStop
+			return executor.closeOneSeg(file, attempt, result, started, false)
+		}
+		if !executor.now().Before(result.PlannedEnd) {
+			result.Reason = core.ReasonCompleted
+			if reconnected {
+				result.Reason = core.ReasonCompletedAfterReconnect
+			}
+			return executor.closeOneSeg(file, attempt, result, started, started)
+		}
+		if ctx.Err() != nil {
+			result.Reason = core.ReasonStreamTimeout
+			return executor.closeOneSeg(file, attempt, result, started, false)
+		}
+		if connection > 0 && result.PlannedEnd.Sub(executor.now()) < minimumReconnectRemaining {
+			return executor.closeOneSeg(file, attempt, result, started, false)
+		}
+		if connection > 0 {
+			reconnected = true
+			result.Quality.ReconnectCount, result.Quality.Status = int64(connection), core.QualityDegraded
+			result.observation.emit("reconnect", result.Quality, executor.now())
+		}
 		lease, openErr := executor.Stream.OpenStream(ctx, providerstream.Request{
 			Target: target, Usage: providerstream.UsageRecording, PriorityPolicy: "0", RequireDescrambled: true,
 			CorrelationID: oneSegStreamCorrelationID(attempt.ID, connection),
 		})
 		if openErr != nil {
+			result.Quality.Status = core.QualityDegraded
+			result.observation.emit("connection-end", result.Quality, executor.now())
 			result.Reason = streamFailureReason(openErr)
 			result.Retryable = retryableStreamFailure(openErr, providerstream.Terminal{})
 			if !executor.prepareReconnect(ctx, result.PlannedEnd, connection, result.Retryable) {
+				if parentCtx.Err() == nil && !errors.Is(ctx.Err(), context.Canceled) && result.Retryable && !executor.now().Before(result.PlannedEnd) {
+					result = executor.endCopy(parentCtx, attempt, result)
+					if result.ReachedEnd && reconnected {
+						result.Reason = core.ReasonCompletedAfterReconnect
+					}
+					return executor.closeOneSeg(file, attempt, result, started, result.ReachedEnd && started)
+				}
 				if result.Retryable && connection == len(reconnectDelays) {
 					result.Reason = core.ReasonStreamReconnectExhausted
 				}
 				return executor.closeOneSeg(file, attempt, result, started, false)
 			}
 			continue
-		}
-		if connection > 0 {
-			reconnected = true
 		}
 		if !started {
 			if err := executor.Store.OneSegRecordingStarted(context.WithoutCancel(ctx), attempt.ID,
@@ -289,9 +351,10 @@ func (executor Executor) runOneSeg(ctx context.Context, reservation core.Reserva
 			}
 			started = true
 		}
-		result = executor.copy(ctx, lease, file, attempt, reservation.Components, result, true)
+		result = executor.copy(parentCtx, ctx, lease, file, attempt, reservation.Components, result, true)
 		_ = lease.Cancel()
 		_ = lease.Close()
+		result.observation.emit("connection-end", result.Quality, executor.now())
 		if result.ReachedEnd {
 			reason := core.ReasonCompleted
 			if reconnected {
@@ -300,11 +363,23 @@ func (executor Executor) runOneSeg(ctx context.Context, reservation core.Reserva
 			result.Reason = reason
 			return executor.closeOneSeg(file, attempt, result, true, true)
 		}
+		if parentCtx.Err() != nil || result.Reason == core.ReasonUserRequestedStop {
+			return executor.closeOneSeg(file, attempt, result, true, false)
+		}
 		if ctx.Err() != nil {
-			result.Reason = core.ReasonStreamCancelled
+			if errors.Is(ctx.Err(), context.Canceled) {
+				result.Reason = core.ReasonStreamCancelled
+			}
 			return executor.closeOneSeg(file, attempt, result, true, false)
 		}
 		if !executor.prepareReconnect(ctx, result.PlannedEnd, connection, result.Retryable) {
+			if parentCtx.Err() == nil && !errors.Is(ctx.Err(), context.Canceled) && result.Retryable && !executor.now().Before(result.PlannedEnd) {
+				result = executor.endCopy(parentCtx, attempt, result)
+				if result.ReachedEnd && reconnected {
+					result.Reason = core.ReasonCompletedAfterReconnect
+				}
+				return executor.closeOneSeg(file, attempt, result, started, result.ReachedEnd)
+			}
 			if result.Retryable && connection == len(reconnectDelays) {
 				result.Reason = core.ReasonStreamReconnectExhausted
 			}
@@ -330,6 +405,11 @@ func (executor Executor) closeOneSeg(file PartialFile, attempt core.Attempt, cop
 	if !fileSynced {
 		copyResult.Reason = core.ReasonFileSyncFailed
 		reachedEnd = false
+	}
+	if started && fileSynced && core.IsCommunicationPartialReason(copyResult.Reason) &&
+		copyResult.ByteCount >= minimumUsefulTS && copyResult.ByteCount%188 == 0 {
+		reachedEnd = true
+		copyResult.Quality.Status = core.QualityDegraded
 	}
 	if reachedEnd && copyResult.ByteCount < minimumUsefulTS {
 		copyResult.Reason = core.ReasonStreamEndedEarly

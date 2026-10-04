@@ -620,7 +620,7 @@ func TestOneSegReconnectsIndependentlyAndUsesDistinctCorrelationIDs(t *testing.T
 		},
 		Wait: func(context.Context, time.Duration) error { return nil },
 	}
-	result := executor.runOneSeg(context.Background(), reservation, attempt, end, start.Add(core.MaxEffectiveDuration))
+	result := executor.runOneSeg(context.Background(), context.Background(), reservation, attempt, end, start.Add(core.MaxEffectiveDuration))
 	if !result.Publish || result.ByteCount != 188 || result.Reason != core.ReasonCompletedAfterReconnect ||
 		stream.opens != 2 || len(stream.requests) != 2 ||
 		stream.requests[0].CorrelationID != attempt.ID.String()+"-oneseg" ||
@@ -677,7 +677,7 @@ func TestOneSegFileFailuresStaySeparateFromMainResult(t *testing.T) {
 				},
 				Wait: func(context.Context, time.Duration) error { return nil },
 			}
-			result := executor.runOneSeg(context.Background(), reservation, attempt, end,
+			result := executor.runOneSeg(context.Background(), context.Background(), reservation, attempt, end,
 				start.Add(core.MaxEffectiveDuration))
 			if result.Publish || result.Reason != test.want ||
 				(test.missing && result.Availability != core.AvailabilityMissing) {
@@ -1564,6 +1564,7 @@ func TestPostRecordingRunsOnlyAfterSuccessfulFinalization(t *testing.T) {
 func TestPostRecordingUsesFinalizationOutcome(t *testing.T) {
 	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
 	store := &attemptMemory{start: start, end: start.Add(time.Hour)}
+	store.stop.Store(true)
 	store.finalizeFunc = func(request core.FinalizeRequest) (core.FinalizeRequest, error) {
 		request.State = core.AttemptPartial
 		request.Reason = core.ReasonUserRequestedStop
@@ -1629,7 +1630,7 @@ func TestCancelledFinalizationWithoutStopBecomesProcessShutdown(t *testing.T) {
 	}}, core.Attempt{ID: appID(t, 96)}, 188, core.AttemptSucceeded, core.ReasonCompleted, core.QualitySummary{})
 	if err != nil || result.State != core.AttemptCancelled || result.Reason != core.ReasonProcessShutdown ||
 		store.finish.State != core.AttemptCancelled || store.finish.Reason != core.ReasonProcessShutdown ||
-		store.finish.Availability != core.AvailabilityPartial || store.finalizeCall != 1 || links != 0 ||
+		store.finish.Availability != core.AvailabilityPartial || store.finalizeCall != 0 || links != 0 ||
 		postCalls != 0 || result.PostRecording.ChangesPower() {
 		t.Fatalf("result=%+v finish=%+v calls=%d links=%d post_calls=%d err=%v",
 			result, store.finish, store.finalizeCall, links, postCalls, err)

@@ -99,10 +99,10 @@ if got.Playable() != wantPlayable { t.Fatalf("publication boundary mismatch") }
 
 - `copy(parentCtx, streamCtx context.Context, lease providerstream.Lease, file PartialFile, attempt core.Attempt, componentMode core.ComponentMode, result streamCopyResult, oneSeg bool) streamCopyResult`。親取消しとexecutor所有期限を別に渡す。
 - mainのexecuteClaimedとoneSegのstart／runOneSegは元親contextを保持する。補助joinによる局所cancelは既存のSTREAM_CANCELLEDとして扱い、主のPROCESS_SHUTDOWNと混同しない。
-- `finishCommunicationPartial(ctx context.Context, reservation core.Reservation, attempt core.Attempt, copyResult streamCopyResult) (Result, error)`。許可reasonだけをSync／Close→確定予定→既存publishFinalへ通す。失敗時は非公開の既存終端へ戻る。
+- `finishCommunicationPartial(ctx context.Context, file PartialFile, attempt core.Attempt, copyResult streamCopyResult) (Result, error)`。許可reasonだけをSync／Close→確定予定→既存publishFinalへ通す。fileを明示して既存の同期・closeを使い、後処理へ渡さない。失敗時は非公開の既存終端へ戻る。
 - `QualityObservation`は`Ordinal int`、`Phase string`、`Quality core.QualitySummary`だけを持つ。Ordinalは0／1、Phaseはstart／continue／fallback／reconnect／connection-end／finalの固定値。`Executor.ObserveQuality func(QualityObservation)`と`observeRecordingQuality(io.Writer) func(recordingapp.QualityObservation)`を追加する。
 
-- [ ] **Step 1: TestQualityFinishPreservesTermination、TestQualityParentCancelAtEndDoesNotPublish、TestQualityExplicitStopCASOrder、TestQualityReconnectAndFallbackState、TestQualityOneSegIsolation、TestQualityLogBoundsを書く。** mutableClock、fakeLease、attemptMemoryのstopとoperation履歴で、最後のreadのn>0／tail／PSI途中とEOF・timeout・peer・0 progress・予定終了・親cancel・親deadlineを組み合わせる。明示DB停止あり／なしとFINALIZINGの前後、補助joinのcancelを別ケースにする。独立性のfixtureは主だけ初期選別上限へ達し、補助は正常なPAT／PMTで選別を完了するものを使う。
+- [x] **Step 1: TestQualityFinishPreservesTermination、TestQualityParentCancelAtEndDoesNotPublish、TestQualityExplicitStopCASOrder、TestQualityReconnectAndFallbackState、TestQualityOneSegIsolation、TestQualityLogBoundsを書く。** mutableClock、fakeLease、attemptMemoryのstopとoperation履歴で、最後のreadのn>0／tail／PSI途中とEOF・timeout・peer・0 progress・予定終了・親cancel・親deadlineを組み合わせる。明示DB停止あり／なしとFINALIZINGの前後、補助joinのcancelを別ケースにする。独立性のfixtureは主だけ初期選別上限へ達し、補助は正常なPAT／PMTで選別を完了するものを使う。
 
 ```go
 if result.Reason != core.ReasonProcessShutdown || finalizationCalled { t.Fatalf("cancel published") }
@@ -110,12 +110,12 @@ if readsAfterEnd != 0 || opens > 4 { t.Fatalf("termination/reconnect bound") }
 if !mainQuality.SelectionUnverified || oneSegQuality.SelectionUnverified { t.Fatalf("segment state leaked") }
 ```
 
-- [ ] **Step 2: REDを確認する。** Run `go test -count=1 ./internal/app/recording ./cmd/sazanami-dvr -run 'TestQuality'`。Finish上書き、ReachedEnd先行、ctx.Errの利用者停止化、通信partial非公開という現行との差を確認する。
-- [ ] **Step 3: 終了分類を分離する。** 親取消し／DB停止→更新済み終了→通信分類→Finish品質の順にし、品質はreason・retryabilityを変えない。Finishのbuffer書込みは予定終了・通信終了・明示停止だけに許可し、file／DB失敗やprocess取消しでは強行しない。DB停止と通常確定のCAS順を維持する。BeginFinalization前とoneSeg wrapperの任意ctx.ErrからUSER_REQUESTED_STOPへの変換を除く。
-- [ ] **Step 4: 同じ安全確定へ通す。** 追加OpenStreamの試行時点でReconnectCountを累積し、失敗した試行も数える。Qualityはsegment内で引継ぎ、filterのtail／collectorは捨てる。許可通信partialにだけ安全確定を使う。主の通信partialで補助を確定できる条件は共通predicateへそろえるが、主失敗の取消し、第二の再生URL、後処理・電源動作の条件は広げない。
-- [ ] **Step 5: bounded observerを接続する。** rate stateは既存segmentの処理内へ置き、30秒以下の頻度で警告を出さない。開始一回、接続終了最大四回、最終一回、分類64 bytes以下、一行2 KiB以下。packet、PID、path、ID、番組情報、接続先、生errorを出さない。共有Writerは一行単位に直列化し、観測の失敗で録画を止めない。
-- [ ] **Step 6: GREENとfailure injectionを確認する。** Run `go test -count=1 ./internal/app/recording ./cmd/sazanami-dvr`。create／short write／sync／close／DB／rename／directory sync／衝突、oneSeg独立、lease・FD・goroutine解放、予定終了後のread・retryなしを確認する。STREAM_UNAVAILABLEは元partialのまま保全する。
-- [ ] **Step 7: Commit。** executor、警告、関連テストだけをcommitする。
+- [x] **Step 2: REDを確認する。** Run `go test -count=1 ./internal/app/recording ./cmd/sazanami-dvr -run 'TestQuality'`。Finish上書き、ReachedEnd先行、ctx.Errの利用者停止化、通信partial非公開という現行との差を確認する。
+- [x] **Step 3: 終了分類を分離する。** 親取消し／DB停止→更新済み終了→通信分類→Finish品質の順にし、品質はreason・retryabilityを変えない。Finishのbuffer書込みは予定終了・通信終了・明示停止だけに許可し、file／DB失敗やprocess取消しでは強行しない。DB停止と通常確定のCAS順を維持する。BeginFinalization前とoneSeg wrapperの任意ctx.ErrからUSER_REQUESTED_STOPへの変換を除く。
+- [x] **Step 4: 同じ安全確定へ通す。** 追加OpenStreamの試行時点でReconnectCountを累積し、失敗した試行も数える。Qualityはsegment内で引継ぎ、filterのtail／collectorは捨てる。許可通信partialにだけ安全確定を使う。主の通信partialで補助を確定できる条件は共通predicateへそろえるが、主失敗の取消し、第二の再生URL、後処理・電源動作の条件は広げない。
+- [x] **Step 5: bounded observerを接続する。** rate stateは既存segmentの処理内へ置き、30秒以下の頻度で警告を出さない。開始一回、接続終了最大四回、最終一回、分類64 bytes以下、一行2 KiB以下。packet、PID、path、ID、番組情報、接続先、生errorを出さない。共有Writerは一行単位に直列化し、観測の失敗で録画を止めない。
+- [x] **Step 6: GREENとfailure injectionを確認する。** Run `go test -count=1 ./internal/app/recording ./cmd/sazanami-dvr`。create／short write／sync／close／DB／rename／directory sync／衝突、oneSeg独立、lease・FD・goroutine解放、予定終了後のread・retryなしを確認する。STREAM_UNAVAILABLEは元partialのまま保全する。
+- [x] **Step 7: Commit。** executor、警告、関連テストだけをcommitする。
 
 ## Task 4: 全公開projectionと統合回帰をそろえる
 
@@ -173,7 +173,7 @@ if restored.Quality != persisted.Quality { t.Fatalf("quality lost") }
 - Implementation plan review: 2026-10-04にProject ownerが直接承認
 - Plan self-review: 2026-10-04に仕様全項目、型・呼出し署名、五つのReview Focus、文量を照合した。旧版更新helperより先にPRを統合する依存順を修正し、main／oneSegの独立性fixtureを具体化した。
 - Baseline full test: `4eebb9d`で`go test -count=1 ./...`成功
-- Product changes so far: Task 1を`259b910`へcommit。Task 2ではschema15、品質保存・再読込、通信partialの公開証跡、再起動時の品質保持を実装した。
-- New behavior RED / GREEN: Task 1の型不在・PID優先順位・payloadなしPMT、Task 2の品質欠落・列不在・公開条件・復旧対象漏れを再現後に修正。Task 2の最終treeで全体`go test -count=1 -timeout 300s ./...`成功。Task 3以降は未完了。
+- Product changes so far: Task 1は`259b910`、Task 2は`a312f12`。Task 3では終了優先順位、許可通信partialの安全確定、独立したワンセグ処理、上限付き品質ログを実装した。
+- New behavior RED / GREEN: 型・品質保存・公開条件の不足、取消しの誤公開、再接続時の停止・終了・件数、補助期限の誤分類を再現後に修正。Task 3の最終treeで全体`go test -count=1 -timeout 300s ./...`成功。Task 4以降は未完了。
 - Feature / release-prep PR、main／Release SHA: UNCREATED
 - Production update instruction: NOT SENT（新公開物のreadback後）
