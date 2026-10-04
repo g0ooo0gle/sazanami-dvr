@@ -150,11 +150,11 @@ if restored.Quality != persisted.Quality { t.Fatalf("quality lost") }
 - verify.shの通常実行は `baseline-archive helper-archive candidate-archive candidate-sha candidate-version`の五引数へそろえる。preflight-onlyは維持する。helperも既存validate_archiveで版／revision／内容を検査し、今回作るinstall root内へ展開する。
 - `advance_to_candidate()`はensure_current helper→candidateの順だけを行い、失敗したら先へ進まない。初回更新と旧backup restore後の再更新で使う。cleanup／purgeの範囲は広げない。
 
-- [ ] **Step 1: helper順序の失敗条件を固定する。** verify_test.shでensure_currentをstubし、呼出し順がhelper→candidate、helper失敗時にcandidate未実行、旧baseline SHA・URLが不変であることを確認する。成功時のtraceは二行の`helper`／`candidate`、helper失敗時のtraceは一行の`helper`と非zero終了を要求する。schema13→14→15、restore13→14→15はfresh Ubuntu jobで実行する。
-- [ ] **Step 2: REDを確認する。** Run `sh packaging/lifecycle/verify_test.sh`。旧scriptがhelperを使わないため順序または入口のassertionで失敗することを記録する。
-- [ ] **Step 3: scriptとCIを最小更新する。** 公開v0.5.0 archive取得は残し、固定v1.3.6 archive取得を追加する。未検証helper、引数不正、既存resource／port、symlinkは作成・変更前に拒否する。helper用の個別削除や本番用SSHを加えない。
-- [ ] **Step 4: 更新説明を仕上げる。** schema14→15の停止、事前backupとrestore確認、明示db migrate、CURRENT確認、旧binaryでschema15を開かないことを既存更新ガイドへ記す。schema13の場合は公開v1.3.6で14へ進めてから15へ進む。品質警告・selection_unverifiedと字幕／データ混入、通信partial三reason、Native REST限定の品質、画面再生未確認を簡潔に説明する。READMEの詳細手順は増やさず、更新ガイドへリンクする。natural-japaneseのfull検査で構造・読みやすさ・guide適合を確認する。
-- [ ] **Step 5: GREENと文書参照を確認する。** Run `sh packaging/install_test.sh`、`sh packaging/lifecycle/verify_test.sh`、`sh packaging/compose/prepare_test.sh`、`git diff --check`。公開文書の参照先と今回の差分を確認してcommitする。Macではsystemd/rootを使うlifecycleを実行しない。
+- [x] **Step 1: helper順序の失敗条件を固定する。** verify_test.shでensure_currentをstubし、呼出し順がhelper→candidate、helper失敗時にcandidate未実行、旧baseline SHA・URLが不変であることを確認する。成功時のtraceは二行の`helper`／`candidate`、helper失敗時のtraceは一行の`helper`と非zero終了を要求する。schema13→14→15、restore13→14→15はfresh Ubuntu jobで実行する。
+- [x] **Step 2: REDを確認する。** Run `sh packaging/lifecycle/verify_test.sh`。旧scriptがhelperを使わないため順序または入口のassertionで失敗することを記録する。
+- [x] **Step 3: scriptとCIを最小更新する。** 公開v0.5.0 archive取得は残し、固定v1.3.6 archive取得を追加する。未検証helper、引数不正、既存resource／port、symlinkは作成・変更前に拒否する。helper用の個別削除や本番用SSHを加えない。
+- [x] **Step 4: 更新説明を仕上げる。** schema14→15の停止、事前backupとrestore確認、明示db migrate、CURRENT確認、旧binaryでschema15を開かないことを既存更新ガイドへ記す。schema13の場合は公開v1.3.6で14へ進めてから15へ進む。品質警告・selection_unverifiedと字幕／データ混入、通信partial三reason、Native REST限定の品質、画面再生未確認を簡潔に説明する。READMEの詳細手順は増やさず、更新ガイドへリンクする。natural-japaneseのfull検査で構造・読みやすさ・guide適合を確認する。
+- [x] **Step 5: GREENと文書参照を確認する。** Run `sh packaging/install_test.sh`、`sh packaging/lifecycle/verify_test.sh`、`sh packaging/compose/prepare_test.sh`、`git diff --check`。公開文書の参照先と今回の差分を確認してcommitする。Macではsystemd/rootを使うlifecycleを実行しない。
 - [ ] **Step 6: 全体独立reviewを行う。** spec QRC-001〜012、handoffの必須matrix、旧版更新helper、禁止範囲を最終branchで一回レビューし、指摘を直す。修正した範囲の検証を再実行する。
 - [ ] **Step 7: feature PRを統合する。** PRを作成・添付し、PRのtest・container・fresh Ubuntu lifecycle、通常削除の保持、明示purgeの固定範囲を読み戻す。CI成功後だけ統合し、main CIと取り込みSHAを確認する。版は1.3.6のままにする。
 - [ ] **Step 8: 専用release-prepを作る。** feature取り込み後のmainから版・CHANGELOG・READMEリンク・Compose imageを1.4.0へそろえる。 `test "$(go run ./cmd/sazanami-dvr --version)" = "sazanami-dvr 1.4.0"`と最終CIを確認してPRを作成・添付・統合する。公開済みtagを動かさない。

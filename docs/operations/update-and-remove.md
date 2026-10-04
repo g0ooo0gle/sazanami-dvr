@@ -6,6 +6,7 @@ Sazanami DVRの更新、切り戻し、アンインストールをまとめま�
 
 ## 目次
 
+- [v1.4.0へ更新する前に](#v140へ更新する前に)
 - [Linuxの更新](#linuxの更新)
 - [Composeの更新](#composeの更新)
 - [チャンネル設定を更新する](#チャンネル設定を更新する)
@@ -14,6 +15,39 @@ Sazanami DVRの更新、切り戻し、アンインストールをまとめま�
 - [録画ファイルを削除する](#録画ファイルを削除する)
 - [困ったとき](#困ったとき)
 - [次に読む](#次に読む)
+
+## v1.4.0へ更新する前に
+
+v1.4.0では、録画の品質情報を保存するためDB形式がschema 14から15へ変わります。
+通常起動やインストールだけではDBを更新しません。サービスと同じDBを使うWebUIを止め、バックアップと復元確認を済ませてから、新版の`db migrate`を実行してください。
+
+更新前の`db status`で表示される`schema`に応じて、次の順で進めます。
+
+| 更新前のschema | 更新順 |
+|---|---|
+| 14 | 以下のLinuxまたはComposeの手順でv1.4.0へ更新する |
+| 13 | 先に[公開v1.3.6](https://github.com/g0ooo0gle/sazanami-dvr/releases/tag/v1.3.6)で`db migrate`を実行して14へ進め、その後v1.4.0へ更新する |
+| それ以外 | 一度に複数段階の更新はできないため、対応する版とDB状態を確認する |
+
+### バックアップの復元確認
+
+Linux・Composeとも、以下の更新手順でバックアップを作成した直後に、別の保存先で復元を確認します。
+`backups`内で控えた`backup_id`をファイル名に含む`.sqlite3`と`.manifest.json`の2ファイルを、確認用データ保存先の`backups`へコピーしてください。録画の`.ts`はコピー不要です。
+確認用データ保存先には絶対パスを使います。保存先と`backups`は通常サービスと同じOSユーザーが所有するモード`0700`のディレクトリ、コピーした2ファイルは同じ所有者のモード`0600`にします。
+
+schema 14へ対応する更新前の実行ファイルで、確認用の保存先だけを指定して復元します。
+
+```sh
+sazanami-dvr db restore --data-root <確認用データ保存先> --backup-id <backup-id>
+sazanami-dvr db status --data-root <確認用データ保存先>
+```
+
+標準Linux環境では`sudo -u sazanami-dvr`を付け、更新前の`/opt/sazanami-dvr/<old-version>/sazanami-dvr`を使います。
+Composeでは現在のイメージを使い、通常サービスと同じユーザー・保存先マウントでコマンドを実行します。確認用の保存先にはDB本体のパスを指定しないでください。
+復元が`phase=COMMITTED`、確認用DBが`state=CURRENT schema=14`になってから、本体の更新へ進みます。確認用のコピーは切り戻し先ではなく、元のバックアップも保持します。
+
+DBを15へ更新した後は、v1.3.6などの旧版で直接開けません。[切り戻し](#切り戻し)では新版で更新前のバックアップを復元し、その後に旧版を配置します。
+古いバックアップへ戻すと、更新後に増えた予約や録画履歴は戻りません。切り戻す前に、それらの保全も判断してください。
 
 ## Linuxの更新
 
@@ -27,7 +61,7 @@ tar -xzf /path/to/sazanami-dvr_<new-version>_linux_<arch>.tar.gz
 
 録画が終了していることを確認し、次の順に実行します。
 
-1. サービスを停止します。
+1. サービスを停止します。同じDBを使うWebUIも停止してください。
 
    ```sh
    sudo systemctl stop sazanami-dvr.service
@@ -38,6 +72,8 @@ tar -xzf /path/to/sazanami-dvr_<new-version>_linux_<arch>.tar.gz
    ```sh
    sudo -u sazanami-dvr /opt/sazanami-dvr/<old-version>/sazanami-dvr db backup --data-root /var/lib/sazanami-dvr
    ```
+
+   v1.4.0への更新では、次へ進む前に[別の保存先で復元を確認](#バックアップの復元確認)します。
 
 3. 旧版のinstallerでアンインストールします。設定、DB、録画、バックアップ、利用者アカウントは保持されます。
 
@@ -99,7 +135,7 @@ sudo ./packaging/install.sh install
 
 Composeではホスト側のデータを残したままイメージを入れ替えます。作業ディレクトリは、Composeファイルを置いた場所です。
 
-1. 録画が終了していることを確認し、コンテナを停止します。
+1. 録画が終了していることを確認し、コンテナを停止します。同じDBを使うWebUIも停止してください。
 
    ```sh
    docker compose down
@@ -111,6 +147,8 @@ Composeではホスト側のデータを残したままイメージを入れ替�
    docker compose run --rm --no-deps sazanami db backup \
      --data-root /var/lib/sazanami-dvr
    ```
+
+   v1.4.0への更新では、次へ進む前に[別の保存先で復元を確認](#バックアップの復元確認)します。
 
 3. `.env`の`SAZANAMI_IMAGE`を新しいイメージタグへ変更します。
 
