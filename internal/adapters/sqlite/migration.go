@@ -316,6 +316,9 @@ func MigrateDatabaseWithBackup(ctx context.Context, dataRoot string, request Mig
 
 // validateMigrationSourceはbackupを作る前に、次版で扱えない既存値がないことを確認する。
 func validateMigrationSource(ctx context.Context, database *sql.DB, inspection Inspection) error {
+	if inspection.CurrentVersion == 14 && inspection.TargetVersion == 15 {
+		return validateSchemaShape(ctx, database, 14)
+	}
 	if inspection.CurrentVersion != 12 || inspection.TargetVersion != 13 {
 		return nil
 	}
@@ -346,17 +349,21 @@ type schemaObject struct {
 
 // validateSchemaTwelveShapeは移行履歴だけでなく、第12版の表、制約、index、triggerを照合する。
 func validateSchemaTwelveShape(ctx context.Context, database *sql.DB) error {
-	expected, err := sql.Open("sqlite3", "file:sazanami-schema-twelve?mode=memory&cache=private&_pragma=foreign_keys(1)")
+	return validateSchemaShape(ctx, database, 12)
+}
+
+func validateSchemaShape(ctx context.Context, database *sql.DB, version int) error {
+	expected, err := sql.Open("sqlite3", "file:sazanami-expected-schema?mode=memory&cache=private&_pragma=foreign_keys(1)")
 	if err != nil {
 		return errors.New("sqlite: prepare expected migration schema")
 	}
 	expected.SetMaxOpenConns(1)
 	defer expected.Close()
 	migrations, err := embeddedMigrations()
-	if err != nil || len(migrations) < 12 {
+	if err != nil || version < 1 || len(migrations) < version {
 		return errors.New("sqlite: prepare expected migration schema")
 	}
-	for _, item := range migrations[:12] {
+	for _, item := range migrations[:version] {
 		if _, err := expected.ExecContext(ctx, item.content); err != nil {
 			return errors.New("sqlite: prepare expected migration schema")
 		}

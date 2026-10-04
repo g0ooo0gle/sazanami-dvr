@@ -23,12 +23,17 @@ func TestCatalogRetentionMigratesSchema13To14(t *testing.T) {
 		t.Fatal(err)
 	}
 	createDatabaseThroughMigration(t, root, 13)
+	advanceDatabaseThroughMigration(t, root, 14)
+	before, err := InspectDatabase(context.Background(), root)
+	if err != nil || before.CurrentVersion != 14 || before.State != StateBehind {
+		t.Fatalf("第14版の回帰fixture=%+v err=%v", before, err)
+	}
 
 	result, err := MigrateDatabaseWithBackup(context.Background(), root, MigrationRequest{
 		AppliedAt: time.UnixMilli(100).UTC(), BackupID: testID(t, 240), ProductVersion: "test",
 		ProductCommit: strings.Repeat("a", 40), Now: func() time.Time { return time.UnixMilli(101).UTC() },
 	})
-	if err != nil || result.Inspection.State != StateCurrent || result.Inspection.CurrentVersion != 14 || result.Backup == nil {
+	if err != nil || result.Inspection.State != StateCurrent || result.Inspection.CurrentVersion != 15 || result.Backup == nil {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
 
@@ -175,11 +180,12 @@ func TestCatalogRetentionMigrationReadbackChecksumAndForeignKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	createDatabaseThroughMigration(t, root, 13)
+	advanceDatabaseThroughMigration(t, root, 14)
 	result, err := MigrateDatabaseWithBackup(context.Background(), root, MigrationRequest{
 		AppliedAt: time.UnixMilli(100).UTC(), BackupID: testID(t, 246), ProductVersion: "test",
 		ProductCommit: strings.Repeat("b", 40), Now: func() time.Time { return time.UnixMilli(101).UTC() },
 	})
-	if err != nil || result.Inspection.CurrentVersion != 14 || result.Backup == nil {
+	if err != nil || result.Inspection.CurrentVersion != 15 || result.Backup == nil {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
 	store, err := OpenStore(context.Background(), root)

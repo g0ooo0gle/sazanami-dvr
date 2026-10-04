@@ -83,7 +83,7 @@ func (store *attemptMemory) OneSegRecordingStarted(context.Context, catalogmodel
 	return nil
 }
 
-func (store *attemptMemory) UpdateRecordingProgress(_ context.Context, _ catalogmodel.ID, count int64, _ time.Time) (time.Time, error) {
+func (store *attemptMemory) UpdateRecordingProgress(_ context.Context, _ catalogmodel.ID, count int64, _ time.Time, _ core.QualitySummary) (time.Time, error) {
 	store.mu.Lock()
 	store.progress = append(store.progress, count)
 	if store.progressEnd.IsZero() {
@@ -96,7 +96,7 @@ func (store *attemptMemory) UpdateRecordingProgress(_ context.Context, _ catalog
 }
 
 func (store *attemptMemory) UpdateOneSegProgress(_ context.Context, _ catalogmodel.ID, count int64,
-	_ time.Time,
+	_ time.Time, _ core.QualitySummary,
 ) (time.Time, error) {
 	store.mu.Lock()
 	if store.progressEnd.IsZero() {
@@ -1480,7 +1480,7 @@ func TestUserStoppedPublicationFailsAtEachDurabilityBoundary(t *testing.T) {
 				},
 			}
 			result, err := executor.publishFinal(context.Background(), attempt, 188,
-				core.AttemptPartial, core.ReasonUserRequestedStop)
+				core.AttemptPartial, core.ReasonUserRequestedStop, core.QualitySummary{})
 			if err == nil {
 				t.Fatal("失敗を成功として返しました")
 			}
@@ -1511,7 +1511,7 @@ func TestUserStopDoesNotPublishWhenFileSyncOrCloseFails(t *testing.T) {
 			}
 			executor := Executor{Store: store, Clock: &mutableClock{now: start}}
 			result, err := executor.finishUserStop(context.Background(), file,
-				core.Reservation{}, core.Attempt{ID: appID(t, 82)}, minimumUsefulTS)
+				core.Reservation{}, core.Attempt{ID: appID(t, 82)}, minimumUsefulTS, core.QualitySummary{})
 			if err != nil || result.State != core.AttemptPartial || result.Reason != core.ReasonFileSyncFailed ||
 				store.finish.Availability != core.AvailabilityPartial || countString(store.operations, "finalizing") != 0 {
 				t.Fatalf("result=%+v finish=%+v operations=%v err=%v", result, store.finish, store.operations, err)
@@ -1554,7 +1554,7 @@ func TestPostRecordingRunsOnlyAfterSuccessfulFinalization(t *testing.T) {
 		ObservePostRecording: func(reason string) { observed = reason },
 	}
 	result, err := executor.publishAndPostProcess(ctx, reservation, attempt, 188,
-		core.AttemptSucceeded, core.ReasonCompleted)
+		core.AttemptSucceeded, core.ReasonCompleted, core.QualitySummary{})
 	if err != nil || result.State != core.AttemptSucceeded || result.PostRecording != core.PostRecordingStandby ||
 		called != 1 || observed != "post-recording-script-exit-failed" {
 		t.Fatalf("result=%+v called=%d observed=%q err=%v", result, called, observed, err)
@@ -1595,7 +1595,7 @@ func TestPostRecordingUsesFinalizationOutcome(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	result, err := executor.publishAndPostProcess(ctx, reservation, attempt, 188,
-		core.AttemptSucceeded, core.ReasonCompleted)
+		core.AttemptSucceeded, core.ReasonCompleted, core.QualitySummary{})
 	if err != nil || result.State != core.AttemptPartial || result.Reason != core.ReasonUserRequestedStop ||
 		store.finish.State != core.AttemptPartial || store.finish.Reason != core.ReasonUserRequestedStop || postCalls != 1 {
 		t.Fatalf("result=%+v finish=%+v post_calls=%d err=%v", result, store.finish, postCalls, err)
@@ -1626,7 +1626,7 @@ func TestCancelledFinalizationWithoutStopBecomesProcessShutdown(t *testing.T) {
 	cancel()
 	result, err := executor.publishAndPostProcess(ctx, core.Reservation{PostRecording: core.PostRecordingSettings{
 		Mode: core.PostRecordingStandby, Script: "/allowed/finish.sh",
-	}}, core.Attempt{ID: appID(t, 96)}, 188, core.AttemptSucceeded, core.ReasonCompleted)
+	}}, core.Attempt{ID: appID(t, 96)}, 188, core.AttemptSucceeded, core.ReasonCompleted, core.QualitySummary{})
 	if err != nil || result.State != core.AttemptCancelled || result.Reason != core.ReasonProcessShutdown ||
 		store.finish.State != core.AttemptCancelled || store.finish.Reason != core.ReasonProcessShutdown ||
 		store.finish.Availability != core.AvailabilityPartial || store.finalizeCall != 1 || links != 0 ||
@@ -1654,7 +1654,7 @@ func TestUnsupportedPublicationSettlesMainAndOneSegWithoutPostProcessing(t *test
 		}
 		result, err := executor.publishAndPostProcess(context.Background(), core.Reservation{
 			Number: 1, PostRecording: core.PostRecordingSettings{Mode: core.PostRecordingShutdown, Script: "/allowed/finish.sh"},
-		}, core.Attempt{ID: appID(t, 86)}, 376, core.AttemptSucceeded, core.ReasonCompleted)
+		}, core.Attempt{ID: appID(t, 86)}, 376, core.AttemptSucceeded, core.ReasonCompleted, core.QualitySummary{})
 		if err != nil || result.State != core.AttemptFailed || result.Reason != core.ReasonFinalPublicationFailed ||
 			store.finish.Availability != core.AvailabilityPartial || store.finish.ByteCount != 376 || called != 0 ||
 			result.PostRecording.ChangesPower() {
@@ -1688,7 +1688,7 @@ func TestPostRecordingIsSkippedWithoutScriptOrWhenPublicationFails(t *testing.T)
 			}
 			result, resultErr := executor.publishAndPostProcess(context.Background(), core.Reservation{
 				Number: 1, PostRecording: core.PostRecordingSettings{Mode: core.PostRecordingShutdown, Script: test.script},
-			}, core.Attempt{ID: appID(t, 86)}, 188, core.AttemptSucceeded, core.ReasonCompleted)
+			}, core.Attempt{ID: appID(t, 86)}, 188, core.AttemptSucceeded, core.ReasonCompleted, core.QualitySummary{})
 			if called != 0 {
 				t.Fatalf("post recording calls=%d", called)
 			}

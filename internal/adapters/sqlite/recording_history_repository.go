@@ -13,7 +13,8 @@ const historyColumns = `m.reserve_id, a.state, a.terminal_reason, r.title, r.sta
 	r.network_id, r.transport_stream_id, r.service_id, r.event_id,
 	a.planned_start_utc_ms, a.planned_end_utc_ms, a.actual_start_utc_ms, a.actual_end_utc_ms, a.byte_count,
 	s.relative_partial_path, s.relative_final_path, s.state, s.availability,
-	s.file_synced, s.final_published, s.directory_synced`
+	s.file_synced, s.final_published, s.directory_synced,
+	a.finalization_token, a.planned_final_state, a.planned_terminal_reason`
 
 const historyFrom = ` FROM ctrlcmd_reservation_ids m
 	JOIN reservations r ON r.id=m.reservation_id
@@ -29,7 +30,7 @@ func (store *Store) RecordingHistory(ctx context.Context, limit int, before int3
 	if before > 0 {
 		upper = int64(before)
 	}
-	query := `SELECT ` + historyColumns + historyFrom + ` WHERE a.state IN
+	query := `SELECT ` + historyColumns + `,` + qualityColumns("s", false) + historyFrom + ` WHERE a.state IN
 		('SUCCEEDED','PARTIAL','FAILED','CANCELLED','MISSED') AND m.reserve_id<?
 		ORDER BY m.reserve_id DESC LIMIT ?`
 	return store.readHistory(ctx, query, upper, limit)
@@ -40,11 +41,15 @@ func (store *Store) CompletedRecordings(ctx context.Context, limit int, after in
 	if store == nil || store.reader == nil || ctx == nil || limit < 1 || limit > recording.MaxHistoryPage || after < 0 {
 		return nil, errors.New("sqlite: invalid completed recording query")
 	}
-	query := `SELECT ` + historyColumns + historyFrom + ` WHERE (
+	query := `SELECT ` + historyColumns + `,` + qualityColumns("s", false) + historyFrom + ` WHERE (
 		(a.state='SUCCEEDED' AND a.terminal_reason IN ('COMPLETED','COMPLETED_AFTER_RECONNECT')) OR
-		(a.state='PARTIAL' AND a.terminal_reason='USER_REQUESTED_STOP'))
+		(a.state='PARTIAL' AND a.terminal_reason='USER_REQUESTED_STOP') OR
+		(a.state='PARTIAL' AND a.terminal_reason IN ('STREAM_ENDED_EARLY','STREAM_TIMEOUT','STREAM_RECONNECT_EXHAUSTED')
+			AND a.planned_final_state='PARTIAL' AND a.planned_terminal_reason=a.terminal_reason
+			AND a.finalization_token IS NOT NULL AND a.byte_count%188=0))
 		AND s.state='FINALIZED' AND s.availability='FINAL' AND s.file_synced=1
-		AND s.final_published=1 AND s.directory_synced=1 AND a.byte_count>=188 AND m.reserve_id>?
+		AND s.final_published=1 AND s.directory_synced=1 AND a.byte_count>=188
+		AND a.actual_end_utc_ms-a.actual_start_utc_ms>=1000 AND m.reserve_id>?
 		ORDER BY m.reserve_id LIMIT ?`
 	return store.readHistory(ctx, query, after, limit)
 }
@@ -54,7 +59,7 @@ func (store *Store) RecordingHistoryItem(ctx context.Context, number int32) (*re
 	if store == nil || store.reader == nil || ctx == nil || number < 1 {
 		return nil, errors.New("sqlite: invalid recording history item query")
 	}
-	query := `SELECT ` + historyColumns + historyFrom + ` WHERE a.state IN
+	query := `SELECT ` + historyColumns + `,` + qualityColumns("s", false) + historyFrom + ` WHERE a.state IN
 		('SUCCEEDED','PARTIAL','FAILED','CANCELLED','MISSED') AND m.reserve_id=? LIMIT 1`
 	row := store.reader.QueryRowContext(ctx, query, number)
 	item, err := scanHistory(row)
@@ -93,10 +98,15 @@ func scanHistory(scanner rowScanner) (recording.HistoryItem, error) {
 	var plannedStart, plannedEnd int64
 	var actualStart, actualEnd sql.NullInt64
 	var fileSynced, finalPublished, directorySynced int64
-	if err := scanner.Scan(&item.Number, &item.State, &item.Reason, &item.Title, &item.StationName,
+	var token []byte
+	var plannedState, plannedReason sql.NullString
+	var quality qualityScanner
+	destinations := []any{&item.Number, &item.State, &item.Reason, &item.Title, &item.StationName,
 		&networkID, &transportID, &serviceID, &eventID, &plannedStart, &plannedEnd, &actualStart, &actualEnd,
 		&item.ByteCount, &item.Plan.PartialPath, &item.Plan.FinalPath, &item.SegmentState, &item.Availability,
-		&fileSynced, &finalPublished, &directorySynced); err != nil {
+		&fileSynced, &finalPublished, &directorySynced, &token, &plannedState, &plannedReason}
+	destinations = append(destinations, quality.destinations()...)
+	if err := scanner.Scan(destinations...); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return recording.HistoryItem{}, err
 		}
@@ -120,6 +130,17 @@ func scanHistory(scanner rowScanner) (recording.HistoryItem, error) {
 		item.ActualEnd = &value
 	}
 	item.FileSynced, item.FinalPublished, item.DirectorySynced = fileSynced == 1, finalPublished == 1, directorySynced == 1
+	if len(token) != 0 {
+		if err := copyExact(item.FinalizationToken[:], token); err != nil {
+			return recording.HistoryItem{}, err
+		}
+	}
+	item.PlannedState, item.PlannedReason = recording.AttemptState(plannedState.String), recording.TerminalReason(plannedReason.String)
+	var err error
+	item.Quality, err = quality.value()
+	if err != nil {
+		return recording.HistoryItem{}, err
+	}
 	if err := item.Validate(); err != nil {
 		return recording.HistoryItem{}, errors.New("sqlite: corrupt recording history item")
 	}

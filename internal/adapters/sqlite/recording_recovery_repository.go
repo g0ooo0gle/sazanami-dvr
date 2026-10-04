@@ -32,12 +32,13 @@ func (store *Store) RecoveryAttempts(ctx context.Context, limit int, after catal
 		o.relative_partial_path, o.relative_final_path, o.state, o.byte_count, o.file_synced, o.final_published,
 		o.directory_synced, o.availability, o.integrity_reason,
 		(SELECT count(*) FROM recording_segments c WHERE c.attempt_id=a.id),
-		(SELECT count(*) FROM recording_segments c WHERE c.attempt_id=a.id AND c.ordinal NOT IN (0,1))
+		(SELECT count(*) FROM recording_segments c WHERE c.attempt_id=a.id AND c.ordinal NOT IN (0,1)),`+
+		qualityColumns("m", false)+`,`+qualityColumns("o", true)+`
 		FROM recording_attempts a
 		LEFT JOIN recording_segments m ON m.attempt_id=a.id AND m.ordinal=0
 		LEFT JOIN recording_segments o ON o.attempt_id=a.id AND o.ordinal=1
 		WHERE a.id>? AND (a.state IN ('CLAIMED','STARTING','RECORDING','FINALIZING','SUCCEEDED') OR
-			(a.state='PARTIAL' AND a.terminal_reason='USER_REQUESTED_STOP'))
+			(a.state='PARTIAL' AND a.terminal_reason='USER_REQUESTED_STOP') OR `+communicationPartialPredicate+`)
 		ORDER BY a.id LIMIT ?`, after.Bytes(), limit)
 	if err != nil {
 		return nil, sanitize("query-recording-recovery", err)
@@ -54,11 +55,15 @@ func (store *Store) RecoveryAttempts(ctx context.Context, limit int, after catal
 		var onePartial, oneFinal, oneState, oneAvailability, oneIntegrity sql.NullString
 		var oneByteCount, oneFileSynced, oneFinalPublished, oneDirectorySynced sql.NullInt64
 		var segmentCount, invalidOrdinalCount int
-		if err := rows.Scan(&id, &reservationID, &item.State, &startMS, &endMS, &byteCount, &token,
+		var mainQuality, oneQuality qualityScanner
+		destinations := []any{&id, &reservationID, &item.State, &startMS, &endMS, &byteCount, &token,
 			&plannedState, &plannedReason, &recovered, &mainPartial, &mainFinal, &item.SegmentState, &mainByteCount,
 			&fileSynced, &finalPublished, &directorySynced, &item.Availability, &item.IntegrityReason,
 			&onePartial, &oneFinal, &oneState, &oneByteCount, &oneFileSynced, &oneFinalPublished,
-			&oneDirectorySynced, &oneAvailability, &oneIntegrity, &segmentCount, &invalidOrdinalCount); err != nil {
+			&oneDirectorySynced, &oneAvailability, &oneIntegrity, &segmentCount, &invalidOrdinalCount}
+		destinations = append(destinations, mainQuality.destinations()...)
+		destinations = append(destinations, oneQuality.destinations()...)
+		if err := rows.Scan(destinations...); err != nil {
 			return nil, sanitize("scan-recording-recovery", err)
 		}
 		if !mainPartial.Valid || !mainFinal.Valid || segmentCount < 1 || segmentCount > 2 || invalidOrdinalCount != 0 ||
@@ -68,6 +73,11 @@ func (store *Store) RecoveryAttempts(ctx context.Context, limit int, after catal
 			return nil, errors.New("sqlite: corrupt recording segment set")
 		}
 		item.Plan = recording.FilePlan{PartialPath: mainPartial.String, FinalPath: mainFinal.String}
+		var qualityErr error
+		item.Quality, qualityErr = mainQuality.value()
+		if qualityErr != nil {
+			return nil, qualityErr
+		}
 		if plannedState.Valid {
 			item.PlannedState = recording.AttemptState(plannedState.String)
 		}
@@ -96,6 +106,10 @@ func (store *Store) RecoveryAttempts(ctx context.Context, limit int, after catal
 			if err := validateRecoverySegment(*oneSeg, oneFileSynced.Int64, oneFinalPublished.Int64,
 				oneDirectorySynced.Int64); err != nil {
 				return nil, err
+			}
+			oneSeg.Quality, qualityErr = oneQuality.value()
+			if qualityErr != nil {
+				return nil, qualityErr
 			}
 			item.OneSeg = oneSeg
 			plan := oneSeg.Plan
@@ -160,7 +174,7 @@ func (store *Store) SetRecordingAvailability(ctx context.Context, attemptID cata
 	result, err := store.writer.ExecContext(ctx, `UPDATE recording_segments SET availability=?, integrity_reason=?,
 		updated_at_utc_ms=? WHERE attempt_id=? AND ordinal=0 AND state='FINALIZED'
 		AND EXISTS (SELECT 1 FROM recording_attempts a WHERE a.id=? AND
-			(a.state='SUCCEEDED' OR (a.state='PARTIAL' AND a.terminal_reason='USER_REQUESTED_STOP')))
+			(a.state='SUCCEEDED' OR (a.state='PARTIAL' AND a.terminal_reason='USER_REQUESTED_STOP') OR `+communicationPartialPredicate+`))
 		AND (availability<>? OR COALESCE(integrity_reason,'')<>?)`, availability, integrity, now.UnixMilli(),
 		attemptID.Bytes(), attemptID.Bytes(), availability, integrityText)
 	if err != nil {
@@ -212,7 +226,7 @@ func (store *Store) SetOneSegAvailability(ctx context.Context, attemptID catalog
 	result, err := store.writer.ExecContext(ctx, `UPDATE recording_segments SET availability=?, integrity_reason=?,
 		updated_at_utc_ms=? WHERE attempt_id=? AND ordinal=1 AND state IN ('PARTIAL','FINALIZED')
 		AND EXISTS (SELECT 1 FROM recording_attempts a WHERE a.id=? AND
-			(a.state='SUCCEEDED' OR (a.state='PARTIAL' AND a.terminal_reason='USER_REQUESTED_STOP')))
+			(a.state='SUCCEEDED' OR (a.state='PARTIAL' AND a.terminal_reason='USER_REQUESTED_STOP') OR `+communicationPartialPredicate+`))
 		AND (?<>'FINAL' OR state='FINALIZED')
 		AND (?<>'PARTIAL' OR state='PARTIAL')
 		AND (availability<>? OR COALESCE(integrity_reason,'')<>?)`, availability, integrity, now.UnixMilli(),
@@ -231,7 +245,7 @@ func validateRecoveryValues(item recording.RecoveryItem, startMS, endMS, byteCou
 	fileSynced, finalPublished, directorySynced int64, tokenBytes int,
 ) error {
 	if startMS < 0 || endMS <= startMS || byteCount < 0 || mainByteCount < 0 || byteCount != mainByteCount ||
-		item.Plan.Validate() != nil ||
+		item.Plan.Validate() != nil || item.Quality.Validate() != nil ||
 		(recovered != 0 && recovered != 1) || (fileSynced != 0 && fileSynced != 1) ||
 		(finalPublished != 0 && finalPublished != 1) || (directorySynced != 0 && directorySynced != 1) {
 		return errors.New("sqlite: corrupt recording recovery value")
@@ -284,10 +298,11 @@ func validateRecoveryValues(item recording.RecoveryItem, startMS, endMS, byteCou
 		validNormal := item.PlannedState == recording.AttemptSucceeded &&
 			(item.PlannedReason == recording.ReasonCompleted || item.PlannedReason == recording.ReasonCompletedAfterReconnect)
 		validStopped := item.PlannedState == recording.AttemptPartial && item.PlannedReason == recording.ReasonUserRequestedStop
-		if !validNormal && !validStopped {
+		validCommunication := item.PlannedState == recording.AttemptPartial && recording.IsCommunicationPartialReason(item.PlannedReason) && byteCount%188 == 0
+		if !validNormal && !validStopped && !validCommunication {
 			return errors.New("sqlite: recording finalization plan is invalid")
 		}
-		if item.State == recording.AttemptSucceeded && !validNormal || item.State == recording.AttemptPartial && !validStopped {
+		if item.State == recording.AttemptSucceeded && !validNormal || item.State == recording.AttemptPartial && !validStopped && !validCommunication {
 			return errors.New("sqlite: terminal recording differs from finalization plan")
 		}
 	}
@@ -297,7 +312,7 @@ func validateRecoveryValues(item recording.RecoveryItem, startMS, endMS, byteCou
 func validateRecoverySegment(segment recording.RecoverySegment, fileSynced, finalPublished,
 	directorySynced int64,
 ) error {
-	if segment.Plan.Validate() != nil || segment.ByteCount < 0 || (fileSynced != 0 && fileSynced != 1) ||
+	if segment.Quality.Validate() != nil || segment.Plan.Validate() != nil || segment.ByteCount < 0 || (fileSynced != 0 && fileSynced != 1) ||
 		(finalPublished != 0 && finalPublished != 1) || (directorySynced != 0 && directorySynced != 1) {
 		return errors.New("sqlite: corrupt one-seg recovery value")
 	}

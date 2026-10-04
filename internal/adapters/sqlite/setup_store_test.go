@@ -21,7 +21,7 @@ func TestOpenStoreForSetupInitializesEmptyAndKeepsOwnerLock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("inspection=%+v err=%v", inspection, err)
 	}
-	if store == nil || inspection.State != StateCurrent || inspection.CurrentVersion != 14 {
+	if store == nil || inspection.State != StateCurrent || inspection.CurrentVersion != 15 {
 		t.Fatalf("store=%v inspection=%+v", store != nil, inspection)
 	}
 	if _, err := acquireOwnerLock(root); err == nil {
@@ -75,7 +75,7 @@ func TestOpenStoreForSetupKeepsCurrentSchema(t *testing.T) {
 	}
 
 	before, err := InspectDatabase(context.Background(), root)
-	if err != nil || before.State != StateCurrent || before.CurrentVersion != 14 {
+	if err != nil || before.State != StateCurrent || before.CurrentVersion != 15 {
 		t.Fatalf("before=%+v err=%v", before, err)
 	}
 	setupStore, after, err := OpenStoreForSetup(context.Background(), root, setupStoreAppliedAt)

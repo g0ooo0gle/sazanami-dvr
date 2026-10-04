@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans for the preserved Native execution method. Use superpowers:subagent-driven-development only if the human changes the method. Steps use checkbox syntax.
 >
-> Status: Draft（実装計画の確認待ち）。仕様の採用と文書同期は完了しているが、この計画の確認前にコードを実装しない。
+> Status: In Progress。2026-10-04にProject ownerが本計画を確認し「いいよ」と承認した。書き込み制限の解除後に実装を開始した。
 
 **Goal:** 受信TSが乱れても録画を続け、安全に確定できた劣化完録・通信部分録画を再生できるようにして公開する。
 
@@ -14,7 +14,7 @@
 
 **Baseline:** 公開v1.3.6 / `b36891cb4016a7d0a7242c3d6b65a380457d1ea1`。文書同期commit `bdb4ffdd14e5fe6601b28f05d3fd2189757b3869`、planning採用source `785537535d7df788cea6099546fcc15bbfaa80cf`。実装時の正本は文書同期commit内の二文書。
 
-**Execution:** Native。親が依存順に実装し、必要な読み取り調査だけLuna Maxへ分担する。全体の独立レビューを一回受ける。実装計画の確認は未実施であり、以前の方針承認をこの計画の承認へ読み替えない。
+**Execution:** Native。親が依存順に実装し、必要な読み取り調査だけLuna Maxへ分担する。全体の独立レビューを一回受ける。2026-10-04に本計画への直接の承認を受領した。
 
 ## Global Constraints
 
@@ -53,7 +53,7 @@
 - `Write([]byte) (int64, error)`、`Finish(allowBufferedWrite bool) (int64, error)`、`Quality() core.QualitySummary`。Finishは今回書いた追加byte数を返し、品質だけではerrorを返さない。file errorは返す。
 - `streamCopyResult.Quality core.QualitySummary`を追加する。constructor／Finish変更のcall siteはこのTaskでcompile可能にそろえる。Finishが返した追加byteと品質は全return経路で結果へ反映し、品質だけのerrorは返さない。親contextの分離と終了優先順位はTask 3で変更する。
 
-- [ ] **Step 1: 失敗する品質・buffer・filterテストを書く。** 既存tsBufferFileとtestTransportStreamを使い、TestQualityArbitrarySplits、TestQualityTEILeavesOriginalPacket、TestQualityPSIRecoveryAndFallback、TestQualitySyncRecoveryBounds、TestQualityCountersSaturateを追加する。split 1／187／188／189、gap／duplicate／同CC別内容／discontinuity／payloadなし、TEI、CRC／pointer／更新PMT／新PID、1 MiB・1,024・64 entry・64 PIDの境界を含める。assertionは次を固定する。
+- [x] **Step 1: 失敗する品質・buffer・filterテストを書く。** 既存tsBufferFileとtestTransportStreamを使い、TestQualityArbitrarySplits、TestQualityTEILeavesOriginalPacket、TestQualityPSIRecoveryAndFallback、TestQualitySyncRecoveryBounds、TestQualityCountersSaturateを追加する。split 1／187／188／189、gap／duplicate／同CC別内容／discontinuity／payloadなし、TEI、CRC／pointer／更新PMT／新PID、1 MiB・1,024・64 entry・64 PIDの境界を含める。assertionは次を固定する。
 
 ```go
 if !bytes.Equal(got, want) || len(got)%188 != 0 { t.Fatalf("output mismatch") }
@@ -61,10 +61,10 @@ if q.FallbackEvents != 1 || !q.SelectionUnverified || q.Status != core.QualityDe
 if q.CCGapEvents == 0 || q.Validate() != nil { t.Fatalf("quality mismatch") }
 ```
 
-- [ ] **Step 2: REDを確認する。** Run `go test -count=1 ./internal/core/recording ./internal/app/recording -run 'TestQuality'`。現行の型不在または即停止の期待差で失敗し、fixture自体の誤りではないことを記録する。
-- [ ] **Step 3: 最小実装を行う。** framingは録画専用に分離し、同期喪失後の前進走査と固定保持を使う。TEIは固定188-byte scratchでだけmaskして構造確認し、原byteを変更しない。PSIの長さ・連番・CRC・構造・上限を固定分類し、次のPUSIから取り直す。共通parserは変更しない。初期・更新選別が保証できなければsegmentで一度だけraw保存へ切り替える。Write／Finishとも実際の書込byteだけを累積し、短いwriteはfatalとする。bufferはlenだけでなくcapacityも上限内にする。
-- [ ] **Step 4: GREENと既存回帰を確認する。** Run `go test -count=1 ./internal/mpegts ./internal/app/recording ./internal/core/recording`。故意の不正TS fixtureは残し、lifecycleだけを検査する旧fixtureの全0x47 packetを、構造が読める合成188-byte packetへ替える。正常選別のPMT再生成・PCR・interleavingとfile障害のassertionを弱めない。
-- [ ] **Step 5: Commit。** このTaskの型・filter・接続点・テストだけをcommitする。
+- [x] **Step 2: REDを確認する。** Run `go test -count=1 ./internal/core/recording ./internal/app/recording -run 'TestQuality'`。現行の型不在または即停止の期待差で失敗し、fixture自体の誤りではないことを記録する。
+- [x] **Step 3: 最小実装を行う。** framingは録画専用に分離し、同期喪失後の前進走査と固定保持を使う。TEIは固定188-byte scratchでだけmaskして構造確認し、原byteを変更しない。PSIの長さ・連番・CRC・構造・上限を固定分類し、次のPUSIから取り直す。共通parserは変更しない。初期・更新選別が保証できなければsegmentで一度だけraw保存へ切り替える。Write／Finishとも実際の書込byteだけを累積し、短いwriteはfatalとする。bufferはlenだけでなくcapacityも上限内にする。
+- [x] **Step 4: GREENと既存回帰を確認する。** Run `go test -count=1 ./internal/mpegts ./internal/app/recording ./internal/core/recording`。故意の不正TS fixtureは残し、lifecycleだけを検査する旧fixtureの全0x47 packetを、構造が読める合成188-byte packetへ替える。正常選別のPMT再生成・PCR・interleavingとfile障害のassertionを弱めない。
+- [x] **Step 5: Commit。** このTaskの型・filter・接続点・テストだけをcommitする。
 
 ## Task 2: schema15と品質・公開証跡の永続化
 
@@ -77,7 +77,7 @@ if q.CCGapEvents == 0 || q.Validate() != nil { t.Fatalf("quality mismatch") }
 - 進捗portは `UpdateRecordingProgress(context.Context, catalogmodel.ID, int64, time.Time, core.QualitySummary) (time.Time, error)`と、同じ署名のUpdateOneSegProgressへ拡張する。本文、全call site、oneSeg adapter、mockを同時にそろえる。
 - SQLは仕様の固定19列だけをqualityとして追加する。historyColumns／scanHistory、RecoveryAttemptsのSELECT／scan、SetRecordingAvailability／SetOneSegAvailability、completedReconcileTargetをそろえる。SQL enumとdomain enumは明示変換する。
 
-- [ ] **Step 1: TestQualityMigrationPreservesOldRecordings、TestQualityPersistenceRoundTrip、TestQualityFinalizationPlanReasons、TestQualityRecoveryKeepsWarningsを書く。** schema14の旧完録・旧partial・予約・main／oneSeg・FK行を作り、状態・reason・token・path・byteの同値とUNKNOWN／0を確認する。各列の負値／上限超過、bool 2、未知enum、999／1000 ms、0／187／188／189 bytes、三許可／拒否reasonを含める。
+- [x] **Step 1: TestQualityMigrationPreservesOldRecordings、TestQualityPersistenceRoundTrip、TestQualityFinalizationPlanReasons、TestQualityRecoveryKeepsWarningsを書く。** schema14の旧完録・旧partial・予約・main／oneSeg・FK行を作り、状態・reason・token・path・byteの同値とUNKNOWN／0を確認する。各列の負値／上限超過、bool 2、未知enum、999／1000 ms、0／187／188／189 bytes、三許可／拒否reasonを含める。
 
 ```go
 if after.State != before.State || after.Reason != before.Reason || after.Plan != before.Plan { t.Fatalf("old recording changed") }
@@ -85,11 +85,11 @@ if q.Status != core.QualityUnknown || q.Validate() != nil { t.Fatalf("legacy qua
 if got.Playable() != wantPlayable { t.Fatalf("publication boundary mismatch") }
 ```
 
-- [ ] **Step 2: REDを確認する。** Run `go test -count=1 ./internal/adapters/sqlite ./internal/core/recording -run 'TestQuality'`。品質列不在または旧公開制限による失敗を記録する。
-- [ ] **Step 3: migrationとrepositoryを実装する。** 過去migrationは変えない。親tableをDROP／再作成せず、旧planned_terminal_reasonをlegacy_planned_terminal_reasonへrenameし、新しい同名canonical列へ六つの許可reasonのCHECKを作って同値をコピーする。旧列は互換値の保全用で新しい計画の判定には使わない。既存stop trigger二つを必要な条件だけ再作成し、利用者停止のstop_requested制約、planned state／reason、tokenと公開段階を維持する。FKを無効化しない。
-- [ ] **Step 4: schema形状とbackup gateをそろえる。** migration.goの既存shape照合をversion引数のprivate helperへまとめ、12→13の挙動を保ったまま14→15でも列・CHECK・triggerを確認する。backup／restore、integrity／FK、失敗transaction、future／drift／再適用拒否を検査する。進捗・確定予定・終端とqualityを同じ短いtransactionへ保存する。
-- [ ] **Step 5: GREENと再起動回帰を確認する。** Run `go test -count=1 ./internal/adapters/sqlite ./internal/core/recording ./internal/app/recording`。planned state前のcrashは既知DEGRADEDを維持し他はUNKNOWN、plan後は品質と予定結果を維持する。旧partialの新規計画・renameは一切発生しない。
-- [ ] **Step 6: Commit。** schema、model、port、永続化とmockをcompile可能な一単位でcommitする。
+- [x] **Step 2: REDを確認する。** Run `go test -count=1 ./internal/adapters/sqlite ./internal/core/recording -run 'TestQuality'`。品質列不在または旧公開制限による失敗を記録する。
+- [x] **Step 3: migrationとrepositoryを実装する。** 過去migrationは変えない。親tableをDROP／再作成せず、旧planned_terminal_reasonをlegacy_planned_terminal_reasonへrenameし、新しい同名canonical列へ六つの許可reasonのCHECKを作って同値をコピーする。旧列は互換値の保全用で新しい計画の判定には使わない。既存stop trigger二つを必要な条件だけ再作成し、利用者停止のstop_requested制約、planned state／reason、tokenと公開段階を維持する。FKを無効化しない。
+- [x] **Step 4: schema形状とbackup gateをそろえる。** migration.goの既存shape照合をversion引数のprivate helperへまとめ、12→13の挙動を保ったまま14→15でも列・CHECK・triggerを確認する。backup／restore、integrity／FK、失敗transaction、future／drift／再適用拒否を検査する。進捗・確定予定・終端とqualityを同じ短いtransactionへ保存する。
+- [x] **Step 5: GREENと再起動回帰を確認する。** Run `go test -count=1 ./internal/adapters/sqlite ./internal/core/recording ./internal/app/recording`。planned state前のcrashは既知DEGRADEDを維持し他はUNKNOWN、plan後は品質と予定結果を維持する。旧partialの新規計画・renameは一切発生しない。
+- [x] **Step 6: Commit。** schema、model、port、永続化とmockをcompile可能な一単位でcommitする。
 
 ## Task 3: 終了優先順位・安全な部分確定・警告ログ
 
@@ -170,10 +170,10 @@ if restored.Quality != persisted.Quality { t.Fatalf("quality lost") }
 
 ## Execution / Completion record
 
-- Implementation plan review: NOT YET
+- Implementation plan review: 2026-10-04にProject ownerが直接承認
 - Plan self-review: 2026-10-04に仕様全項目、型・呼出し署名、五つのReview Focus、文量を照合した。旧版更新helperより先にPRを統合する依存順を修正し、main／oneSegの独立性fixtureを具体化した。
-- Baseline full test: NOT RUN（実装計画確認後、専用外部tempで実行）
-- Product changes so far: Accepted ADR・仕様の二文書同期のみ
-- New behavior RED / GREEN: NOT RUN
+- Baseline full test: `4eebb9d`で`go test -count=1 ./...`成功
+- Product changes so far: Task 1を`259b910`へcommit。Task 2ではschema15、品質保存・再読込、通信partialの公開証跡、再起動時の品質保持を実装した。
+- New behavior RED / GREEN: Task 1の型不在・PID優先順位・payloadなしPMT、Task 2の品質欠落・列不在・公開条件・復旧対象漏れを再現後に修正。Task 2の最終treeで全体`go test -count=1 -timeout 300s ./...`成功。Task 3以降は未完了。
 - Feature / release-prep PR、main／Release SHA: UNCREATED
 - Production update instruction: NOT SENT（新公開物のreadback後）

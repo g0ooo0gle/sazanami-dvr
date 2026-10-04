@@ -318,7 +318,7 @@ func (executor Executor) closeOneSeg(file PartialFile, attempt core.Attempt, cop
 ) core.OneSegResult {
 	if started {
 		if _, err := executor.Store.UpdateOneSegProgress(context.Background(), attempt.ID, copyResult.ByteCount,
-			executor.now()); err != nil {
+			executor.now(), copyResult.Quality); err != nil {
 			copyResult.Reason = core.ReasonProcessInterrupted
 			reachedEnd = false
 		}
@@ -336,6 +336,7 @@ func (executor Executor) closeOneSeg(file PartialFile, attempt core.Attempt, cop
 		reachedEnd = false
 	}
 	return core.OneSegResult{
+		Quality:   copyResult.Quality,
 		ByteCount: copyResult.ByteCount, Availability: core.AvailabilityPartial, Reason: copyResult.Reason,
 		FileSynced: fileSynced, Publish: reachedEnd,
 	}

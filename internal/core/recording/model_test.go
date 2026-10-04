@@ -155,7 +155,7 @@ func TestFilePlanAndRecordingRequests(t *testing.T) {
 	if err := finish.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	finish.Reason = ReasonStreamEndedEarly
+	finish.Reason = ReasonStreamUnavailable
 	if err := finish.Validate(); err == nil {
 		t.Fatal("利用者停止以外の部分録画が完成ファイル扱いになりました")
 	}

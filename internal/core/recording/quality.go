@@ -2,6 +2,11 @@ package recording
 
 import "errors"
 
+// IsCommunicationPartialReasonは安全な確定を許可する通信終了理由だけを返す。
+func IsCommunicationPartialReason(reason TerminalReason) bool {
+	return reason == ReasonStreamEndedEarly || reason == ReasonStreamTimeout || reason == ReasonStreamReconnectExhausted
+}
+
 // QualityStatusは保存処理の状態とは独立した、有界な品質観測の結果である。
 type QualityStatus uint8
 
