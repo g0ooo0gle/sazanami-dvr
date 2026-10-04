@@ -85,4 +85,3 @@ WHEN
 BEGIN
     SELECT RAISE(ABORT, 'invalid recording stop or finalization plan');
 END;
-

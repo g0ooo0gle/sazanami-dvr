@@ -945,12 +945,24 @@ func (store *Store) BeginFinalization(ctx context.Context,
 	if store == nil || store.writer == nil || ctx == nil || request.Validate() != nil {
 		return recording.FinalizeRequest{}, errors.New("sqlite: invalid recording finalization")
 	}
+	// writer待ちの間は親取消しを維持し、確定計画を保存する直前まで確認する。
+	connection, err := store.writer.Conn(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			return recording.FinalizeRequest{}, ErrFinalizationUnavailable
+		}
+		return recording.FinalizeRequest{}, sanitize("acquire-recording-finalization-writer", err)
+	}
+	defer connection.Close()
 	durableCtx := context.WithoutCancel(ctx)
-	tx, err := store.writer.BeginTx(durableCtx, &sql.TxOptions{})
+	tx, err := connection.BeginTx(durableCtx, &sql.TxOptions{})
 	if err != nil {
 		return recording.FinalizeRequest{}, sanitize("begin-recording-finalization", err)
 	}
 	defer tx.Rollback()
+	if ctx.Err() != nil {
+		return recording.FinalizeRequest{}, ErrFinalizationUnavailable
+	}
 	nowMS := request.Now.UnixMilli()
 	markFinalizing := func(candidate recording.FinalizeRequest) (sql.Result, error) {
 		return tx.ExecContext(durableCtx, `UPDATE recording_attempts SET state='FINALIZING', state_version=state_version+1,

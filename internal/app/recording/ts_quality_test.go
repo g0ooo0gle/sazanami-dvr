@@ -107,6 +107,58 @@ func TestQualityPMTWithoutPayloadDoesNotLoseSelection(t *testing.T) {
 	}
 }
 
+func TestQualityMalformedControlUpdateLosesSelection(t *testing.T) {
+	for _, pid := range []uint16{0, 0x100} {
+		file := &tsBufferFile{}
+		f := newTSComponentFilter(file, true, false, core.QualitySummary{})
+		if _, err := f.Write(testTransportStream(t, []testStream{{0x1b, 0x101, nil}, {0x0d, 0x103, nil}})); err != nil {
+			t.Fatal(err)
+		}
+		before := file.Len()
+		bad := makePayloadPacket(pid)
+		bad[3] = 0
+		payload := makePayloadPacket(0x103)
+		if _, err := f.Write(append(bad, payload...)); err != nil {
+			t.Fatal(err)
+		}
+		q := f.Quality()
+		if q.MalformedPacketEvents != 1 || !q.SelectionUnverified || q.FallbackEvents != 1 ||
+			file.Len() != before+188 || !bytes.HasSuffix(file.Bytes(), payload) {
+			t.Fatalf("PID=%d malformed control後に内容を失いました: quality=%+v bytes=%d", pid, q, file.Len()-before)
+		}
+	}
+}
+
+func TestQualityRawFallbackKeepsObservingPSI(t *testing.T) {
+	for _, reconnect := range []bool{false, true} {
+		file := &tsBufferFile{}
+		f := newTSComponentFilter(file, true, false, core.QualitySummary{})
+		if _, err := f.Write(testTransportStream(t, []testStream{{0x1b, 0x101, nil}})); err != nil {
+			t.Fatal(err)
+		}
+		bad := packetizeSectionForTest(0x100, 4, makePMTSection(t, []testStream{{0x1b, 0x101, nil}}))
+		bad[20] ^= 1
+		if _, err := f.Write(bad); err != nil {
+			t.Fatal(err)
+		}
+		before := f.Quality().PSICRCEvents
+		if reconnect {
+			f = newTSComponentFilter(file, true, false, f.Quality())
+			if _, err := f.Write(packetizeSectionForTest(0, 0, makePATSection(t, []uint16{1}))); err != nil {
+				t.Fatal(err)
+			}
+		}
+		bad[3] = 0x15
+		if _, err := f.Write(bad); err != nil {
+			t.Fatal(err)
+		}
+		q := f.Quality()
+		if q.PSICRCEvents != before+1 || !q.SelectionUnverified || q.FallbackEvents != 1 || !bytes.HasSuffix(file.Bytes(), bad) {
+			t.Fatalf("reconnect=%t fallback後のPSIを計測しませんでした: before=%d quality=%+v", reconnect, before, q)
+		}
+	}
+}
+
 func TestQualityPSIRecoveryAndFallback(t *testing.T) {
 	t.Run("initial CRC recovery", func(t *testing.T) {
 		bad := packetizeSectionForTest(0, 0, makePATSection(t, []uint16{1}))

@@ -144,6 +144,38 @@ func TestQualityCancelBeforeFinalizationDoesNotBecomeUserStop(t *testing.T) {
 	}
 }
 
+func TestQualityCancellationDuringFinalizationWaitResolvesDatabaseStop(t *testing.T) {
+	for _, stop := range []bool{false, true} {
+		t.Run(map[bool]string{false: "process-cancel", true: "database-stop"}[stop], func(t *testing.T) {
+			start := time.Date(2026, 10, 4, 0, 0, 0, 0, time.UTC)
+			store := &attemptMemory{start: start, end: start.Add(time.Minute)}
+			executor := executorForTest(t, store, &fakeProvider{}, &mutableClock{now: start}, false)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			store.finalizeFunc = func(request core.FinalizeRequest) (core.FinalizeRequest, error) {
+				if store.finalizeCall == 1 {
+					store.stop.Store(stop)
+					cancel()
+					return core.FinalizeRequest{}, core.ErrFinalizationUnavailable
+				}
+				return request, nil
+			}
+			quality := core.QualitySummary{Status: core.QualityDegraded, TEIPackets: 1}
+			result, err := executor.publishFinal(ctx, core.Attempt{ID: appID(t, 20)}, 188,
+				core.AttemptSucceeded, core.ReasonCompleted, quality)
+			wantState, wantReason, wantCalls, wantLinks := core.AttemptCancelled, core.ReasonProcessShutdown, 1, 0
+			if stop {
+				wantState, wantReason, wantCalls, wantLinks = core.AttemptPartial, core.ReasonUserRequestedStop, 2, 1
+			}
+			if err != nil || result.State != wantState || result.Reason != wantReason ||
+				store.finish.Quality != quality || store.finalizeCall != wantCalls || countString(store.operations, "link") != wantLinks {
+				t.Fatalf("result=%+v finish=%+v calls=%d links=%d err=%v", result, store.finish,
+					store.finalizeCall, countString(store.operations, "link"), err)
+			}
+		})
+	}
+}
+
 func TestQualityObservationRateBound(t *testing.T) {
 	start := time.Date(2026, 10, 4, 0, 0, 0, 0, time.UTC)
 	clock := &mutableClock{now: start}

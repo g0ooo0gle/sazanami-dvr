@@ -226,12 +226,12 @@ run_as_service() {
 
 ensure_current() {
   database_binary=$1
-  status_output=$(run_as_service "$database_binary" db status --data-root "$data_root")
+  status_output=$(run_as_service "$database_binary" db status --data-root "$data_root") || return $?
   case "$status_output" in
     state=CURRENT*) return 0 ;;
     state=BEHIND*)
-      run_as_service "$database_binary" db migrate --data-root "$data_root"
-      status_output=$(run_as_service "$database_binary" db status --data-root "$data_root")
+      run_as_service "$database_binary" db migrate --data-root "$data_root" || return $?
+      status_output=$(run_as_service "$database_binary" db status --data-root "$data_root") || return $?
       case "$status_output" in
         state=CURRENT*) return 0 ;;
       esac

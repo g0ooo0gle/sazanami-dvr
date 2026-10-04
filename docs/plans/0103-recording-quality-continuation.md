@@ -155,7 +155,7 @@ if restored.Quality != persisted.Quality { t.Fatalf("quality lost") }
 - [x] **Step 3: scriptとCIを最小更新する。** 公開v0.5.0 archive取得は残し、固定v1.3.6 archive取得を追加する。未検証helper、引数不正、既存resource／port、symlinkは作成・変更前に拒否する。helper用の個別削除や本番用SSHを加えない。
 - [x] **Step 4: 更新説明を仕上げる。** schema14→15の停止、事前backupとrestore確認、明示db migrate、CURRENT確認、旧binaryでschema15を開かないことを既存更新ガイドへ記す。schema13の場合は公開v1.3.6で14へ進めてから15へ進む。品質警告・selection_unverifiedと字幕／データ混入、通信partial三reason、Native REST限定の品質、画面再生未確認を簡潔に説明する。READMEの詳細手順は増やさず、更新ガイドへリンクする。natural-japaneseのfull検査で構造・読みやすさ・guide適合を確認する。
 - [x] **Step 5: GREENと文書参照を確認する。** Run `sh packaging/install_test.sh`、`sh packaging/lifecycle/verify_test.sh`、`sh packaging/compose/prepare_test.sh`、`git diff --check`。公開文書の参照先と今回の差分を確認してcommitする。Macではsystemd/rootを使うlifecycleを実行しない。
-- [ ] **Step 6: 全体独立reviewを行う。** spec QRC-001〜012、handoffの必須matrix、旧版更新helper、禁止範囲を最終branchで一回レビューし、指摘を直す。修正した範囲の検証を再実行する。
+- [x] **Step 6: 全体独立reviewを行う。** spec QRC-001〜012、handoffの必須matrix、旧版更新helper、禁止範囲を最終branchで一回レビューし、指摘を直す。修正した範囲の検証を再実行する。
 - [ ] **Step 7: feature PRを統合する。** PRを作成・添付し、PRのtest・container・fresh Ubuntu lifecycle、通常削除の保持、明示purgeの固定範囲を読み戻す。CI成功後だけ統合し、main CIと取り込みSHAを確認する。版は1.3.6のままにする。
 - [ ] **Step 8: 専用release-prepを作る。** feature取り込み後のmainから版・CHANGELOG・READMEリンク・Compose imageを1.4.0へそろえる。 `test "$(go run ./cmd/sazanami-dvr --version)" = "sazanami-dvr 1.4.0"`と最終CIを確認してPRを作成・添付・統合する。公開済みtagを動かさない。
 - [ ] **Step 9: 配布を読み戻す。** 正確なmain SHAへv1.4.0 tagを作り、Release CI、amd64／arm64 archive、version・revision・CGO・収録file、OCI tag・digest・multiarchを確認する。ユーザー向けchecksum工程や時間指定試験は加えない。
@@ -174,6 +174,6 @@ if restored.Quality != persisted.Quality { t.Fatalf("quality lost") }
 - Plan self-review: 2026-10-04に仕様全項目、型・呼出し署名、五つのReview Focus、文量を照合した。旧版更新helperより先にPRを統合する依存順を修正し、main／oneSegの独立性fixtureを具体化した。
 - Baseline full test: `4eebb9d`で`go test -count=1 ./...`成功
 - Product changes so far: Task 1は`259b910`、Task 2は`a312f12`、Task 3は`5bcce02`。Task 4でNative履歴の品質object、CtrlCmdの既存wire維持、21ケースの確定中断・再起動、視聴・EPGと録画の独立性を確認した。
-- New behavior RED / GREEN: 型・品質保存・公開条件の不足、取消しの誤公開、再接続時の停止・終了・件数、補助期限の誤分類、Native履歴の品質不足を再現後に修正。Task 4の最終Go sourceでfull、shuffle、race（`-p 1`）各36 package、vet、module verify、govulncheck、CGO無効のlinux／darwin各amd64／arm64 buildが成功。Task 5は未完了。
+- New behavior RED / GREEN: 型・品質保存・公開条件の不足、取消しの誤公開、再接続時の停止・終了・件数、補助期限の誤分類、Native履歴の品質不足を再現後に修正。Task 4の最終Go sourceでfull、shuffle、race（`-p 1`）各36 package、vet、module verify、govulncheck、CGO無効のlinux／darwin各amd64／arm64 buildが成功。一回の独立レビュー後、writer待ち中の取消し、壊れたPAT／PMT更新後の選別、fallback後のPSI計測、helperの失敗伝播をRED→GREENで修正し、全36 packageとportable installer／lifecycle／Compose、branch全体のdiff確認が成功。Task 5のPR・公開工程は未完了。
 - Feature / release-prep PR、main／Release SHA: UNCREATED
 - Production update instruction: NOT SENT（新公開物のreadback後）

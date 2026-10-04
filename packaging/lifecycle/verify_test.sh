@@ -53,6 +53,39 @@ cmp "$transition_root/expected" "$transition_trace"
 repository_root=$(CDPATH= cd -- "$script_root/../.." && pwd)
 grep -Fx '            https://github.com/g0ooo0gle/sazanami-dvr/releases/download/v0.5.0/sazanami-dvr_0.5.0_linux_amd64.tar.gz' \
   "$repository_root/.github/workflows/ci.yml" >/dev/null
+for helper_failure in initial-status migrate final-status; do
+  : > "$transition_trace"
+  (
+    helper_state=BEHIND
+    run_as_service() {
+      if [ "$1" = "$candidate_root/sazanami-dvr" ]; then
+        printf 'candidate\n' >> "$transition_trace"
+        printf 'state=CURRENT\n'
+        return 0
+      fi
+      case "$3" in
+        status)
+          printf 'state=%s\n' "$helper_state"
+          if [ "$helper_failure" = initial-status ] ||
+            { [ "$helper_state" = CURRENT ] && [ "$helper_failure" = final-status ]; }; then
+            return 23
+          fi
+          ;;
+        migrate)
+          helper_state=CURRENT
+          if [ "$helper_failure" = migrate ]; then return 23; fi
+          ;;
+        *) return 24 ;;
+      esac
+    }
+    transition_result=0
+    advance_to_candidate || transition_result=$?
+    if [ "$transition_result" -ne 23 ] || [ -s "$transition_trace" ]; then
+      printf 'helper %sの失敗を無視しました: status=%s\n' "$helper_failure" "$transition_result" >&2
+      exit 1
+    fi
+  )
+done
 rm -rf -- "$transition_root"
 transition_root=
 trap - EXIT HUP INT TERM

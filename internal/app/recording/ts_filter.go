@@ -90,6 +90,19 @@ func (filter *tsComponentFilter) processPacket(packet []byte) (int64, error) {
 	parsed, tei, err := parseRecordingPacket(packet)
 	if err != nil {
 		addQuality(&filter.quality, &filter.quality.MalformedPacketEvents, 1)
+		pid := uint16(packet[1]&0x1f)<<8 | uint16(packet[2])
+		control := pid == 0 || filter.pmtKnown && pid == filter.pmtPID
+		if control {
+			if pid == 0 {
+				filter.pat.reset()
+			} else {
+				filter.pmt.reset()
+			}
+			if filter.initialized && filter.selectionRequired() && !filter.raw {
+				n, fallbackErr := filter.fallback()
+				return written + n, fallbackErr
+			}
+		}
 		return written, nil
 	}
 	if filter.quality.Status == core.QualityUnknown {
@@ -100,6 +113,16 @@ func (filter *tsComponentFilter) processPacket(packet []byte) (int64, error) {
 	}
 	filter.tracker.observe(packet, parsed, &filter.quality)
 	if filter.raw {
+		if tei && (parsed.PID == 0 || filter.pmtKnown && parsed.PID == filter.pmtPID) {
+			filter.issue(psiStructure)
+			if parsed.PID == 0 {
+				filter.pat.reset()
+			} else {
+				filter.pmt.reset()
+			}
+		} else {
+			filter.observeTables(packet, parsed)
+		}
 		n, err := filter.writePacket(packet)
 		return written + n, err
 	}

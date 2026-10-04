@@ -436,12 +436,21 @@ func (executor Executor) publishFinal(ctx context.Context, attempt recording.Att
 	if reason == recording.ReasonUserRequestedStop {
 		finalizationContext = context.WithoutCancel(ctx)
 	}
-	finalization, err := executor.Store.BeginFinalization(finalizationContext, recording.FinalizeRequest{
+	request := recording.FinalizeRequest{
 		AttemptID: attempt.ID, Token: token, ByteCount: byteCount, State: state, Reason: reason, Now: executor.now(), Quality: quality,
-	})
+	}
+	finalization, err := executor.Store.BeginFinalization(finalizationContext, request)
 	if errors.Is(err, recording.ErrFinalizationUnavailable) && ctx.Err() != nil {
-		return executor.finishByCount(context.WithoutCancel(ctx), attempt.ID, byteCount,
-			recording.ReasonProcessShutdown, true, quality)
+		cancelReason, cancelErr := executor.cancelReason(ctx, attempt.ID)
+		if cancelErr != nil {
+			return Result{}, cancelErr
+		}
+		if cancelReason != recording.ReasonUserRequestedStop {
+			return executor.finishByCount(context.WithoutCancel(ctx), attempt.ID, byteCount,
+				cancelReason, true, quality)
+		}
+		request.State, request.Reason = recording.AttemptPartial, recording.ReasonUserRequestedStop
+		finalization, err = executor.Store.BeginFinalization(context.WithoutCancel(ctx), request)
 	}
 	if err != nil {
 		return Result{}, errors.New("recording: persist finalization start")

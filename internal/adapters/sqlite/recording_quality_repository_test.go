@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -352,5 +353,65 @@ func TestQualityProgressDatabaseFailureRollsBack(t *testing.T) {
 	}
 	if count != 0 || segmentBytes != 0 || heartbeat != now.UnixMilli() || status != "UNKNOWN" {
 		t.Fatal("失敗した進捗を部分的にcommitしました")
+	}
+}
+
+func TestQualityCancelledWriterWaitDoesNotPlanFinalization(t *testing.T) {
+	for _, reason := range []core.TerminalReason{core.ReasonCompleted, core.ReasonStreamEndedEarly, core.ReasonStreamTimeout, core.ReasonStreamReconnectExhausted} {
+		t.Run(string(reason), func(t *testing.T) {
+			_, store := openMigratedStore(t)
+			claim, _, now := qualityRunningAttempt(t, store)
+			held, err := store.writer.Conn(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer held.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			state := core.AttemptPartial
+			if reason == core.ReasonCompleted {
+				state = core.AttemptSucceeded
+			}
+			request := core.FinalizeRequest{AttemptID: claim.AttemptID, Token: testID(t, 204),
+				State: state, Reason: reason, ByteCount: 188, Now: now.Add(time.Second),
+				OneSeg: &core.OneSegResult{Availability: core.AvailabilityPartial, Reason: core.ReasonStreamUnavailable}}
+			before := store.writer.Stats().WaitCount
+			done := make(chan error, 1)
+			go func() {
+				_, err := store.BeginFinalization(ctx, request)
+				done <- err
+			}()
+			ticker := time.NewTicker(time.Millisecond)
+			defer ticker.Stop()
+			deadline := time.NewTimer(5 * time.Second)
+			defer deadline.Stop()
+			for store.writer.Stats().WaitCount == before {
+				select {
+				case <-ticker.C:
+				case <-deadline.C:
+					t.Fatal("確定処理がwriter待ちへ入りませんでした")
+				}
+			}
+			var persisted string
+			if err := store.reader.QueryRow(`SELECT state FROM recording_attempts WHERE id=?`, claim.AttemptID.Bytes()).Scan(&persisted); err != nil || persisted != "RECORDING" {
+				t.Fatalf("取消し前state=%s err=%v", persisted, err)
+			}
+			cancel()
+			if err := held.Close(); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-done:
+				if !errors.Is(err, core.ErrFinalizationUnavailable) {
+					t.Fatalf("取消し後の確定が拒否されませんでした: %v", err)
+				}
+			case <-deadline.C:
+				t.Fatal("取消し後の確定処理が終了しませんでした")
+			}
+			var noToken bool
+			if err := store.reader.QueryRow(`SELECT state,finalization_token IS NULL FROM recording_attempts WHERE id=?`, claim.AttemptID.Bytes()).Scan(&persisted, &noToken); err != nil || persisted != "RECORDING" || !noToken {
+				t.Fatalf("取消された確定計画を保存しました: state=%s no_token=%t err=%v", persisted, noToken, err)
+			}
+		})
 	}
 }
