@@ -240,6 +240,17 @@ jobs:
             https://github.com/g0ooo0gle/sazanami-dvr/releases/download/v0.5.0/sazanami-dvr_0.5.0_linux_amd64.tar.gz
           printf 'archive=%s\n' "$archive" >> "$GITHUB_OUTPUT"
 
+      - name: schema14更新用の公開v1.3.6 archiveを取得
+        id: helper
+        run: |
+          helper_dir="$RUNNER_TEMP/helper"
+          mkdir -p "$helper_dir"
+          archive="$helper_dir/sazanami-dvr_1.3.6_linux_amd64.tar.gz"
+          curl --fail --location \
+            --output "$archive" \
+            https://github.com/g0ooo0gle/sazanami-dvr/releases/download/v1.3.6/sazanami-dvr_1.3.6_linux_amd64.tar.gz
+          printf 'archive=%s\n' "$archive" >> "$GITHUB_OUTPUT"
+
       - name: 既存resourceを変更前に拒否する
         run: |
           sudo env "PATH=$PATH" packaging/lifecycle/verify.sh --preflight-only
@@ -276,6 +287,7 @@ jobs:
         run: |
           sudo env "PATH=$PATH" packaging/lifecycle/verify.sh \
             "${{ steps.baseline.outputs.archive }}" \
+            "${{ steps.helper.outputs.archive }}" \
             "${{ steps.candidate.outputs.archive }}" \
             "$GITHUB_SHA" \
             "${{ steps.candidate.outputs.version }}"

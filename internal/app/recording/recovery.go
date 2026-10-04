@@ -93,7 +93,9 @@ func (recovery Recovery) finishInterrupted(ctx context.Context, item core.Recove
 	finish := interruptedMainResult(item, mainObservation)
 	finish.Now = recovery.now()
 	if item.OneSeg != nil {
-		finish.OneSeg = oneSegInterruptedResult(*item.OneSeg, *oneSegObservation, core.ReasonProcessInterrupted)
+		segment := *item.OneSeg
+		segment.Quality = interruptedQuality(segment.Quality)
+		finish.OneSeg = oneSegInterruptedResult(segment, *oneSegObservation, core.ReasonProcessInterrupted)
 	}
 	if err := recovery.Store.FinishAttempt(ctx, finish); err != nil {
 		return errors.New("recording: finish interrupted attempt")
@@ -103,6 +105,7 @@ func (recovery Recovery) finishInterrupted(ctx context.Context, item core.Recove
 
 func interruptedMainResult(item core.RecoveryItem, observation core.FileObservation) core.FinishRequest {
 	finish := core.FinishRequest{
+		Quality:   interruptedQuality(item.Quality),
 		AttemptID: item.ID, State: core.AttemptFailed, Reason: core.ReasonProcessInterrupted,
 		Availability: core.AvailabilityMissing, Recovered: true,
 	}
@@ -124,7 +127,7 @@ func interruptedMainResult(item core.RecoveryItem, observation core.FileObservat
 func oneSegInterruptedResult(segment core.RecoverySegment, observation core.FileObservation,
 	reason core.TerminalReason,
 ) *core.OneSegResult {
-	result := core.OneSegResult{Availability: core.AvailabilityMissing, Reason: reason}
+	result := core.OneSegResult{Availability: core.AvailabilityMissing, Reason: reason, Quality: segment.Quality}
 	switch {
 	case observation.Unsafe || invalidFact(observation.Partial) || invalidFact(observation.Final) || observation.Final.Exists:
 		result.ByteCount = segment.ByteCount
@@ -167,6 +170,7 @@ func (recovery Recovery) recoverFinalizing(ctx context.Context, item core.Recove
 		}
 	}
 	finish := core.FinishRequest{
+		Quality:   item.Quality,
 		AttemptID: item.ID, State: item.PlannedState, Reason: item.PlannedReason,
 		ByteCount: item.ByteCount, Availability: core.AvailabilityFinal, Recovered: true, Now: recovery.now(),
 	}
@@ -255,6 +259,7 @@ func finalizationFailure(item core.RecoveryItem, reason core.TerminalReason,
 	availability core.Availability,
 ) *core.FinishRequest {
 	return &core.FinishRequest{
+		Quality:   item.Quality,
 		AttemptID: item.ID, State: core.AttemptFailed, Reason: reason, ByteCount: item.ByteCount,
 		Availability: availability, Recovered: true,
 	}
@@ -275,12 +280,12 @@ func (recovery Recovery) recoverOneSegFinalization(ctx context.Context, attemptI
 			*oneSegInterruptedResult(segment, observation, core.ReasonProcessInterrupted))
 	}
 	if observation.Unsafe || invalidFact(observation.Partial) || invalidFact(observation.Final) {
-		return recovery.saveOneSegOutcome(ctx, attemptID, oneSegMismatch(segment.ByteCount))
+		return recovery.saveOneSegOutcome(ctx, attemptID, oneSegMismatch(segment.ByteCount, segment.Quality))
 	}
 	partialMatches := observation.Partial.Exists && observation.Partial.Size == segment.ByteCount
 	finalMatches := observation.Final.Exists && observation.Final.Size == segment.ByteCount
 	if (observation.Partial.Exists && !partialMatches) || (observation.Final.Exists && !finalMatches) {
-		return recovery.saveOneSegOutcome(ctx, attemptID, oneSegMismatch(segment.ByteCount))
+		return recovery.saveOneSegOutcome(ctx, attemptID, oneSegMismatch(segment.ByteCount, segment.Quality))
 	}
 	switch {
 	case partialMatches && !observation.Final.Exists && !segment.FinalPublished && !segment.DirectorySynced:
@@ -307,10 +312,11 @@ func (recovery Recovery) recoverOneSegFinalization(ctx context.Context, attemptI
 		return recovery.completeOneSegPublication(ctx, attemptID, segment, false)
 	case !observation.Partial.Exists && !observation.Final.Exists:
 		return recovery.saveOneSegOutcome(ctx, attemptID, core.OneSegResult{
+			Quality:      segment.Quality,
 			Availability: core.AvailabilityMissing, Reason: core.ReasonFileMissing,
 		})
 	default:
-		return recovery.saveOneSegOutcome(ctx, attemptID, oneSegMismatch(segment.ByteCount))
+		return recovery.saveOneSegOutcome(ctx, attemptID, oneSegMismatch(segment.ByteCount, segment.Quality))
 	}
 }
 
@@ -319,31 +325,35 @@ func (recovery Recovery) recoverFinalizedOneSeg(ctx context.Context, attemptID c
 ) error {
 	if observation.Unsafe || invalidFact(observation.Partial) || invalidFact(observation.Final) ||
 		observation.Final.Exists && observation.Final.Size != segment.ByteCount {
-		return recovery.saveOneSegOutcome(ctx, attemptID, oneSegMismatch(segment.ByteCount))
+		return recovery.saveOneSegOutcome(ctx, attemptID, oneSegMismatch(segment.ByteCount, segment.Quality))
 	}
 	if !observation.Final.Exists {
 		return recovery.saveOneSegOutcome(ctx, attemptID, core.OneSegResult{
+			Quality:      segment.Quality,
 			Availability: core.AvailabilityMissing, Reason: core.ReasonFileMissing,
 		})
 	}
 	if observation.Partial.Exists {
 		if observation.Partial.Size != segment.ByteCount || !observation.SameFile {
-			return recovery.saveOneSegOutcome(ctx, attemptID, oneSegMismatch(segment.ByteCount))
+			return recovery.saveOneSegOutcome(ctx, attemptID, oneSegMismatch(segment.ByteCount, segment.Quality))
 		}
 		if err := recovery.Files.SyncDirectory(segment.Plan); err != nil {
 			return recovery.saveOneSegOutcome(ctx, attemptID, core.OneSegResult{
+				Quality:   segment.Quality,
 				ByteCount: segment.ByteCount, Availability: core.AvailabilityPartial,
 				Reason: core.ReasonFileSyncFailed, FileSynced: segment.FileSynced,
 			})
 		}
 		if err := recovery.Files.RemovePartial(segment.Plan); err != nil {
 			return recovery.saveOneSegOutcome(ctx, attemptID, core.OneSegResult{
+				Quality:   segment.Quality,
 				ByteCount: segment.ByteCount, Availability: core.AvailabilityPartial,
 				Reason: core.ReasonFinalPublicationFailed, FileSynced: segment.FileSynced,
 			})
 		}
 		if err := recovery.Files.SyncDirectory(segment.Plan); err != nil {
 			return recovery.saveOneSegOutcome(ctx, attemptID, core.OneSegResult{
+				Quality:   segment.Quality,
 				ByteCount: segment.ByteCount, Availability: core.AvailabilityPartial,
 				Reason: core.ReasonFileSyncFailed, FileSynced: segment.FileSynced,
 			})
@@ -357,6 +367,7 @@ func (recovery Recovery) completeOneSegPublication(ctx context.Context, attemptI
 ) error {
 	if err := recovery.Files.SyncDirectory(segment.Plan); err != nil {
 		return recovery.saveOneSegOutcome(ctx, attemptID, core.OneSegResult{
+			Quality:   segment.Quality,
 			ByteCount: segment.ByteCount, Availability: core.AvailabilityPartial,
 			Reason: core.ReasonFileSyncFailed, FileSynced: segment.FileSynced,
 		})
@@ -364,12 +375,14 @@ func (recovery Recovery) completeOneSegPublication(ctx context.Context, attemptI
 	if removePartial {
 		if err := recovery.Files.RemovePartial(segment.Plan); err != nil {
 			return recovery.saveOneSegOutcome(ctx, attemptID, core.OneSegResult{
+				Quality:   segment.Quality,
 				ByteCount: segment.ByteCount, Availability: core.AvailabilityPartial,
 				Reason: core.ReasonFinalPublicationFailed, FileSynced: segment.FileSynced,
 			})
 		}
 		if err := recovery.Files.SyncDirectory(segment.Plan); err != nil {
 			return recovery.saveOneSegOutcome(ctx, attemptID, core.OneSegResult{
+				Quality:   segment.Quality,
 				ByteCount: segment.ByteCount, Availability: core.AvailabilityPartial,
 				Reason: core.ReasonFileSyncFailed, FileSynced: segment.FileSynced,
 			})
@@ -387,6 +400,7 @@ func (recovery Recovery) saveOneSegPublicationFailure(ctx context.Context, attem
 	segment core.RecoverySegment, publicationErr error,
 ) error {
 	result := core.OneSegResult{
+		Quality:   segment.Quality,
 		ByteCount: segment.ByteCount, Availability: core.AvailabilityPartial,
 		Reason: core.ReasonFinalPublicationFailed, FileSynced: segment.FileSynced,
 	}
@@ -406,8 +420,9 @@ func (recovery Recovery) saveOneSegOutcome(ctx context.Context, attemptID catalo
 	return nil
 }
 
-func oneSegMismatch(byteCount int64) core.OneSegResult {
+func oneSegMismatch(byteCount int64, quality core.QualitySummary) core.OneSegResult {
 	return core.OneSegResult{
+		Quality:   quality,
 		ByteCount: byteCount, Availability: core.AvailabilityMismatched,
 		Reason: core.ReasonFileIntegrityMismatch,
 	}
@@ -448,6 +463,7 @@ func (recovery Recovery) reconcileSettledOneSeg(ctx context.Context, attemptID c
 		return nil
 	}
 	result := core.OneSegResult{
+		Quality:   segment.Quality,
 		ByteCount: segment.ByteCount, Availability: availability, Reason: reason,
 		FileSynced: segment.FileSynced,
 	}
@@ -498,3 +514,10 @@ func settledOneSegAvailability(segment core.RecoverySegment,
 func (recovery Recovery) now() time.Time { return recovery.Clock.Now().UTC() }
 
 func invalidFact(fact core.FileFact) bool { return fact.Exists && (!fact.Regular || fact.Size < 0) }
+
+func interruptedQuality(quality core.QualitySummary) core.QualitySummary {
+	if quality.Status != core.QualityDegraded {
+		quality.Status = core.QualityUnknown
+	}
+	return quality
+}

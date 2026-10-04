@@ -15,6 +15,81 @@ for accepted in /opt/sazanami-dvr /etc/sazanami-dvr /var/lib/sazanami-dvr; do
   check_purge_target "$accepted"
 done
 
+transition_root=$(mktemp -d)
+trap 'rm -rf -- "$transition_root"' EXIT HUP INT TERM
+helper_root="$transition_root/helper"
+candidate_root="$transition_root/candidate"
+transition_trace="$transition_root/trace"
+(
+  ensure_current() {
+    case "$1" in
+      "$helper_root/sazanami-dvr") printf 'helper\n' >> "$transition_trace" ;;
+      "$candidate_root/sazanami-dvr") printf 'candidate\n' >> "$transition_trace" ;;
+      *) return 1 ;;
+    esac
+  }
+  advance_to_candidate
+)
+printf 'helper\ncandidate\n' > "$transition_root/expected"
+cmp "$transition_root/expected" "$transition_trace"
+: > "$transition_trace"
+if (
+  ensure_current() {
+    case "$1" in
+      "$helper_root/sazanami-dvr") printf 'helper\n' >> "$transition_trace"; return 1 ;;
+      "$candidate_root/sazanami-dvr") printf 'candidate\n' >> "$transition_trace" ;;
+      *) return 1 ;;
+    esac
+  }
+  advance_to_candidate
+); then
+  printf 'helperの失敗後に候補版へ進みました\n' >&2
+  exit 1
+fi
+printf 'helper\n' > "$transition_root/expected"
+cmp "$transition_root/expected" "$transition_trace"
+[ "$baseline_version" = 0.5.0 ]
+[ "$baseline_commit" = 0b90ee4d5cdd137c23cdb966649e436db0170ea8 ]
+repository_root=$(CDPATH= cd -- "$script_root/../.." && pwd)
+grep -Fx '            https://github.com/g0ooo0gle/sazanami-dvr/releases/download/v0.5.0/sazanami-dvr_0.5.0_linux_amd64.tar.gz' \
+  "$repository_root/.github/workflows/ci.yml" >/dev/null
+for helper_failure in initial-status migrate final-status; do
+  : > "$transition_trace"
+  (
+    helper_state=BEHIND
+    run_as_service() {
+      if [ "$1" = "$candidate_root/sazanami-dvr" ]; then
+        printf 'candidate\n' >> "$transition_trace"
+        printf 'state=CURRENT\n'
+        return 0
+      fi
+      case "$3" in
+        status)
+          printf 'state=%s\n' "$helper_state"
+          if [ "$helper_failure" = initial-status ] ||
+            { [ "$helper_state" = CURRENT ] && [ "$helper_failure" = final-status ]; }; then
+            return 23
+          fi
+          ;;
+        migrate)
+          helper_state=CURRENT
+          if [ "$helper_failure" = migrate ]; then return 23; fi
+          ;;
+        *) return 24 ;;
+      esac
+    }
+    transition_result=0
+    advance_to_candidate || transition_result=$?
+    if [ "$transition_result" -ne 23 ] || [ -s "$transition_trace" ]; then
+      printf 'helper %sの失敗を無視しました: status=%s\n' "$helper_failure" "$transition_result" >&2
+      exit 1
+    fi
+  )
+done
+rm -rf -- "$transition_root"
+transition_root=
+trap - EXIT HUP INT TERM
+
 ownership_root=$(mktemp -d)
 trap 'rm -rf -- "$ownership_root"' EXIT HUP INT TERM
 mkdir -p "$ownership_root/install/v1/packaging/systemd" "$ownership_root/outside"

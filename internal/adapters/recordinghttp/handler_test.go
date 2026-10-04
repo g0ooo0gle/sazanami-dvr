@@ -8,17 +8,156 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/g0ooo0gle/sazanami-dvr/internal/core/catalogmodel"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/provider"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/recording"
 )
 
 var logoPNG = []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 1, 2, 3}
+
+func TestQualityAllReadSurfacesAgree(t *testing.T) {
+	data := make([]byte, 376)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	for _, kind := range []string{"normal", "degraded", "stopped", "EOF", "timeout", "exhausted", "legacy-partial", "missing-token", "missing-directory", "unavailable"} {
+		t.Run(kind, func(t *testing.T) {
+			item := httpHistoryItemWithBytes(7, 376)
+			want := true
+			switch kind {
+			case "degraded":
+				item.Quality = recording.QualitySummary{Status: recording.QualityDegraded, TEIPackets: 3}
+			case "stopped":
+				item.State, item.Reason = recording.AttemptPartial, recording.ReasonUserRequestedStop
+			case "EOF", "timeout", "exhausted", "missing-token", "missing-directory":
+				item.State, item.Reason = recording.AttemptPartial, recording.ReasonStreamEndedEarly
+				if kind == "timeout" {
+					item.Reason = recording.ReasonStreamTimeout
+				}
+				if kind == "exhausted" {
+					item.Reason = recording.ReasonStreamReconnectExhausted
+				}
+				item.PlannedState, item.PlannedReason = item.State, item.Reason
+				item.FinalizationToken = catalogmodel.ID{1}
+				item.Quality = recording.QualitySummary{Status: recording.QualityDegraded, ReconnectCount: 3}
+				if kind == "missing-token" {
+					item.FinalizationToken = catalogmodel.ID{}
+					want = false
+				}
+				if kind == "missing-directory" {
+					item.DirectorySynced = false
+					want = false
+				}
+			case "legacy-partial", "unavailable":
+				item.State, item.Reason, want = recording.AttemptPartial, recording.ReasonStreamEndedEarly, false
+				if kind == "unavailable" {
+					item.Reason = recording.ReasonStreamUnavailable
+				}
+			}
+			handler, err := NewHandler(&fakeHistory{items: []recording.HistoryItem{item}}, &fakeFiles{data: data})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, path := range []string{"/api/recordings/7", "/api/recordings"} {
+				response := serve(handler, http.MethodGet, path, nil)
+				var value map[string]json.RawMessage
+				if err := json.Unmarshal(response.Body.Bytes(), &value); err != nil {
+					t.Fatal(err)
+				}
+				if path == "/api/recordings" {
+					var list []map[string]json.RawMessage
+					if err := json.Unmarshal(value["recordings"], &list); err != nil || len(list) != 1 {
+						t.Fatalf("list=%v err=%v", list, err)
+					}
+					value = list[0]
+				}
+				var playable bool
+				if err := json.Unmarshal(value["playable"], &playable); err != nil || playable != want {
+					t.Fatalf("playable=%t want=%t err=%v", playable, want, err)
+				}
+				var quality map[string]json.RawMessage
+				if err := json.Unmarshal(value["quality"], &quality); err != nil || len(quality) != 19 {
+					t.Fatalf("quality=%s err=%v", value["quality"], err)
+				}
+				if string(quality["status"]) != `"`+item.Quality.Status.String()+`"` || string(quality["tei_packets"]) != strconv.FormatInt(item.Quality.TEIPackets, 10) ||
+					bytes.Contains(response.Body.Bytes(), []byte("finalization_token")) || bytes.Contains(response.Body.Bytes(), []byte(item.Plan.FinalPath)) {
+					t.Fatalf("projection=%s", response.Body.String())
+				}
+			}
+			status := http.StatusOK
+			if !want {
+				status = http.StatusNotFound
+			}
+			for _, method := range []string{http.MethodGet, http.MethodHead} {
+				response := serve(handler, method, "/recordings/7.ts", nil)
+				if response.Code != status {
+					t.Fatalf("%s code=%d want=%d", method, response.Code, status)
+				}
+				if want && method == http.MethodGet && !bytes.Equal(response.Body.Bytes(), data) {
+					t.Fatal("full bytes differ")
+				}
+				if want && method == http.MethodHead && response.Body.Len() != 0 {
+					t.Fatal("HEAD body")
+				}
+			}
+			for _, test := range []struct {
+				header      string
+				first, last int
+			}{{"bytes=0-31", 0, 32}, {"bytes=180-200", 180, 201}, {"bytes=-16", 360, 376}} {
+				response := serve(handler, http.MethodGet, "/recordings/7.ts", map[string]string{"Range": test.header})
+				if want && (response.Code != http.StatusPartialContent || !bytes.Equal(response.Body.Bytes(), data[test.first:test.last])) {
+					t.Fatalf("range=%s code=%d", test.header, response.Code)
+				}
+				if !want && response.Code != http.StatusNotFound {
+					t.Fatalf("private range=%d", response.Code)
+				}
+			}
+			if response := serve(handler, http.MethodGet, "/komorebi/resolver.lua?id=7", nil); response.Code != status {
+				t.Fatalf("resolver=%d", response.Code)
+			}
+		})
+	}
+}
+
+func TestQualityNativeProjectionHasAllFixedFields(t *testing.T) {
+	item := httpHistoryItem(7)
+	item.Quality = recording.QualitySummary{Status: recording.QualityDegraded, SelectionUnverified: true,
+		ObservationLimited: true, CountersSaturated: true, CCGapEvents: 2147483647, CCDuplicateEvents: 2,
+		TEIPackets: 3, MalformedPacketEvents: 4, PSIContinuityEvents: 5, PSICRCEvents: 6,
+		PSIStructureEvents: 7, PSILimitEvents: 8, SyncLossEvents: 9, SyncRecoveredEvents: 10,
+		SyncDiscardedBytes: 11, TrailingIncompleteBytes: 12, UnfinishedPSIEvents: 13, FallbackEvents: 1, ReconnectCount: 3}
+	handler, err := NewHandler(&fakeHistory{items: []recording.HistoryItem{item}}, &fakeFiles{data: make([]byte, 188)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := serve(handler, http.MethodGet, "/api/recordings/7", nil)
+	var value struct {
+		Quality map[string]json.RawMessage `json:"quality"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &value); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"status": `"DEGRADED"`, "selection_unverified": "true", "observation_limited": "true", "counters_saturated": "true",
+		"cc_gap_events": "2147483647", "cc_duplicate_events": "2", "tei_packets": "3", "malformed_packet_events": "4",
+		"psi_continuity_events": "5", "psi_crc_events": "6", "psi_structure_events": "7", "psi_limit_events": "8",
+		"sync_loss_events": "9", "sync_recovered_events": "10", "sync_discarded_bytes": "11", "trailing_incomplete_bytes": "12",
+		"unfinished_psi_events": "13", "fallback_events": "1", "reconnect_count": "3"}
+	if len(value.Quality) != 19 {
+		t.Fatalf("quality=%v", value.Quality)
+	}
+	for key, expected := range want {
+		if string(value.Quality[key]) != expected {
+			t.Fatalf("%s=%s want=%s", key, value.Quality[key], expected)
+		}
+	}
+}
 
 func TestNativeHistoryResolverAndRelatedAssets(t *testing.T) {
 	item := httpHistoryItem(7)

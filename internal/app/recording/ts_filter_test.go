@@ -2,9 +2,9 @@ package recording
 
 import (
 	"bytes"
-	"errors"
 	"testing"
 
+	core "github.com/g0ooo0gle/sazanami-dvr/internal/core/recording"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/mpegts"
 )
 
@@ -12,6 +12,11 @@ type tsBufferFile struct{ bytes.Buffer }
 
 func (file *tsBufferFile) Sync() error  { return nil }
 func (file *tsBufferFile) Close() error { return nil }
+
+func finishFilterForTest(filter *tsComponentFilter) error {
+	_, err := filter.Finish(true)
+	return err
+}
 
 type testStream struct {
 	typeValue  byte
@@ -23,7 +28,7 @@ func TestTSComponentFilterSelectsPIDsWithArbitraryReads(t *testing.T) {
 	streams := []testStream{{0x1b, 0x101, nil}, {0x06, 0x102, nil}, {0x0d, 0x103, nil}, {0x0f, 0x104, nil}}
 	input := testTransportStream(t, streams)
 	file := &tsBufferFile{}
-	filter := newTSComponentFilter(file, true, false)
+	filter := newTSComponentFilter(file, true, false, core.QualitySummary{})
 	for offset, sizeIndex := 0, 0; offset < len(input); sizeIndex++ {
 		sizes := [...]int{1, 187, 23, 401, 17}
 		size := min(sizes[sizeIndex%len(sizes)], len(input)-offset)
@@ -32,7 +37,7 @@ func TestTSComponentFilterSelectsPIDsWithArbitraryReads(t *testing.T) {
 		}
 		offset += size
 	}
-	if err := filter.Finish(); err != nil {
+	if err := finishFilterForTest(filter); err != nil {
 		t.Fatal(err)
 	}
 	got := file.Bytes()
@@ -64,8 +69,8 @@ func TestTSComponentFilterFourSelectionsAndPMTUpdate(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			file := &tsBufferFile{}
-			filter := newTSComponentFilter(file, test.captions, test.data)
-			if _, err := filter.Write(testTransportStream(t, base)); err != nil || filter.Finish() != nil {
+			filter := newTSComponentFilter(file, test.captions, test.data, core.QualitySummary{})
+			if _, err := filter.Write(testTransportStream(t, base)); err != nil || finishFilterForTest(filter) != nil {
 				t.Fatal(err)
 			}
 			pids := packetPIDsForTest(t, file.Bytes())
@@ -76,12 +81,12 @@ func TestTSComponentFilterFourSelectionsAndPMTUpdate(t *testing.T) {
 	}
 
 	file := &tsBufferFile{}
-	filter := newTSComponentFilter(file, false, false)
+	filter := newTSComponentFilter(file, false, false, core.QualitySummary{})
 	initial := testTransportStream(t, base)
 	updatedSection := makePMTSection(t, []testStream{{0x1b, 0x101, nil}, {0x06, 0x105, nil}, {0x0d, 0x106, nil}})
 	updated := append(packetizeSectionForTest(0x100, 4, updatedSection), makePayloadPacket(0x105)...)
 	updated = append(updated, makePayloadPacket(0x106)...)
-	if _, err := filter.Write(append(initial, updated...)); err != nil || filter.Finish() != nil {
+	if _, err := filter.Write(append(initial, updated...)); err != nil || finishFilterForTest(filter) != nil {
 		t.Fatal(err)
 	}
 	pids := packetPIDsForTest(t, file.Bytes())
@@ -106,8 +111,8 @@ func TestTSComponentFilterHandlesMultiPacketPMT(t *testing.T) {
 	streams := []testStream{{0x1b, 0x101, descriptor}, {0x06, 0x102, nil}, {0x0d, 0x103, nil}}
 	input := testTransportStream(t, streams)
 	file := &tsBufferFile{}
-	filter := newTSComponentFilter(file, true, false)
-	if _, err := filter.Write(input); err != nil || filter.Finish() != nil {
+	filter := newTSComponentFilter(file, true, false, core.QualitySummary{})
+	if _, err := filter.Write(input); err != nil || finishFilterForTest(filter) != nil {
 		t.Fatal(err)
 	}
 	section := pmtSectionFromPackets(t, file.Bytes(), 0x100)
@@ -127,56 +132,60 @@ func TestTSComponentFilterHandlesMultiPacketPMT(t *testing.T) {
 	}
 }
 
-func TestTSComponentFilterRejectsMalformedAndBoundaries(t *testing.T) {
+func TestTSComponentFilterWarnsOnMalformedAndBoundaries(t *testing.T) {
 	for _, test := range []struct {
 		name string
 		data []byte
 	}{
-		{"wrong sync", bytes.Repeat([]byte{0}, tsPacketBytes)},
+		{"wrong sync", bytes.Repeat([]byte{0}, 188)},
 		{"two programs", append(packetizeSectionForTest(0, 0, makePATSection(t, []uint16{1, 2})), makePayloadPacket(0x101)...)},
 		{"pointer over", invalidPointerPacket()},
 		{"section over", oversizedSectionPacket()},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			filter := newTSComponentFilter(&tsBufferFile{}, true, false)
-			if _, err := filter.Write(test.data); !errors.Is(err, errTSFormat) {
-				t.Fatalf("err=%v", err)
+			file := &tsBufferFile{}
+			filter := newTSComponentFilter(file, true, false, core.QualitySummary{})
+			if _, err := filter.Write(test.data); err != nil {
+				t.Fatal(err)
+			}
+			if err := finishFilterForTest(filter); err != nil {
+				t.Fatal(err)
+			}
+			if filter.Quality().Status != core.QualityDegraded || file.Len()%188 != 0 {
+				t.Fatalf("quality=%+v bytes=%d", filter.Quality(), file.Len())
 			}
 		})
 	}
-	filter := newTSComponentFilter(&tsBufferFile{}, true, false)
+	filter := newTSComponentFilter(&tsBufferFile{}, true, false, core.QualitySummary{})
 	if _, err := filter.Write(make([]byte, 187)); err != nil {
 		t.Fatal(err)
 	}
-	if !errors.Is(filter.Finish(), errTSFormat) {
-		t.Fatal("truncated packetが受理されました")
+	if err := finishFilterForTest(filter); err != nil || filter.Quality().TrailingIncompleteBytes != 187 {
+		t.Fatalf("tail quality=%+v err=%v", filter.Quality(), err)
 	}
-
 	badCRC := testTransportStream(t, []testStream{{0x1b, 0x101, nil}})
 	badCRC[20] ^= 1
-	filter = newTSComponentFilter(&tsBufferFile{}, true, false)
-	if _, err := filter.Write(badCRC); !errors.Is(err, errTSFormat) {
-		t.Fatalf("CRC err=%v", err)
+	filter = newTSComponentFilter(&tsBufferFile{}, true, false, core.QualitySummary{})
+	if _, err := filter.Write(badCRC); err != nil {
+		t.Fatal(err)
 	}
-
+	if err := finishFilterForTest(filter); err != nil || filter.Quality().PSICRCEvents != 1 {
+		t.Fatalf("CRC quality=%+v err=%v", filter.Quality(), err)
+	}
 	many := make([]testStream, maxElementaryPIDs+1)
 	for index := range many {
 		many[index] = testStream{0x1b, uint16(0x101 + index), nil}
 	}
-	filter = newTSComponentFilter(&tsBufferFile{}, true, false)
-	if _, err := filter.Write(testTransportStream(t, many)); !errors.Is(err, errTSFormat) {
-		t.Fatalf("stream one-over err=%v", err)
+	filter = newTSComponentFilter(&tsBufferFile{}, true, false, core.QualitySummary{})
+	if _, err := filter.Write(testTransportStream(t, many)); err != nil || filter.Quality().FallbackEvents != 1 {
+		t.Fatalf("entry quality=%+v err=%v", filter.Quality(), err)
 	}
-
 	nullPacket := makePayloadPacket(0x1fff)
-	data := bytes.Repeat(nullPacket, maxPSIBuffer/tsPacketBytes)
-	data = append(data, bytes.Repeat([]byte{0xff}, maxPSIBuffer-len(data))...)
-	filter = newTSComponentFilter(&tsBufferFile{}, true, false)
-	if _, err := filter.Write(data); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := filter.Write([]byte{0}); !errors.Is(err, errTSFormat) {
-		t.Fatalf("one-over err=%v", err)
+	data := bytes.Repeat(nullPacket, maxPSIBuffer/188+1)
+	file := &tsBufferFile{}
+	filter = newTSComponentFilter(file, true, false, core.QualitySummary{})
+	if _, err := filter.Write(data); err != nil || !bytes.Equal(file.Bytes(), data) || filter.Quality().FallbackEvents != 1 {
+		t.Fatalf("buffer quality=%+v err=%v", filter.Quality(), err)
 	}
 }
 
@@ -191,7 +200,7 @@ func TestTSComponentFilterKeepsPCRReservedBitsAcrossDiscoveryAndRecording(t *tes
 	input = append(input, makePayloadPacket(0x102)...)
 	input = append(input, makePayloadPacket(0x103)...)
 	file := &tsBufferFile{}
-	filter := newTSComponentFilter(file, true, false)
+	filter := newTSComponentFilter(file, true, false, core.QualitySummary{})
 	for offset := 0; offset < len(input); {
 		end := min(len(input), offset+187)
 		if _, err := filter.Write(input[offset:end]); err != nil {
@@ -199,7 +208,7 @@ func TestTSComponentFilterKeepsPCRReservedBitsAcrossDiscoveryAndRecording(t *tes
 		}
 		offset = end
 	}
-	if err := filter.Finish(); err != nil {
+	if err := finishFilterForTest(filter); err != nil {
 		t.Fatal(err)
 	}
 	if got := packetPIDsForTest(t, file.Bytes()); !equalPIDs(got, []uint16{0x101, 0, 0x101, 0x100, 0x101, 0x102}) ||
@@ -212,7 +221,7 @@ func TestTSComponentFilterKeepsInterleavedPacketsDuringPMT(t *testing.T) {
 	for _, phase := range []string{"initial", "update"} {
 		t.Run(phase, func(t *testing.T) {
 			file := &tsBufferFile{}
-			filter := newTSComponentFilter(file, true, false)
+			filter := newTSComponentFilter(file, true, false, core.QualitySummary{})
 			continuity := byte(3)
 			var input []byte
 			wantPIDs := []uint16{0, 0x100, 0x100, 0x101, 0x102, 0x101}
@@ -240,7 +249,7 @@ func TestTSComponentFilterKeepsInterleavedPacketsDuringPMT(t *testing.T) {
 			if _, err := filter.Write(input); err != nil {
 				t.Fatal(err)
 			}
-			if err := filter.Finish(); err != nil {
+			if err := finishFilterForTest(filter); err != nil {
 				t.Fatal(err)
 			}
 			if got := packetPIDsForTest(t, file.Bytes()); !equalPIDs(got, wantPIDs) ||

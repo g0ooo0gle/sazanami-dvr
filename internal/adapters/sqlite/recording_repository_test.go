@@ -481,7 +481,7 @@ func TestReservationFollowExtendsActiveRecording(t *testing.T) {
 				t.Fatalf("state=%s version=%d end=%d", persistedState, stateVersion, endMS)
 			}
 			if state == recording.AttemptRecording {
-				end, err := store.UpdateRecordingProgress(context.Background(), attemptID, 188, claim.Now.Add(4*time.Second))
+				end, err := store.UpdateRecordingProgress(context.Background(), attemptID, 188, claim.Now.Add(4*time.Second), recording.QualitySummary{})
 				if err != nil || !end.Equal(reservation.Program.Start.Add(40*time.Minute+recording.DefaultEndMargin)) {
 					t.Fatalf("progress end=%s err=%v", end, err)
 				}
@@ -543,7 +543,7 @@ func TestReservationFollowReconcilesActiveTimeUnlessExtensionOnlyOrFinalizing(t 
 				}
 			}
 			if test.finalizing {
-				if _, err := store.UpdateRecordingProgress(context.Background(), attemptID, 188, now.Add(3*time.Second)); err != nil {
+				if _, err := store.UpdateRecordingProgress(context.Background(), attemptID, 188, now.Add(3*time.Second), recording.QualitySummary{}); err != nil {
 					t.Fatal(err)
 				}
 				if _, err := store.BeginFinalization(context.Background(), recording.FinalizeRequest{
@@ -950,10 +950,10 @@ func TestRecordingAttemptLifecycle(t *testing.T) {
 	if _, err := store.RecordingStarted(context.Background(), claim.AttemptID, now.Add(2*time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.UpdateRecordingProgress(context.Background(), claim.AttemptID, 376, now.Add(3*time.Second)); err != nil {
+	if _, err := store.UpdateRecordingProgress(context.Background(), claim.AttemptID, 376, now.Add(3*time.Second), recording.QualitySummary{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.UpdateRecordingProgress(context.Background(), claim.AttemptID, 188, now.Add(4*time.Second)); !errors.Is(err, ErrAttemptState) {
+	if _, err := store.UpdateRecordingProgress(context.Background(), claim.AttemptID, 188, now.Add(4*time.Second), recording.QualitySummary{}); !errors.Is(err, ErrAttemptState) {
 		t.Fatalf("減少したbyte数が受理されました: %v", err)
 	}
 	finalize := recording.FinalizeRequest{
@@ -1252,10 +1252,10 @@ func TestOneSegLifecycleKeepsMainByteCountAndSettlesBothSegments(t *testing.T) {
 	if err := store.OneSegRecordingStarted(context.Background(), request.AttemptID, now.Add(3*time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.UpdateRecordingProgress(context.Background(), request.AttemptID, 376, now.Add(4*time.Second)); err != nil {
+	if _, err := store.UpdateRecordingProgress(context.Background(), request.AttemptID, 376, now.Add(4*time.Second), recording.QualitySummary{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.UpdateOneSegProgress(context.Background(), request.AttemptID, 188, now.Add(5*time.Second)); err != nil {
+	if _, err := store.UpdateOneSegProgress(context.Background(), request.AttemptID, 188, now.Add(5*time.Second), recording.QualitySummary{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.BeginFinalization(context.Background(), recording.FinalizeRequest{
@@ -1362,10 +1362,10 @@ func TestSettledOneSegAvailabilityCanReturnFromMissingToPartial(t *testing.T) {
 	if err := store.OneSegRecordingStarted(context.Background(), attemptID, now.Add(3*time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.UpdateRecordingProgress(context.Background(), attemptID, 376, now.Add(4*time.Second)); err != nil {
+	if _, err := store.UpdateRecordingProgress(context.Background(), attemptID, 376, now.Add(4*time.Second), recording.QualitySummary{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.UpdateOneSegProgress(context.Background(), attemptID, 188, now.Add(5*time.Second)); err != nil {
+	if _, err := store.UpdateOneSegProgress(context.Background(), attemptID, 188, now.Add(5*time.Second), recording.QualitySummary{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.BeginFinalization(context.Background(), recording.FinalizeRequest{
@@ -1663,7 +1663,7 @@ func TestUserStopIsPersistedIdempotentlyAndPublishesOnlyItsPartialRecording(t *t
 	if _, err := store.RecordingStarted(context.Background(), claim.AttemptID, now.Add(4*time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.UpdateRecordingProgress(context.Background(), claim.AttemptID, 376, now.Add(5*time.Second)); err != nil {
+	if _, err := store.UpdateRecordingProgress(context.Background(), claim.AttemptID, 376, now.Add(5*time.Second), recording.QualitySummary{}); err != nil {
 		t.Fatal(err)
 	}
 	normal := recording.FinalizeRequest{

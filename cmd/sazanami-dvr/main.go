@@ -259,6 +259,7 @@ func runRecordingCommand(ctx context.Context, arguments []string, stdout, stderr
 		Store: store, Stream: streamAdapter, Files: files, Clock: recordingClock,
 		NewID: catalogmodel.NewID, OwnerID: ownerID, Generation: 1,
 		FollowExtensionOnly: *followExtensionOnly,
+		ObserveQuality:      observeRecordingQuality(stderr),
 		PostRecording: func(runContext context.Context, request recordingapp.PostRecordingRequest) string {
 			return postRecordingRunner.Run(runContext, request.Script, postrecordingadapter.Environment{
 				RecordingNumber: request.RecordingNumber, RecordingFile: request.FinalPath,

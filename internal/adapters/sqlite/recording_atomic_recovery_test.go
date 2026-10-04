@@ -19,6 +19,162 @@ import (
 	core "github.com/g0ooo0gle/sazanami-dvr/internal/core/recording"
 )
 
+func TestQualityFinalizeCrashReadback(t *testing.T) {
+	for _, reason := range []core.TerminalReason{core.ReasonStreamEndedEarly, core.ReasonStreamTimeout, core.ReasonStreamReconnectExhausted} {
+		for _, window := range []string{"pre-plan", "plan", "rename", "published", "directory", "terminal", "unplanned-terminal"} {
+			t.Run(string(reason)+"/"+window, func(t *testing.T) {
+				ctx := context.Background()
+				dataRoot, store := openMigratedStore(t)
+				claim, reservation, now := qualityRunningAttempt(t, store)
+				q := core.QualitySummary{Status: core.QualityDegraded, ObservationLimited: true, TEIPackets: 3, ReconnectCount: 2}
+				aux := core.QualitySummary{Status: core.QualityNoIssuesObserved}
+				rootPath := filepath.Join(t.TempDir(), "recordings")
+				root, err := recordingfs.OpenRoot(rootPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for ordinal, plan := range []core.FilePlan{claim.Plan, *claim.OneSegPlan} {
+					file, err := root.CreatePartial(plan)
+					if err != nil {
+						t.Fatal(err)
+					}
+					length := 376
+					if ordinal == 1 {
+						length = 188
+					}
+					if _, err := file.Write(bytes.Repeat([]byte{0x47}, length)); err != nil {
+						t.Fatal(err)
+					}
+					if err := file.Sync(); err != nil {
+						t.Fatal(err)
+					}
+					if err := file.Close(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if _, err := store.UpdateRecordingProgress(ctx, claim.AttemptID, 376, now.Add(time.Second), q); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := store.UpdateOneSegProgress(ctx, claim.AttemptID, 188, now.Add(time.Second), aux); err != nil {
+					t.Fatal(err)
+				}
+				planned := window != "pre-plan" && window != "unplanned-terminal"
+				if planned {
+					if _, err := store.BeginFinalization(ctx, core.FinalizeRequest{AttemptID: claim.AttemptID, Token: testID(t, 204),
+						State: core.AttemptPartial, Reason: reason, ByteCount: 376, Now: now.Add(2 * time.Second), Quality: q,
+						OneSeg: &core.OneSegResult{ByteCount: 188, Reason: core.ReasonCompleted, Availability: core.AvailabilityPartial,
+							FileSynced: true, Publish: true, Quality: aux}}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if window == "rename" || window == "published" || window == "directory" || window == "terminal" {
+					if err := root.LinkFinal(claim.Plan); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if window == "published" || window == "directory" || window == "terminal" {
+					if err := store.MarkFinalPublished(ctx, claim.AttemptID, now.Add(3*time.Second)); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if window == "directory" || window == "terminal" {
+					if err := root.SyncDirectory(claim.Plan); err != nil {
+						t.Fatal(err)
+					}
+					if err := root.RemovePartial(claim.Plan); err != nil {
+						t.Fatal(err)
+					}
+					if err := root.SyncDirectory(claim.Plan); err != nil {
+						t.Fatal(err)
+					}
+					if err := store.MarkDirectorySynced(ctx, claim.AttemptID, now.Add(3*time.Second)); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if window == "terminal" {
+					if err := root.LinkFinal(*claim.OneSegPlan); err != nil {
+						t.Fatal(err)
+					}
+					if err := store.MarkOneSegFinalPublished(ctx, claim.AttemptID, now.Add(3*time.Second)); err != nil {
+						t.Fatal(err)
+					}
+					if err := root.SyncDirectory(*claim.OneSegPlan); err != nil {
+						t.Fatal(err)
+					}
+					if err := root.RemovePartial(*claim.OneSegPlan); err != nil {
+						t.Fatal(err)
+					}
+					if err := root.SyncDirectory(*claim.OneSegPlan); err != nil {
+						t.Fatal(err)
+					}
+					if err := store.MarkOneSegDirectorySynced(ctx, claim.AttemptID, now.Add(3*time.Second)); err != nil {
+						t.Fatal(err)
+					}
+					if err := store.FinishAttempt(ctx, core.FinishRequest{AttemptID: claim.AttemptID, State: core.AttemptPartial,
+						Reason: reason, ByteCount: 376, Availability: core.AvailabilityFinal, Now: now.Add(3 * time.Second), Quality: q}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if window == "unplanned-terminal" {
+					if err := store.FinishAttempt(ctx, core.FinishRequest{AttemptID: claim.AttemptID, State: core.AttemptPartial,
+						Reason: reason, ByteCount: 376, Availability: core.AvailabilityPartial, Now: now.Add(3 * time.Second), Quality: q,
+						OneSeg: &core.OneSegResult{ByteCount: 188, Reason: reason, Availability: core.AvailabilityPartial, Quality: aux}}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := store.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if err := root.Close(); err != nil {
+					t.Fatal(err)
+				}
+				store, err = OpenStore(ctx, dataRoot)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer store.Close()
+				root, err = recordingfs.OpenRoot(rootPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer root.Close()
+				clock := &e2eClock{now: now.Add(4 * time.Second)}
+				recovery := apprecording.Recovery{Store: store, Clock: clock, Files: apprecording.RecoveryFiles{
+					FileOperations: apprecording.FileOperations{
+						CreatePartial: func(plan core.FilePlan) (apprecording.PartialFile, error) { return root.CreatePartial(plan) },
+						LinkFinal:     root.LinkFinal, SyncDirectory: root.SyncDirectory, RemovePartial: root.RemovePartial}, Inspect: root.Inspect}}
+				for range 2 {
+					if err := recovery.Run(ctx); err != nil {
+						t.Fatal(err)
+					}
+				}
+				history, err := store.RecordingHistoryItem(ctx, reservation.Number)
+				if err != nil || history == nil || history.Quality != q || history.Playable() != planned {
+					t.Fatalf("history=%+v err=%v", history, err)
+				}
+				if planned && (history.Reason != reason || history.PlannedReason != reason || history.FinalizationToken == (catalogmodel.ID{})) {
+					t.Fatalf("plan lost: %+v", history)
+				}
+				observation, err := root.Inspect(claim.Plan)
+				if err != nil || planned && (!observation.Final.Exists || observation.Partial.Exists) || !planned && (observation.Final.Exists || !observation.Partial.Exists) {
+					t.Fatalf("files=%+v err=%v", observation, err)
+				}
+				reconciler := apprecording.CompletedReconciler{Store: store, Clock: clock, Inspect: root.Inspect}
+				result, _, err := reconciler.Run(ctx)
+				if err != nil || result.Changed != 0 {
+					t.Fatalf("reconcile=%+v err=%v", result, err)
+				}
+				if planned {
+					items, err := store.RecoveryAttempts(ctx, core.MaxRecoveryPage, catalogmodel.ID{})
+					if err != nil || len(items) != 1 || items[0].OneSeg == nil || items[0].OneSeg.Quality != aux || items[0].OneSeg.Availability != core.AvailabilityFinal {
+						t.Fatalf("aux=%+v err=%v", items, err)
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestAtomicPublicationBeforeDatabaseRecordSurvivesRestart(t *testing.T) {
 	for _, stopped := range []bool{false, true} {
 		for _, window := range []string{"main", "one-seg", "unsupported-main", "unsupported-one-seg"} {

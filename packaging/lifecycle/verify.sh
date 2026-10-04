@@ -3,6 +3,8 @@ set -eu
 
 baseline_commit=0b90ee4d5cdd137c23cdb966649e436db0170ea8
 baseline_version=0.5.0
+helper_commit=b36891cb4016a7d0a7242c3d6b65a380457d1ea1
+helper_version=1.3.6
 service_name=sazanami-dvr.service
 install_root=/opt/sazanami-dvr
 binary_link=/usr/local/bin/sazanami-dvr
@@ -90,7 +92,7 @@ preflight() {
   [ "$(id -u)" -eq 0 ] || fail "root-required"
   [ "$(uname -s)" = Linux ] || fail "linux-required"
   [ "$(uname -m)" = x86_64 ] || fail "linux-amd64-required"
-  for command_name in awk chown chmod cmp find getent go grep groupdel install ln mktemp python3 readlink rm runuser sed sort ss stat systemctl tar timeout useradd userdel; do
+  for command_name in awk chown chmod cmp find getent go grep groupdel install ln mktemp mv python3 readlink rm runuser sed sort ss stat systemctl tar timeout useradd userdel; do
     require_command "$command_name"
   done
   if getent passwd sazanami-dvr >/dev/null; then
@@ -224,18 +226,23 @@ run_as_service() {
 
 ensure_current() {
   database_binary=$1
-  status_output=$(run_as_service "$database_binary" db status --data-root "$data_root")
+  status_output=$(run_as_service "$database_binary" db status --data-root "$data_root") || return $?
   case "$status_output" in
     state=CURRENT*) return 0 ;;
     state=BEHIND*)
-      run_as_service "$database_binary" db migrate --data-root "$data_root"
-      status_output=$(run_as_service "$database_binary" db status --data-root "$data_root")
+      run_as_service "$database_binary" db migrate --data-root "$data_root" || return $?
+      status_output=$(run_as_service "$database_binary" db status --data-root "$data_root") || return $?
       case "$status_output" in
         state=CURRENT*) return 0 ;;
       esac
       ;;
   esac
   fail "database-not-current"
+}
+
+advance_to_candidate() {
+  ensure_current "$helper_root/sazanami-dvr" || return $?
+  ensure_current "$candidate_root/sazanami-dvr"
 }
 
 switch_release() {
@@ -275,30 +282,37 @@ main() {
     preflight
     return
   fi
-  [ "$#" -eq 4 ] || fail "usage: verify.sh <v0.5.0-archive> <candidate-archive> <candidate-sha> <candidate-version>"
+  [ "$#" -eq 5 ] || fail "usage: verify.sh <v0.5.0-archive> <v1.3.6-helper-archive> <candidate-archive> <candidate-sha> <candidate-version>"
   baseline_archive=$1
-  candidate_archive=$2
-  candidate_commit=$3
-  candidate_version=$4
+  helper_archive=$2
+  candidate_archive=$3
+  candidate_commit=$4
+  candidate_version=$5
   printf '%s\n' "$candidate_commit" | grep -Eq '^[0-9a-f]{40}$' || fail "candidate-commit-invalid"
   printf '%s\n' "$candidate_version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' ||
     fail "candidate-version-invalid"
 
   preflight
-  owned_resources=1
   trap cleanup EXIT
   trap 'exit 129' HUP
   trap 'exit 130' INT
   trap 'exit 143' TERM
   work_root=$(mktemp -d /run/sazanami-dvr-lifecycle.XXXXXX)
   baseline_root="$install_root/$baseline_version"
+  helper_root="$install_root/$helper_version"
   candidate_root="$install_root/candidate-${candidate_commit%${candidate_commit#????????????}}"
 
-  install -d -o root -g root -m 0755 "$install_root"
   validate_archive "$baseline_archive" "$baseline_commit" "$baseline_version" 0 \
-    "$work_root/baseline.list" "$baseline_root"
+    "$work_root/baseline.list" "$work_root/baseline"
+  validate_archive "$helper_archive" "$helper_commit" "$helper_version" 1 \
+    "$work_root/helper.list" "$work_root/helper"
   validate_archive "$candidate_archive" "$candidate_commit" "$candidate_version" 1 \
-    "$work_root/candidate.list" "$candidate_root"
+    "$work_root/candidate.list" "$work_root/candidate"
+  owned_resources=1
+  install -d -o root -g root -m 0755 "$install_root"
+  mv -- "$work_root/baseline" "$baseline_root"
+  mv -- "$work_root/helper" "$helper_root"
+  mv -- "$work_root/candidate" "$candidate_root"
   start_provider "$candidate_root"
 
   useradd --system --user-group --home-dir "$data_root" --shell /usr/sbin/nologin sazanami-dvr
@@ -353,7 +367,7 @@ PY
   printf '%s\n' "$backup_id" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' ||
     fail "backup-id-missing"
 
-  ensure_current "$candidate_root/sazanami-dvr"
+  advance_to_candidate
   rm -f -- "$data_root/channels.json"
   require_absent "$data_root/channels.json"
   setup_output=$(run_as_service "$candidate_root/sazanami-dvr" setup \
@@ -378,7 +392,7 @@ PY
   switch_release "$baseline_root"
   wait_for_service
   systemctl stop "$service_name"
-  ensure_current "$candidate_root/sazanami-dvr"
+  advance_to_candidate
   switch_release "$candidate_root"
   wait_for_service
   systemctl stop "$service_name"
@@ -414,7 +428,7 @@ PY
   remove_work_root
   owned_resources=0
   completed=1
-  printf 'Linux lifecycle確認を完了しました: baseline=%s candidate=%s\n' "$baseline_commit" "$candidate_commit"
+  printf 'Linux lifecycle確認を完了しました: baseline=%s helper=%s candidate=%s\n' "$baseline_commit" "$helper_commit" "$candidate_commit"
 }
 
 if [ "${0##*/}" = verify.sh ]; then

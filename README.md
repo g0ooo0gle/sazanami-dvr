@@ -62,6 +62,7 @@ CtrlCmdには認証とTLSがないため、インターネットへ公開せず�
 ## 詳しい文書
 
 導入後の操作、設定、更新、復旧、トラブル対応は[ドキュメント一覧](https://github.com/g0ooo0gle/sazanami-dvr/blob/v1.3.6/docs/README.md)から探せます。
+すでに利用中の方は、[更新・切り戻し・削除](https://github.com/g0ooo0gle/sazanami-dvr/blob/v1.3.6/docs/operations/update-and-remove.md)を参照してください。
 
 開発への参加は[CONTRIBUTING.md](https://github.com/g0ooo0gle/sazanami-dvr/blob/v1.3.6/CONTRIBUTING.md)、脆弱性の連絡は[SECURITY.md](https://github.com/g0ooo0gle/sazanami-dvr/blob/v1.3.6/SECURITY.md)を参照してください。
 

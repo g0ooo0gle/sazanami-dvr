@@ -83,7 +83,7 @@ func (store *attemptMemory) OneSegRecordingStarted(context.Context, catalogmodel
 	return nil
 }
 
-func (store *attemptMemory) UpdateRecordingProgress(_ context.Context, _ catalogmodel.ID, count int64, _ time.Time) (time.Time, error) {
+func (store *attemptMemory) UpdateRecordingProgress(_ context.Context, _ catalogmodel.ID, count int64, _ time.Time, _ core.QualitySummary) (time.Time, error) {
 	store.mu.Lock()
 	store.progress = append(store.progress, count)
 	if store.progressEnd.IsZero() {
@@ -96,7 +96,7 @@ func (store *attemptMemory) UpdateRecordingProgress(_ context.Context, _ catalog
 }
 
 func (store *attemptMemory) UpdateOneSegProgress(_ context.Context, _ catalogmodel.ID, count int64,
-	_ time.Time,
+	_ time.Time, _ core.QualitySummary,
 ) (time.Time, error) {
 	store.mu.Lock()
 	if store.progressEnd.IsZero() {
@@ -245,9 +245,7 @@ func TestExecutorPublishesOnlyAfterPlannedEnd(t *testing.T) {
 		if len(destination) != provider.MaxStreamChunk {
 			t.Fatalf("buffer=%d", len(destination))
 		}
-		for index := 0; index < 188; index++ {
-			destination[index] = 0x47
-		}
+		copy(destination, bytesOf(0x47, 188))
 		clock.now = store.end
 		return 188, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
 	}
@@ -622,7 +620,7 @@ func TestOneSegReconnectsIndependentlyAndUsesDistinctCorrelationIDs(t *testing.T
 		},
 		Wait: func(context.Context, time.Duration) error { return nil },
 	}
-	result := executor.runOneSeg(context.Background(), reservation, attempt, end, start.Add(core.MaxEffectiveDuration))
+	result := executor.runOneSeg(context.Background(), context.Background(), reservation, attempt, end, start.Add(core.MaxEffectiveDuration))
 	if !result.Publish || result.ByteCount != 188 || result.Reason != core.ReasonCompletedAfterReconnect ||
 		stream.opens != 2 || len(stream.requests) != 2 ||
 		stream.requests[0].CorrelationID != attempt.ID.String()+"-oneseg" ||
@@ -679,7 +677,7 @@ func TestOneSegFileFailuresStaySeparateFromMainResult(t *testing.T) {
 				},
 				Wait: func(context.Context, time.Duration) error { return nil },
 			}
-			result := executor.runOneSeg(context.Background(), reservation, attempt, end,
+			result := executor.runOneSeg(context.Background(), context.Background(), reservation, attempt, end,
 				start.Add(core.MaxEffectiveDuration))
 			if result.Publish || result.Reason != test.want ||
 				(test.missing && result.Availability != core.AvailabilityMissing) {
@@ -776,12 +774,14 @@ func eventIndex(values []string, target string) int {
 	return -1
 }
 
-func TestExecutorFailsMalformedSelectedStreamWithoutReconnect(t *testing.T) {
+func TestExecutorDiscardsMalformedSelectedStreamWithoutReconnect(t *testing.T) {
 	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
 	clock := &mutableClock{now: start}
 	store := &attemptMemory{start: start, end: start.Add(time.Minute)}
 	lease := &fakeLease{read: func(destination []byte) (int, providerstream.Terminal, error) {
-		copy(destination, bytesOf(0x47, tsPacketBytes))
+		packet := makePayloadPacket(0x101)
+		packet[3] = 0 // 構造不正のpacketは捨てるが、予定終了まで受信する。
+		copy(destination, packet)
 		clock.now = store.end
 		return tsPacketBytes, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
 	}}
@@ -790,7 +790,7 @@ func TestExecutorFailsMalformedSelectedStreamWithoutReconnect(t *testing.T) {
 	reservation := reservationForExecutor(t, start, time.Minute)
 	reservation.Components = core.ComponentDefault
 	result, err := executor.Execute(context.Background(), reservation)
-	if err != nil || result.State != core.AttemptFailed || result.Reason != core.ReasonStreamFormatInvalid ||
+	if err != nil || result.State != core.AttemptFailed || result.Reason != core.ReasonStreamEndedEarly ||
 		stream.opens != 1 || store.finish.ByteCount != 0 {
 		t.Fatalf("result=%+v opens=%d finish=%+v err=%v", result, stream.opens, store.finish, err)
 	}
@@ -827,9 +827,7 @@ func TestExecutorUsesExtendedPlannedEnd(t *testing.T) {
 	reads := 0
 	lease := &fakeLease{read: func(destination []byte) (int, providerstream.Terminal, error) {
 		reads++
-		for index := 0; index < 188; index++ {
-			destination[index] = 0x47
-		}
+		copy(destination, bytesOf(0x47, 188))
 		switch reads {
 		case 1:
 			clock.now = start.Add(progressInterval)
@@ -863,9 +861,7 @@ func TestExecutorUsesExtensionObservedBeforeRecordingStart(t *testing.T) {
 	reads := 0
 	lease := &fakeLease{read: func(destination []byte) (int, providerstream.Terminal, error) {
 		reads++
-		for index := 0; index < 188; index++ {
-			destination[index] = 0x47
-		}
+		copy(destination, bytesOf(0x47, 188))
 		if reads == 1 {
 			clock.now = initialEnd
 		} else {
@@ -908,9 +904,7 @@ func TestExecutorRejectsInvalidPlannedEndUpdate(t *testing.T) {
 			clock := &mutableClock{now: start}
 			store := &attemptMemory{start: start, end: start.Add(time.Minute), progressEnd: plannedEnd}
 			lease := &fakeLease{read: func(destination []byte) (int, providerstream.Terminal, error) {
-				for index := 0; index < 188; index++ {
-					destination[index] = 0x47
-				}
+				copy(destination, bytesOf(0x47, 188))
 				clock.now = start.Add(progressInterval)
 				return 188, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
 			}}
@@ -962,9 +956,7 @@ func TestExecutorKeepsEarlyStreamAsPartialWhenLessThanReconnectWindowRemains(t *
 	clock := &mutableClock{now: start}
 	store := &attemptMemory{start: start, end: start.Add(time.Minute - time.Nanosecond)}
 	lease := &fakeLease{read: func(destination []byte) (int, providerstream.Terminal, error) {
-		for index := 0; index < 188; index++ {
-			destination[index] = 0x47
-		}
+		copy(destination, bytesOf(0x47, 188))
 		return 188, providerstream.Terminal{Done: true, Reason: providerstream.TerminalEarlyEOF},
 			provider.NewFailure(provider.ReasonEarlyEOF, "test")
 	}}
@@ -986,12 +978,13 @@ func TestExecutorDoesNotTreatShortWriteAsUsefulRecording(t *testing.T) {
 	clock := &mutableClock{now: start}
 	store := &attemptMemory{start: start, end: start.Add(time.Minute)}
 	lease := &fakeLease{read: func(destination []byte) (int, providerstream.Terminal, error) {
-		return 100, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
+		copy(destination, bytesOf(0x47, 188))
+		return 188, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
 	}}
 	executor := executorForTest(t, store, &fakeProvider{lease: lease}, clock, true)
 	result, err := executor.Execute(context.Background(), reservationForExecutor(t, start, time.Minute))
 	if err != nil || result.State != core.AttemptFailed || result.Reason != core.ReasonFileWriteFailed ||
-		store.finish.ByteCount != 99 || store.finish.Availability != core.AvailabilityPartial {
+		store.finish.ByteCount != 187 || store.finish.Availability != core.AvailabilityPartial {
 		t.Fatalf("result=%+v finish=%+v err=%v", result, store.finish, err)
 	}
 }
@@ -1348,7 +1341,7 @@ func TestExecutorDoesNotPublishTooShortUserStoppedRecording(t *testing.T) {
 	select {
 	case result := <-done:
 		if result.State != core.AttemptCancelled || result.Reason != core.ReasonUserRequestedStop ||
-			store.finish.ByteCount != minimumUsefulTS-1 || store.finish.Availability != core.AvailabilityPartial {
+			store.finish.ByteCount != 0 || store.finish.Availability != core.AvailabilityPartial {
 			t.Fatalf("result=%+v finish=%+v", result, store.finish)
 		}
 	case <-time.After(time.Second):
@@ -1487,7 +1480,7 @@ func TestUserStoppedPublicationFailsAtEachDurabilityBoundary(t *testing.T) {
 				},
 			}
 			result, err := executor.publishFinal(context.Background(), attempt, 188,
-				core.AttemptPartial, core.ReasonUserRequestedStop)
+				core.AttemptPartial, core.ReasonUserRequestedStop, core.QualitySummary{})
 			if err == nil {
 				t.Fatal("失敗を成功として返しました")
 			}
@@ -1518,7 +1511,7 @@ func TestUserStopDoesNotPublishWhenFileSyncOrCloseFails(t *testing.T) {
 			}
 			executor := Executor{Store: store, Clock: &mutableClock{now: start}}
 			result, err := executor.finishUserStop(context.Background(), file,
-				core.Reservation{}, core.Attempt{ID: appID(t, 82)}, minimumUsefulTS)
+				core.Reservation{}, core.Attempt{ID: appID(t, 82)}, minimumUsefulTS, core.QualitySummary{})
 			if err != nil || result.State != core.AttemptPartial || result.Reason != core.ReasonFileSyncFailed ||
 				store.finish.Availability != core.AvailabilityPartial || countString(store.operations, "finalizing") != 0 {
 				t.Fatalf("result=%+v finish=%+v operations=%v err=%v", result, store.finish, store.operations, err)
@@ -1561,7 +1554,7 @@ func TestPostRecordingRunsOnlyAfterSuccessfulFinalization(t *testing.T) {
 		ObservePostRecording: func(reason string) { observed = reason },
 	}
 	result, err := executor.publishAndPostProcess(ctx, reservation, attempt, 188,
-		core.AttemptSucceeded, core.ReasonCompleted)
+		core.AttemptSucceeded, core.ReasonCompleted, core.QualitySummary{})
 	if err != nil || result.State != core.AttemptSucceeded || result.PostRecording != core.PostRecordingStandby ||
 		called != 1 || observed != "post-recording-script-exit-failed" {
 		t.Fatalf("result=%+v called=%d observed=%q err=%v", result, called, observed, err)
@@ -1571,6 +1564,7 @@ func TestPostRecordingRunsOnlyAfterSuccessfulFinalization(t *testing.T) {
 func TestPostRecordingUsesFinalizationOutcome(t *testing.T) {
 	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
 	store := &attemptMemory{start: start, end: start.Add(time.Hour)}
+	store.stop.Store(true)
 	store.finalizeFunc = func(request core.FinalizeRequest) (core.FinalizeRequest, error) {
 		request.State = core.AttemptPartial
 		request.Reason = core.ReasonUserRequestedStop
@@ -1602,7 +1596,7 @@ func TestPostRecordingUsesFinalizationOutcome(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	result, err := executor.publishAndPostProcess(ctx, reservation, attempt, 188,
-		core.AttemptSucceeded, core.ReasonCompleted)
+		core.AttemptSucceeded, core.ReasonCompleted, core.QualitySummary{})
 	if err != nil || result.State != core.AttemptPartial || result.Reason != core.ReasonUserRequestedStop ||
 		store.finish.State != core.AttemptPartial || store.finish.Reason != core.ReasonUserRequestedStop || postCalls != 1 {
 		t.Fatalf("result=%+v finish=%+v post_calls=%d err=%v", result, store.finish, postCalls, err)
@@ -1633,10 +1627,10 @@ func TestCancelledFinalizationWithoutStopBecomesProcessShutdown(t *testing.T) {
 	cancel()
 	result, err := executor.publishAndPostProcess(ctx, core.Reservation{PostRecording: core.PostRecordingSettings{
 		Mode: core.PostRecordingStandby, Script: "/allowed/finish.sh",
-	}}, core.Attempt{ID: appID(t, 96)}, 188, core.AttemptSucceeded, core.ReasonCompleted)
+	}}, core.Attempt{ID: appID(t, 96)}, 188, core.AttemptSucceeded, core.ReasonCompleted, core.QualitySummary{})
 	if err != nil || result.State != core.AttemptCancelled || result.Reason != core.ReasonProcessShutdown ||
 		store.finish.State != core.AttemptCancelled || store.finish.Reason != core.ReasonProcessShutdown ||
-		store.finish.Availability != core.AvailabilityPartial || store.finalizeCall != 1 || links != 0 ||
+		store.finish.Availability != core.AvailabilityPartial || store.finalizeCall != 0 || links != 0 ||
 		postCalls != 0 || result.PostRecording.ChangesPower() {
 		t.Fatalf("result=%+v finish=%+v calls=%d links=%d post_calls=%d err=%v",
 			result, store.finish, store.finalizeCall, links, postCalls, err)
@@ -1661,7 +1655,7 @@ func TestUnsupportedPublicationSettlesMainAndOneSegWithoutPostProcessing(t *test
 		}
 		result, err := executor.publishAndPostProcess(context.Background(), core.Reservation{
 			Number: 1, PostRecording: core.PostRecordingSettings{Mode: core.PostRecordingShutdown, Script: "/allowed/finish.sh"},
-		}, core.Attempt{ID: appID(t, 86)}, 376, core.AttemptSucceeded, core.ReasonCompleted)
+		}, core.Attempt{ID: appID(t, 86)}, 376, core.AttemptSucceeded, core.ReasonCompleted, core.QualitySummary{})
 		if err != nil || result.State != core.AttemptFailed || result.Reason != core.ReasonFinalPublicationFailed ||
 			store.finish.Availability != core.AvailabilityPartial || store.finish.ByteCount != 376 || called != 0 ||
 			result.PostRecording.ChangesPower() {
@@ -1695,7 +1689,7 @@ func TestPostRecordingIsSkippedWithoutScriptOrWhenPublicationFails(t *testing.T)
 			}
 			result, resultErr := executor.publishAndPostProcess(context.Background(), core.Reservation{
 				Number: 1, PostRecording: core.PostRecordingSettings{Mode: core.PostRecordingShutdown, Script: test.script},
-			}, core.Attempt{ID: appID(t, 86)}, 188, core.AttemptSucceeded, core.ReasonCompleted)
+			}, core.Attempt{ID: appID(t, 86)}, 188, core.AttemptSucceeded, core.ReasonCompleted, core.QualitySummary{})
 			if called != 0 {
 				t.Fatalf("post recording calls=%d", called)
 			}
@@ -1753,6 +1747,11 @@ func bytesOf(value byte, count int) []byte {
 	result := make([]byte, count)
 	for index := range result {
 		result[index] = value
+	}
+	if value == 0x47 {
+		for offset := 0; offset+4 <= count; offset += 188 {
+			copy(result[offset:offset+4], []byte{0x47, 0x01, 0x01, 0x10 | byte(offset/188)&15})
+		}
 	}
 	return result
 }

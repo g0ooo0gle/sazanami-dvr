@@ -10,8 +10,70 @@ import (
 	"time"
 
 	"github.com/g0ooo0gle/sazanami-dvr/internal/adapters/ctrlcmd/codec"
+	"github.com/g0ooo0gle/sazanami-dvr/internal/core/catalogmodel"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/core/recording"
 )
+
+func TestQualityAllReadSurfacesAgree(t *testing.T) {
+	for _, reason := range []recording.TerminalReason{recording.ReasonCompleted, recording.ReasonUserRequestedStop,
+		recording.ReasonStreamEndedEarly, recording.ReasonStreamTimeout, recording.ReasonStreamReconnectExhausted, recording.ReasonStreamUnavailable} {
+		for _, proven := range []bool{false, true} {
+			item := historyItem(7)
+			item.Reason = reason
+			if reason != recording.ReasonCompleted {
+				item.State = recording.AttemptPartial
+			}
+			item.Quality = recording.QualitySummary{Status: recording.QualityDegraded, CCGapEvents: 2147483647}
+			if proven {
+				item.FinalizationToken = catalogmodel.ID{1}
+				item.PlannedState, item.PlannedReason = item.State, item.Reason
+			}
+			want := reason == recording.ReasonCompleted || reason == recording.ReasonUserRequestedStop ||
+				proven && (reason == recording.ReasonStreamEndedEarly || reason == recording.ReasonStreamTimeout || reason == recording.ReasonStreamReconnectExhausted)
+			handler := Handler{Operations: &fakeOperations{items: []recording.HistoryItem{item}}, Limits: codec.DefaultLimits()}
+			var response bytes.Buffer
+			if err := handler.Handle(context.Background(), requestFrame(CommandList, versionBody()), &response); err != nil {
+				t.Fatal(err)
+			}
+			body := responseBody(t, response.Bytes(), resultSuccess)
+			wantCount := uint32(0)
+			if want {
+				wantCount = 1
+			}
+			if len(body) < 10 || binary.LittleEndian.Uint32(body[6:10]) != wantCount {
+				t.Fatalf("reason=%s proven=%t list=%x", reason, proven, body)
+			}
+			response.Reset()
+			if err := handler.Handle(context.Background(), requestFrame(CommandGet, append(versionBody(), 7, 0, 0, 0)), &response); err != nil {
+				t.Fatal(err)
+			}
+			wantCode := resultFailure
+			if want {
+				wantCode = resultSuccess
+			}
+			responseBody(t, response.Bytes(), wantCode)
+		}
+	}
+}
+
+func TestQualityDoesNotChangeCtrlCmdWire(t *testing.T) {
+	var baseline []byte
+	for _, status := range []recording.QualityStatus{recording.QualityUnknown, recording.QualityNoIssuesObserved, recording.QualityDegraded} {
+		item := historyItem(7)
+		item.Quality = recording.QualitySummary{Status: status, TEIPackets: 3, SyncDiscardedBytes: 2147483647}
+		handler := Handler{Operations: &fakeOperations{items: []recording.HistoryItem{item}}, Limits: codec.DefaultLimits()}
+		var response bytes.Buffer
+		if err := handler.Handle(context.Background(), requestFrame(CommandGet, append(versionBody(), 7, 0, 0, 0)), &response); err != nil {
+			t.Fatal(err)
+		}
+		responseBody(t, response.Bytes(), resultSuccess)
+		if baseline == nil {
+			baseline = append([]byte(nil), response.Bytes()...)
+		} else if !bytes.Equal(baseline, response.Bytes()) {
+			t.Fatal("quality changed CtrlCmd bytes")
+		}
+	}
+}
 
 func TestHandlerListsAndGetsCompletedRecordings(t *testing.T) {
 	items := []recording.HistoryItem{historyItem(1), historyItem(2)}

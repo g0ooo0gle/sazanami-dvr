@@ -131,8 +131,12 @@ func (result *CompletedReconcileResult) observe(availability core.Availability) 
 }
 
 func completedReconcileTarget(item core.RecoveryItem) bool {
+	communication := item.State == core.AttemptPartial && item.PlannedState == core.AttemptPartial &&
+		core.IsCommunicationPartialReason(item.PlannedReason) && item.FinalizationToken != (catalogmodel.ID{}) &&
+		item.ByteCount >= minimumUsefulTS && item.ByteCount%188 == 0 && item.SegmentState == core.SegmentFinalized &&
+		item.FileSynced && item.FinalPublished && item.DirectorySynced
 	return item.State == core.AttemptSucceeded ||
-		item.State == core.AttemptPartial && item.PlannedReason == core.ReasonUserRequestedStop
+		item.State == core.AttemptPartial && item.PlannedReason == core.ReasonUserRequestedStop || communication
 }
 
 func (reconciler *CompletedReconciler) now() time.Time { return reconciler.Clock.Now().UTC() }

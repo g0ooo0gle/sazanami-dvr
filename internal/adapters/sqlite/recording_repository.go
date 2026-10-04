@@ -846,8 +846,8 @@ func (store *Store) OneSegRecordingStarted(ctx context.Context, attemptID catalo
 }
 
 // UpdateRecordingProgressは5秒ごとのバイト数と生存時刻を保存し、現在の予定終了時刻を返す。
-func (store *Store) UpdateRecordingProgress(ctx context.Context, attemptID catalogmodel.ID, byteCount int64, now time.Time) (time.Time, error) {
-	if byteCount < 0 || validateRecordingUpdate(store, ctx, attemptID, now) != nil {
+func (store *Store) UpdateRecordingProgress(ctx context.Context, attemptID catalogmodel.ID, byteCount int64, now time.Time, quality recording.QualitySummary) (time.Time, error) {
+	if quality.Validate() != nil || byteCount < 0 || validateRecordingUpdate(store, ctx, attemptID, now) != nil {
 		return time.Time{}, errors.New("sqlite: invalid recording progress")
 	}
 	tx, err := store.writer.BeginTx(ctx, &sql.TxOptions{})
@@ -882,6 +882,9 @@ func (store *Store) UpdateRecordingProgress(ctx context.Context, attemptID catal
 	if plannedEndMS < 0 {
 		return time.Time{}, errors.New("sqlite: corrupt recording planned end")
 	}
+	if err := saveQuality(ctx, tx, attemptID, 0, quality); err != nil {
+		return time.Time{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return time.Time{}, sanitize("commit-recording-progress", err)
 	}
@@ -890,9 +893,9 @@ func (store *Store) UpdateRecordingProgress(ctx context.Context, attemptID catal
 
 // UpdateOneSegProgressはordinal 1のbyte数だけを進め、メインと共通の予定終了を返す。
 func (store *Store) UpdateOneSegProgress(ctx context.Context, attemptID catalogmodel.ID, byteCount int64,
-	now time.Time,
+	now time.Time, quality recording.QualitySummary,
 ) (time.Time, error) {
-	if byteCount < 0 || validateRecordingUpdate(store, ctx, attemptID, now) != nil {
+	if quality.Validate() != nil || byteCount < 0 || validateRecordingUpdate(store, ctx, attemptID, now) != nil {
 		return time.Time{}, errors.New("sqlite: invalid one-seg recording progress")
 	}
 	tx, err := store.writer.BeginTx(ctx, &sql.TxOptions{})
@@ -926,6 +929,9 @@ func (store *Store) UpdateOneSegProgress(ctx context.Context, attemptID catalogm
 	if plannedEndMS < 0 {
 		return time.Time{}, errors.New("sqlite: corrupt one-seg recording planned end")
 	}
+	if err := saveQuality(ctx, tx, attemptID, 1, quality); err != nil {
+		return time.Time{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return time.Time{}, sanitize("commit-one-seg-recording-progress", err)
 	}
@@ -939,20 +945,35 @@ func (store *Store) BeginFinalization(ctx context.Context,
 	if store == nil || store.writer == nil || ctx == nil || request.Validate() != nil {
 		return recording.FinalizeRequest{}, errors.New("sqlite: invalid recording finalization")
 	}
+	// writer待ちの間は親取消しを維持し、確定計画を保存する直前まで確認する。
+	connection, err := store.writer.Conn(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			return recording.FinalizeRequest{}, ErrFinalizationUnavailable
+		}
+		return recording.FinalizeRequest{}, sanitize("acquire-recording-finalization-writer", err)
+	}
+	defer connection.Close()
 	durableCtx := context.WithoutCancel(ctx)
-	tx, err := store.writer.BeginTx(durableCtx, &sql.TxOptions{})
+	tx, err := connection.BeginTx(durableCtx, &sql.TxOptions{})
 	if err != nil {
 		return recording.FinalizeRequest{}, sanitize("begin-recording-finalization", err)
 	}
 	defer tx.Rollback()
+	if ctx.Err() != nil {
+		return recording.FinalizeRequest{}, ErrFinalizationUnavailable
+	}
 	nowMS := request.Now.UnixMilli()
 	markFinalizing := func(candidate recording.FinalizeRequest) (sql.Result, error) {
 		return tx.ExecContext(durableCtx, `UPDATE recording_attempts SET state='FINALIZING', state_version=state_version+1,
 			byte_count=?, heartbeat_utc_ms=?, finalization_token=?, planned_final_state=?, planned_terminal_reason=?, updated_at_utc_ms=?
 			WHERE id=? AND state='RECORDING' AND byte_count<=?
-			AND ((?='PARTIAL' AND stop_requested_at_utc_ms IS NOT NULL) OR (?='SUCCEEDED' AND stop_requested_at_utc_ms IS NULL))`,
+			AND ((?='USER_REQUESTED_STOP' AND stop_requested_at_utc_ms IS NOT NULL) OR
+				(?<>'USER_REQUESTED_STOP' AND stop_requested_at_utc_ms IS NULL))
+			AND (?=0 OR (actual_start_utc_ms IS NOT NULL AND ?-actual_start_utc_ms>=1000))`,
 			candidate.ByteCount, nowMS, candidate.Token.Bytes(), candidate.State, candidate.Reason, nowMS,
-			candidate.AttemptID.Bytes(), candidate.ByteCount, candidate.State, candidate.State)
+			candidate.AttemptID.Bytes(), candidate.ByteCount, candidate.Reason, candidate.Reason,
+			recording.IsCommunicationPartialReason(candidate.Reason), nowMS)
 	}
 	resolved := request
 	result, err := markFinalizing(resolved)
@@ -963,8 +984,8 @@ func (store *Store) BeginFinalization(ctx context.Context,
 	if err != nil {
 		return recording.FinalizeRequest{}, sanitize("count-recording-finalizing", err)
 	}
-	if count == 0 && request.State == recording.AttemptSucceeded &&
-		(request.Reason == recording.ReasonCompleted || request.Reason == recording.ReasonCompletedAfterReconnect) {
+	if count == 0 && (request.State == recording.AttemptSucceeded ||
+		request.State == recording.AttemptPartial && recording.IsCommunicationPartialReason(request.Reason)) {
 		resolved.State = recording.AttemptPartial
 		resolved.Reason = recording.ReasonUserRequestedStop
 		if resolved.OneSeg != nil && resolved.OneSeg.Publish {
@@ -993,6 +1014,9 @@ func (store *Store) BeginFinalization(ctx context.Context,
 	if affected(result) != 1 {
 		return recording.FinalizeRequest{}, ErrAttemptState
 	}
+	if err := saveQuality(durableCtx, tx, resolved.AttemptID, 0, resolved.Quality); err != nil {
+		return recording.FinalizeRequest{}, err
+	}
 	var oneSegCount int
 	if err := tx.QueryRowContext(durableCtx, `SELECT count(*) FROM recording_segments WHERE attempt_id=? AND ordinal=1`,
 		resolved.AttemptID.Bytes()).Scan(&oneSegCount); err != nil {
@@ -1020,6 +1044,9 @@ func (store *Store) BeginFinalization(ctx context.Context,
 		}
 		if affected(result) != 1 {
 			return recording.FinalizeRequest{}, ErrAttemptState
+		}
+		if err := saveQuality(durableCtx, tx, resolved.AttemptID, 1, resolved.OneSeg.Quality); err != nil {
+			return recording.FinalizeRequest{}, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -1059,11 +1086,13 @@ func (store *Store) SetOneSegOutcome(ctx context.Context, attemptID catalogmodel
 	if outcome.FileSynced {
 		fileSynced = 1
 	}
+	args := []any{outcome.ByteCount, fileSynced, outcome.Availability, outcome.Reason, now.UnixMilli()}
+	args = append(args, qualityValues(outcome.Quality)...)
+	args = append(args, attemptID.Bytes(), attemptID.Bytes())
 	result, err := store.writer.ExecContext(ctx, `UPDATE recording_segments SET state='PARTIAL', byte_count=?,
-		file_synced=?, final_published=0, directory_synced=0, availability=?, integrity_reason=?, updated_at_utc_ms=?
+		file_synced=?, final_published=0, directory_synced=0, availability=?, integrity_reason=?, updated_at_utc_ms=?,`+qualityAssignments()+`
 		WHERE attempt_id=? AND ordinal=1 AND state IN ('PLANNED','WRITING','PARTIAL','FINALIZED') AND EXISTS (
-			SELECT 1 FROM recording_attempts a WHERE a.id=? AND a.state='FINALIZING')`,
-		outcome.ByteCount, fileSynced, outcome.Availability, outcome.Reason, now.UnixMilli(), attemptID.Bytes(), attemptID.Bytes())
+			SELECT 1 FROM recording_attempts a WHERE a.id=? AND a.state='FINALIZING')`, args...)
 	if err != nil {
 		return sanitize("save-one-seg-outcome", err)
 	}
@@ -1100,19 +1129,17 @@ func (store *Store) FinishAttempt(ctx context.Context, request recording.FinishR
 		current == recording.AttemptCancelled || current == recording.AttemptMissed {
 		return ErrAttemptState
 	}
-	if (request.State == recording.AttemptSucceeded ||
-		(request.State == recording.AttemptPartial && request.Reason == recording.ReasonUserRequestedStop)) &&
-		current != recording.AttemptFinalizing {
+	successful := request.State == recording.AttemptSucceeded || request.State == recording.AttemptPartial &&
+		(request.Reason == recording.ReasonUserRequestedStop ||
+			recording.IsCommunicationPartialReason(request.Reason) && request.Availability == recording.AvailabilityFinal)
+	if successful && current != recording.AttemptFinalizing {
 		return ErrAttemptState
 	}
-	if current == recording.AttemptFinalizing && (request.State == recording.AttemptSucceeded ||
-		(request.State == recording.AttemptPartial && request.Reason == recording.ReasonUserRequestedStop)) &&
+	if current == recording.AttemptFinalizing && successful &&
 		(!plannedState.Valid || !plannedReason.Valid ||
 			plannedState.String != string(request.State) || plannedReason.String != string(request.Reason)) {
 		return ErrAttemptState
 	}
-	successful := request.State == recording.AttemptSucceeded ||
-		(request.State == recording.AttemptPartial && request.Reason == recording.ReasonUserRequestedStop)
 	var mainState recording.SegmentState
 	var mainAvailability recording.Availability
 	var mainSynced, mainPublished, mainDirectory int
@@ -1187,6 +1214,9 @@ func (store *Store) FinishAttempt(ctx context.Context, request recording.FinishR
 	if affected(result) != 1 {
 		return ErrAttemptState
 	}
+	if err := saveQuality(ctx, tx, request.AttemptID, 0, request.Quality); err != nil {
+		return err
+	}
 	if !successful && request.OneSeg != nil {
 		fileSynced := 0
 		if request.OneSeg.FileSynced {
@@ -1201,6 +1231,9 @@ func (store *Store) FinishAttempt(ctx context.Context, request recording.FinishR
 		}
 		if affected(result) != 1 {
 			return ErrAttemptState
+		}
+		if err := saveQuality(ctx, tx, request.AttemptID, 1, request.OneSeg.Quality); err != nil {
+			return err
 		}
 	}
 	result, err = tx.ExecContext(ctx, `UPDATE reservations SET state='FINISHED', version=version+1,

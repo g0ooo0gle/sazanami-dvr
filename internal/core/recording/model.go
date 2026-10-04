@@ -457,6 +457,10 @@ type StopResult struct {
 // HistoryItemは一回の終了済み録画を外部形式から独立して読み出すための保存済み事実である。
 // FilePlanはadapter内の安全なfile解決にだけ使い、HTTPやCtrlCmdへ直接公開しない。
 type HistoryItem struct {
+	Quality           QualitySummary
+	FinalizationToken catalogmodel.ID
+	PlannedState      AttemptState
+	PlannedReason     TerminalReason
 	Number            int32
 	State             AttemptState
 	Reason            TerminalReason
@@ -481,7 +485,7 @@ type HistoryItem struct {
 
 // ValidateはDBから読んだ履歴が終了状態と時刻、file計画の不変条件を満たすか確認する。
 func (item HistoryItem) Validate() error {
-	if item.Number < 1 || !terminalAttemptState(item.State) || !item.Reason.Valid() ||
+	if item.Quality.Validate() != nil || item.Number < 1 || !terminalAttemptState(item.State) || !item.Reason.Valid() ||
 		!validText(item.Title, 0, 4096) || !validText(item.StationName, 0, 4096) || item.ByteCount < 0 ||
 		item.PlannedStart.IsZero() || item.PlannedStart.Location() != time.UTC ||
 		item.PlannedEnd.Location() != time.UTC || !item.PlannedEnd.After(item.PlannedStart) ||
@@ -508,11 +512,14 @@ func (item HistoryItem) Validate() error {
 	return nil
 }
 
-// Playableは正常完了または利用者停止で安全に確定し、CtrlCmdとHTTPへ公開できる場合だけtrueを返す。
+// Playableは安全な確定証跡が揃い、CtrlCmdとHTTPへ公開できる場合だけtrueを返す。
 func (item HistoryItem) Playable() bool {
 	completed := item.State == AttemptSucceeded && item.Reason.successful()
 	userStopped := item.State == AttemptPartial && item.Reason == ReasonUserRequestedStop
-	return item.Validate() == nil && (completed || userStopped) &&
+	communication := item.State == AttemptPartial && IsCommunicationPartialReason(item.Reason) &&
+		item.ByteCount%188 == 0 && item.FinalizationToken != (catalogmodel.ID{}) &&
+		item.PlannedState == item.State && item.PlannedReason == item.Reason
+	return item.Validate() == nil && (completed || userStopped || communication) &&
 		item.ActualStart != nil && item.ActualEnd.Sub(*item.ActualStart) >= time.Second && item.ByteCount >= 188 && item.SegmentState == SegmentFinalized &&
 		item.Availability == AvailabilityFinal && item.FileSynced && item.FinalPublished && item.DirectorySynced
 }
@@ -529,6 +536,7 @@ func terminalAttemptState(state AttemptState) bool {
 // RecoveryItemは再起動時にDBと録画ファイルを照合するための、保存済みの事実である。
 type RecoveryItem struct {
 	Attempt
+	Quality           QualitySummary
 	FinalizationToken catalogmodel.ID
 	PlannedState      AttemptState
 	PlannedReason     TerminalReason
@@ -544,6 +552,7 @@ type RecoveryItem struct {
 
 // RecoverySegmentはワンセグsegmentをメインと分けて照合するための保存済み事実である。
 type RecoverySegment struct {
+	Quality         QualitySummary
 	Plan            FilePlan
 	ByteCount       int64
 	State           SegmentState
@@ -571,6 +580,7 @@ type FileObservation struct {
 
 // FinalizeRequestは録画データの同期完了をDBへ確定するための値をまとめる。
 type FinalizeRequest struct {
+	Quality   QualitySummary
 	AttemptID catalogmodel.ID
 	Token     catalogmodel.ID
 	ByteCount int64
@@ -583,12 +593,13 @@ type FinalizeRequest struct {
 // Validateは完成処理を始められる値かを検証する。
 func (request FinalizeRequest) Validate() error {
 	zero := catalogmodel.ID{}
-	if request.AttemptID == zero || request.Token == zero || request.ByteCount < 188 ||
+	if request.Quality.Validate() != nil || request.AttemptID == zero || request.Token == zero || request.ByteCount < 188 ||
 		request.Now.IsZero() || request.Now.Location() != time.UTC || request.Now.UnixMilli() < 0 {
 		return errors.New("recording: invalid finalize request")
 	}
 	if (request.State != AttemptSucceeded || !request.Reason.successful()) &&
-		(request.State != AttemptPartial || request.Reason != ReasonUserRequestedStop) {
+		(request.State != AttemptPartial || (request.Reason != ReasonUserRequestedStop &&
+			(!IsCommunicationPartialReason(request.Reason) || request.ByteCount%188 != 0))) {
 		return errors.New("recording: invalid planned final result")
 	}
 	if request.OneSeg != nil && request.OneSeg.Validate() != nil {
@@ -599,6 +610,7 @@ func (request FinalizeRequest) Validate() error {
 
 // OneSegResultは補助録画を公開できるか、部分・欠落・不一致として残すかを表す。
 type OneSegResult struct {
+	Quality      QualitySummary
 	ByteCount    int64
 	Availability Availability
 	Reason       TerminalReason
@@ -608,12 +620,13 @@ type OneSegResult struct {
 
 // Validateはワンセグのfile状態と固定理由の組合せを検証する。
 func (result OneSegResult) Validate() error {
-	if result.ByteCount < 0 {
+	if result.Quality.Validate() != nil || result.ByteCount < 0 {
 		return errors.New("recording: invalid one-seg byte count")
 	}
 	if result.Publish {
 		if result.ByteCount < 188 || result.Availability != AvailabilityPartial || !result.FileSynced ||
-			(!result.Reason.successful() && result.Reason != ReasonUserRequestedStop) {
+			(!result.Reason.successful() && result.Reason != ReasonUserRequestedStop &&
+				(!IsCommunicationPartialReason(result.Reason) || result.ByteCount%188 != 0)) {
 			return errors.New("recording: invalid publishable one-seg result")
 		}
 		return nil
@@ -634,6 +647,7 @@ func (result OneSegResult) Validate() error {
 
 // FinishRequestは録画試行と予約を同時に終了状態へ進めるための値である。
 type FinishRequest struct {
+	Quality      QualitySummary
 	AttemptID    catalogmodel.ID
 	State        AttemptState
 	Reason       TerminalReason
@@ -647,7 +661,7 @@ type FinishRequest struct {
 // Validateは終了状態とファイル状態の組合せを検証する。
 func (request FinishRequest) Validate() error {
 	zero := catalogmodel.ID{}
-	if request.AttemptID == zero || !request.Reason.Valid() || request.ByteCount < 0 ||
+	if request.Quality.Validate() != nil || request.AttemptID == zero || !request.Reason.Valid() || request.ByteCount < 0 ||
 		request.Now.IsZero() || request.Now.Location() != time.UTC || request.Now.UnixMilli() < 0 {
 		return errors.New("recording: invalid finish request")
 	}
@@ -663,6 +677,10 @@ func (request FinishRequest) Validate() error {
 		if request.Reason == ReasonUserRequestedStop {
 			if request.ByteCount < 188 || request.Availability != AvailabilityFinal {
 				return errors.New("recording: invalid stopped partial finish")
+			}
+		} else if request.Availability == AvailabilityFinal && IsCommunicationPartialReason(request.Reason) {
+			if request.ByteCount < 188 || request.ByteCount%188 != 0 {
+				return errors.New("recording: invalid communication partial finish")
 			}
 		} else if request.Reason.successful() || request.ByteCount < 188 || request.Availability != AvailabilityPartial {
 			return errors.New("recording: invalid partial finish")
