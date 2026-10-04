@@ -1,8 +1,9 @@
 package recording
 
 import (
+	"bytes"
 	"errors"
-
+	core "github.com/g0ooo0gle/sazanami-dvr/internal/core/recording"
 	"github.com/g0ooo0gle/sazanami-dvr/internal/mpegts"
 )
 
@@ -14,243 +15,413 @@ const (
 
 var errTSFormat = errors.New("recording: invalid MPEG-TS format")
 
-// tsComponentFilterは一つの録画接続に限ってPATとPMTを追跡し、選択外のPIDを除く。
-// 入力全体は保持せず、最初のPMTまたは更新中のPMTを待つ間だけ固定上限まで保持する。
+// tsComponentFilterは録画接続ごとに回復・選別を行い、segmentの品質だけを引き継ぐ。
 type tsComponentFilter struct {
-	file              PartialFile
-	keepCaptions      bool
-	keepData          bool
-	initialized       bool
-	pmtPID            uint16
-	pmtContinuity     byte
-	dropped           map[uint16]bool
-	tail              []byte
-	discovery         []byte
-	discoveryScanned  int
-	discoveryPAT      mpegts.PSICollector
-	discoveryPMT      mpegts.PSICollector
-	discovered        discoveredPMT
-	discoveryPMTKnown bool
-	updatePackets     [][]byte
-	updatePMTIndexes  []int
-	updateCollector   mpegts.PSICollector
+	file                                                         PartialFile
+	keepCaptions, keepData, initialized, pmtKnown, raw, finished bool
+	pmtPID                                                       uint16
+	pmtContinuity                                                byte
+	dropped                                                      map[uint16]bool
+	framer                                                       tsFramer
+	generation                                                   uint64
+	quality                                                      core.QualitySummary
+	tracker                                                      tsQualityTracker
+	pat, pmt                                                     recordingPSI
+	discovery                                                    []byte
+	firstPMT                                                     int
+	pending                                                      []byte
 }
 
-type discoveredPMT struct {
-	pmtPID      uint16
-	section     []byte
-	firstPacket int
-	lastPacket  int
-	continuity  byte
+func newTSComponentFilter(file PartialFile, keepCaptions, keepData bool, initial core.QualitySummary) *tsComponentFilter {
+	return &tsComponentFilter{file: file, keepCaptions: keepCaptions, keepData: keepData, quality: initial,
+		raw: initial.SelectionUnverified, firstPMT: -1}
 }
 
-// newTSComponentFilterは選別後のpacketだけを部分ファイルへ渡す接続単位の状態を作る。
-func newTSComponentFilter(file PartialFile, keepCaptions, keepData bool) *tsComponentFilter {
-	return &tsComponentFilter{file: file, keepCaptions: keepCaptions, keepData: keepData}
+// Qualityは現在までに観測した品質の要約を返す。
+func (filter *tsComponentFilter) Quality() core.QualitySummary { return filter.quality }
+func (filter *tsComponentFilter) selectionRequired() bool {
+	return !filter.keepCaptions || !filter.keepData
 }
 
-// Writeは任意のread境界をTS packetへ組み立て、実際に保存したbyte数を返す。
+// Writeは入力を188-byte単位で選別し、実際に保存したbyte数を返す。
 func (filter *tsComponentFilter) Write(data []byte) (int64, error) {
-	if !filter.initialized {
-		if len(filter.discovery) > maxPSIBuffer-len(data) {
-			return 0, errTSFormat
-		}
-		filter.discovery = append(filter.discovery, data...)
-		found, ok, err := filter.scanDiscovery()
-		if err != nil {
-			return 0, err
-		}
-		if !ok {
-			return 0, nil
-		}
-		rewritten, dropped, err := rewritePMT(found.section, filter.keepCaptions, filter.keepData)
-		if err != nil {
-			return 0, err
-		}
-		filter.pmtPID, filter.dropped, filter.initialized = found.pmtPID, dropped, true
-		filter.updateCollector = filter.discoveryPMT
-		consumed := (found.lastPacket + 1) * tsPacketBytes
-		written, err := filter.replayInitial(filter.discovery[:consumed], found, rewritten)
-		if err != nil {
-			return written, err
-		}
-		rest := append([]byte(nil), filter.discovery[consumed:]...)
-		filter.discovery = nil
-		more, err := filter.writeInitialized(rest)
-		return written + more, err
-	}
-	return filter.writeInitialized(data)
+	return filter.framer.Write(data, &filter.quality, filter.processPacket)
 }
 
-// scanDiscoveryは新しく増えた完全なpacketだけを一度ずつ調べ、最初のPATとPMTを探す。
-func (filter *tsComponentFilter) scanDiscovery() (discoveredPMT, bool, error) {
-	for filter.discoveryScanned+tsPacketBytes <= len(filter.discovery) {
-		offset := filter.discoveryScanned
-		index := offset / tsPacketBytes
-		packet := filter.discovery[offset : offset+tsPacketBytes]
-		filter.discoveryScanned += tsPacketBytes
-		parsed, err := mpegts.ParsePacket(packet)
-		if err != nil {
-			return discoveredPMT{}, false, invalidTS(err)
-		}
-		if !filter.discoveryPMTKnown && parsed.PID == 0 {
-			sections, feedErr := filter.discoveryPAT.Feed(packet)
-			if feedErr != nil {
-				return discoveredPMT{}, false, invalidTS(feedErr)
-			}
-			if len(sections) != 0 {
-				pat, parseErr := mpegts.ParsePAT(sections[len(sections)-1])
-				if parseErr != nil {
-					return discoveredPMT{}, false, invalidTS(parseErr)
-				}
-				filter.discovered.pmtPID = pat.PMTPID
-				filter.discoveryPMTKnown = true
-			}
-		}
-		if !filter.discoveryPMTKnown || parsed.PID != filter.discovered.pmtPID {
-			continue
-		}
-		if parsed.PayloadUnitStart {
-			filter.discovered.firstPacket = index
-			filter.discovered.continuity = parsed.ContinuityCounter
-		}
-		sections, feedErr := filter.discoveryPMT.Feed(packet)
-		if feedErr != nil {
-			return discoveredPMT{}, false, invalidTS(feedErr)
-		}
-		if len(sections) != 0 {
-			filter.discovered.section = sections[len(sections)-1]
-			filter.discovered.lastPacket = index
-			return filter.discovered, true, nil
-		}
+func (filter *tsComponentFilter) issue(issue psiIssue) {
+	q := &filter.quality
+	switch issue {
+	case psiContinuity:
+		addQuality(q, &q.PSIContinuityEvents, 1)
+	case psiCRC:
+		addQuality(q, &q.PSICRCEvents, 1)
+	case psiStructure:
+		addQuality(q, &q.PSIStructureEvents, 1)
+	case psiLimit:
+		addQuality(q, &q.PSILimitEvents, 1)
 	}
-	return discoveredPMT{}, false, nil
 }
 
-// Finishは接続終了時に未完のpacketやPSI sectionが残っていないことを確認する。
-func (filter *tsComponentFilter) Finish() error {
-	if !filter.initialized || len(filter.tail) != 0 || len(filter.updatePackets) != 0 {
-		return errTSFormat
+func (filter *tsComponentFilter) resetPSI() {
+	if filter.pat.incomplete() {
+		addQuality(&filter.quality, &filter.quality.UnfinishedPSIEvents, 1)
 	}
-	return nil
-}
-
-func (filter *tsComponentFilter) replayInitial(data []byte, found discoveredPMT, rewritten []byte) (int64, error) {
-	var written int64
-	for index := 0; index <= found.lastPacket; index++ {
-		if index == found.firstPacket {
-			packets, err := mpegts.PacketizeSection(found.pmtPID, found.continuity, rewritten)
-			if err != nil {
-				return written, invalidTS(err)
-			}
-			count, writeErr := filter.writePacketList(packets)
-			filter.pmtContinuity = (found.continuity + byte(len(packets))) & 0x0f
-			written += count
-			if writeErr != nil {
-				return written, writeErr
-			}
-		}
-		packet := data[index*tsPacketBytes : (index+1)*tsPacketBytes]
-		if index >= found.firstPacket && index <= found.lastPacket && mpegts.PID(packet) == found.pmtPID {
-			continue
-		}
-		count, err := filter.writeSelected(packet)
-		written += count
-		if err != nil {
-			return written, err
-		}
+	if filter.pmt.incomplete() {
+		addQuality(&filter.quality, &filter.quality.UnfinishedPSIEvents, 1)
 	}
-	return written, nil
-}
-
-func (filter *tsComponentFilter) writeInitialized(data []byte) (int64, error) {
-	combined := append(filter.tail, data...)
-	complete := len(combined) / tsPacketBytes * tsPacketBytes
-	var written int64
-	for offset := 0; offset < complete; offset += tsPacketBytes {
-		packet := append([]byte(nil), combined[offset:offset+tsPacketBytes]...)
-		count, err := filter.processPacket(packet)
-		written += count
-		if err != nil {
-			return written, err
-		}
-	}
-	filter.tail = append(filter.tail[:0], combined[complete:]...)
-	return written, nil
+	filter.pat.reset()
+	filter.pmt.reset()
+	filter.tracker.reset()
 }
 
 func (filter *tsComponentFilter) processPacket(packet []byte) (int64, error) {
-	parsed, err := mpegts.ParsePacket(packet)
+	var written int64
+	if filter.generation != filter.framer.generation {
+		filter.generation = filter.framer.generation
+		filter.resetPSI()
+		if len(filter.pending) > 0 {
+			n, err := filter.fallback()
+			written += n
+			if err != nil {
+				return written, err
+			}
+		}
+	}
+	parsed, tei, err := parseRecordingPacket(packet)
 	if err != nil {
-		return 0, invalidTS(err)
+		addQuality(&filter.quality, &filter.quality.MalformedPacketEvents, 1)
+		return written, nil
 	}
-	if len(filter.updatePackets) == 0 && parsed.PID != filter.pmtPID {
-		return filter.writeSelected(packet)
+	if filter.quality.Status == core.QualityUnknown {
+		filter.quality.Status = core.QualityNoIssuesObserved
 	}
-	if len(filter.updatePackets) == 0 && !parsed.PayloadUnitStart {
-		return 0, errTSFormat
+	if tei {
+		addQuality(&filter.quality, &filter.quality.TEIPackets, 1)
 	}
-	if len(filter.updatePackets) >= maxPSIBuffer/tsPacketBytes {
-		return 0, errTSFormat
+	filter.tracker.observe(packet, parsed, &filter.quality)
+	if filter.raw {
+		n, err := filter.writePacket(packet)
+		return written + n, err
 	}
-	filter.updatePackets = append(filter.updatePackets, packet)
-	if parsed.PID != filter.pmtPID {
+	control := parsed.PID == 0 || filter.pmtKnown && parsed.PID == filter.pmtPID
+	if tei && control {
+		filter.issue(psiStructure)
+		if parsed.PID == 0 {
+			filter.pat.reset()
+		} else {
+			filter.pmt.reset()
+		}
+		if filter.selectionRequired() {
+			if filter.initialized {
+				n, err := filter.fallback()
+				return written + n, err
+			}
+			return written, nil
+		}
+		n, err := filter.writePacket(packet)
+		return written + n, err
+	}
+	if !filter.selectionRequired() {
+		filter.observeTables(packet, parsed)
+		n, err := filter.writePacket(packet)
+		return written + n, err
+	}
+	if !filter.initialized {
+		if len(filter.discovery)+188 > maxPSIBuffer {
+			n, err := filter.fallback()
+			written += n
+			if err != nil {
+				return written, err
+			}
+			n, err = filter.writePacket(packet)
+			return written + n, err
+		}
+		if filter.discovery == nil {
+			filter.discovery = make([]byte, 0, maxPSIBuffer)
+		}
+		filter.discovery = append(filter.discovery, packet...)
+		n, err := filter.discover(packet, parsed)
+		return written + n, err
+	}
+	if parsed.PID == 0 {
+		sections, _, issue := filter.pat.Feed(packet, parsed)
+		filter.issue(issue)
+		invalid := issue != psiOK
+		for _, section := range sections {
+			pat, err := mpegts.ParsePAT(section)
+			if err != nil {
+				filter.issue(psiStructure)
+				invalid = true
+				break
+			}
+			if pat.PMTPID != filter.pmtPID {
+				invalid = true
+			}
+		}
+		if invalid {
+			n, err := filter.fallback()
+			written += n
+			if err != nil {
+				return written, err
+			}
+			n, err = filter.writePacket(packet)
+			return written + n, err
+		}
+	}
+	n, err := filter.writeInitialized(packet, parsed)
+	return written + n, err
+}
+
+// observeTablesは全component保存時にもPSI品質を観測するが、選別設定には使わない。
+func (filter *tsComponentFilter) observeTables(packet []byte, parsed mpegts.Packet) {
+	if parsed.PID == 0 {
+		sections, _, issue := filter.pat.Feed(packet, parsed)
+		filter.issue(issue)
+		for _, section := range sections {
+			pat, err := mpegts.ParsePAT(section)
+			if err != nil {
+				filter.issue(psiStructure)
+				continue
+			}
+			if !filter.pmtKnown || filter.pmtPID != pat.PMTPID {
+				filter.pmt.reset()
+			}
+			filter.pmtPID, filter.pmtKnown = pat.PMTPID, true
+			filter.tracker.prioritize(pat.PMTPID, &filter.quality)
+		}
+	} else if filter.pmtKnown && parsed.PID == filter.pmtPID {
+		sections, _, issue := filter.pmt.Feed(packet, parsed)
+		filter.issue(issue)
+		for _, section := range sections {
+			if issue := pmtIssue(section); issue != psiOK {
+				filter.issue(issue)
+				continue
+			}
+			pmt, err := mpegts.ParsePMT(section)
+			if err != nil {
+				filter.issue(psiStructure)
+				continue
+			}
+			filter.tracker.configure(filter.pmtPID, pmt, &filter.quality)
+		}
+	}
+}
+
+func (filter *tsComponentFilter) discover(packet []byte, parsed mpegts.Packet) (int64, error) {
+	if parsed.PID == 0 {
+		sections, _, issue := filter.pat.Feed(packet, parsed)
+		filter.issue(issue)
+		if issue == psiLimit {
+			return filter.fallback()
+		}
+		for _, section := range sections {
+			pat, err := mpegts.ParsePAT(section)
+			if err != nil {
+				filter.issue(psiStructure)
+				continue
+			}
+			if !filter.pmtKnown || pat.PMTPID != filter.pmtPID {
+				filter.pmt.reset()
+				filter.firstPMT = -1
+			}
+			filter.pmtPID, filter.pmtKnown = pat.PMTPID, true
+			filter.tracker.prioritize(pat.PMTPID, &filter.quality)
+		}
+	}
+	if !filter.pmtKnown || parsed.PID != filter.pmtPID {
 		return 0, nil
 	}
-	filter.updatePMTIndexes = append(filter.updatePMTIndexes, len(filter.updatePackets)-1)
-	sections, feedErr := filter.updateCollector.Feed(packet)
-	if feedErr != nil {
-		return 0, invalidTS(feedErr)
+	sections, duplicate, issue := filter.pmt.Feed(packet, parsed)
+	filter.issue(issue)
+	if issue == psiLimit {
+		return filter.fallback()
+	}
+	if issue != psiOK {
+		filter.firstPMT = -1
+		return 0, nil
+	}
+	if parsed.PayloadUnitStart && !duplicate {
+		filter.firstPMT = len(filter.discovery)/188 - 1
 	}
 	if len(sections) == 0 {
 		return 0, nil
 	}
 	section := sections[len(sections)-1]
+	if issue := pmtIssue(section); issue != psiOK {
+		filter.issue(issue)
+		if issue == psiLimit {
+			return filter.fallback()
+		}
+		return 0, nil
+	}
+	pmt, err := mpegts.ParsePMT(section)
+	if err != nil {
+		filter.issue(psiStructure)
+		return 0, nil
+	}
 	rewritten, dropped, err := rewritePMT(section, filter.keepCaptions, filter.keepData)
+	if err != nil {
+		filter.issue(psiStructure)
+		return 0, nil
+	}
+	filter.tracker.configure(filter.pmtPID, pmt, &filter.quality)
+	filter.dropped = dropped
+	filter.initialized = true
+	filter.pmtContinuity = packet[3] & 15
+	// PMTの最初の連番を出力の起点にする。
+	if filter.firstPMT >= 0 {
+		filter.pmtContinuity = filter.discovery[filter.firstPMT*188+3] & 15
+	}
+	written, err := filter.replay(filter.discovery, filter.firstPMT, rewritten, dropped)
+	filter.discovery = nil
+	return written, err
+}
+
+func (filter *tsComponentFilter) writeInitialized(packet []byte, parsed mpegts.Packet) (int64, error) {
+	if len(filter.pending) == 0 && parsed.PID != filter.pmtPID {
+		return filter.writeSelectedWith(packet, filter.dropped)
+	}
+	if len(filter.pending) == 0 && !parsed.HasPayload {
+		// adaptationだけのpacketはPMT更新の開始ではない。
+		filter.pmt.Feed(packet, parsed)
+		return filter.writePacket(packet)
+	}
+	// 完全同一の再送はcollectorにも更新bufferにも二重に追加しない。
+	if parsed.PID == filter.pmtPID && filter.pmt.known && parsed.ContinuityCounter == filter.pmt.cc && !parsed.Discontinuity {
+		if bytes.Equal(packet, filter.pmt.previous[:]) {
+			return 0, nil
+		}
+	}
+	if len(filter.pending) == 0 && !parsed.PayloadUnitStart {
+		filter.issue(psiStructure)
+		n, err := filter.fallback()
+		if err != nil {
+			return n, err
+		}
+		more, err := filter.writePacket(packet)
+		return n + more, err
+	}
+	if len(filter.pending)+188 > maxPSIBuffer {
+		filter.issue(psiLimit)
+		n, err := filter.fallback()
+		if err != nil {
+			return n, err
+		}
+		more, err := filter.writePacket(packet)
+		return n + more, err
+	}
+	if filter.pending == nil {
+		filter.pending = make([]byte, 0, maxPSIBuffer)
+	}
+	filter.pending = append(filter.pending, packet...)
+	if parsed.PID != filter.pmtPID {
+		return 0, nil
+	}
+	sections, _, issue := filter.pmt.Feed(packet, parsed)
+	filter.issue(issue)
+	if issue != psiOK {
+		return filter.fallback()
+	}
+	if len(sections) == 0 {
+		return 0, nil
+	}
+	section := sections[len(sections)-1]
+	if issue := pmtIssue(section); issue != psiOK {
+		filter.issue(issue)
+		return filter.fallback()
+	}
+	pmt, err := mpegts.ParsePMT(section)
+	if err != nil {
+		filter.issue(psiStructure)
+		return filter.fallback()
+	}
+	rewritten, dropped, err := rewritePMT(section, filter.keepCaptions, filter.keepData)
+	if err != nil {
+		filter.issue(psiStructure)
+		return filter.fallback()
+	}
+	filter.tracker.configure(filter.pmtPID, pmt, &filter.quality)
+	written, err := filter.replay(filter.pending, 0, rewritten, dropped)
+	filter.pending = filter.pending[:0]
+	filter.dropped = dropped
+	return written, err
+}
+
+func (filter *tsComponentFilter) replay(data []byte, first int, section []byte, dropped map[uint16]bool) (int64, error) {
+	var written int64
+	packets, err := mpegts.PacketizeSection(filter.pmtPID, filter.pmtContinuity, section)
 	if err != nil {
 		return 0, err
 	}
-	first := filter.updatePMTIndexes[0]
-	last := filter.updatePMTIndexes[len(filter.updatePMTIndexes)-1]
-	packets, err := mpegts.PacketizeSection(filter.pmtPID, filter.pmtContinuity, rewritten)
-	if err != nil {
-		return 0, invalidTS(err)
-	}
-	var written int64
-	for index, pending := range filter.updatePackets {
+	for index := 0; index < len(data)/188; index++ {
 		if index == first {
-			count, writeErr := filter.writePacketList(packets)
-			written += count
-			if writeErr != nil {
-				return written, writeErr
+			n, err := filter.writePacketList(packets)
+			written += n
+			if err != nil {
+				return written, err
 			}
+			filter.pmtContinuity = (filter.pmtContinuity + byte(len(packets))) & 15
 		}
-		if index >= first && index <= last && mpegts.PID(pending) == filter.pmtPID {
+		packet := data[index*188 : (index+1)*188]
+		if index >= first && mpegts.PID(packet) == filter.pmtPID {
 			continue
 		}
-		count, writeErr := filter.writeSelectedWith(pending, dropped)
-		written += count
-		if writeErr != nil {
-			return written, writeErr
+		n, err := filter.writeSelectedWith(packet, dropped)
+		written += n
+		if err != nil {
+			return written, err
 		}
 	}
-	filter.dropped = dropped
-	filter.pmtContinuity = (filter.pmtContinuity + byte(len(packets))) & 0x0f
-	filter.updatePackets = nil
-	filter.updatePMTIndexes = nil
 	return written, nil
 }
 
-func (filter *tsComponentFilter) writeSelected(packet []byte) (int64, error) {
-	return filter.writeSelectedWith(packet, filter.dropped)
+func (filter *tsComponentFilter) fallback() (int64, error) {
+	if !filter.raw {
+		filter.raw = true
+		filter.quality.SelectionUnverified = true
+		filter.quality.FallbackEvents = 1
+		filter.quality.Status = core.QualityDegraded
+	}
+	var written int64
+	for _, data := range [][]byte{filter.discovery, filter.pending} {
+		for offset := 0; offset < len(data); offset += 188 {
+			n, err := filter.writePacket(data[offset : offset+188])
+			written += n
+			if err != nil {
+				filter.discovery = nil
+				filter.pending = nil
+				return written, err
+			}
+		}
+	}
+	filter.discovery = nil
+	filter.pending = nil
+	return written, nil
+}
+
+// Finishは末尾の観測を確定する。許可された場合だけ保持済みpacketを保存する。
+func (filter *tsComponentFilter) Finish(allowBufferedWrite bool) (int64, error) {
+	if filter.finished {
+		return 0, nil
+	}
+	filter.finished = true
+	filter.framer.Finish(&filter.quality)
+	if filter.pat.incomplete() {
+		addQuality(&filter.quality, &filter.quality.UnfinishedPSIEvents, 1)
+	}
+	if filter.pmt.incomplete() {
+		addQuality(&filter.quality, &filter.quality.UnfinishedPSIEvents, 1)
+	}
+	if filter.selectionRequired() && (!filter.initialized || len(filter.pending) > 0) && allowBufferedWrite {
+		return filter.fallback()
+	}
+	filter.discovery = nil
+	filter.pending = nil
+	return 0, nil
 }
 
 func (filter *tsComponentFilter) writeSelectedWith(packet []byte, dropped map[uint16]bool) (int64, error) {
-	parsed, err := mpegts.ParsePacket(packet)
-	if err != nil {
-		return 0, invalidTS(err)
-	}
-	if dropped[parsed.PID] {
+	if dropped[mpegts.PID(packet)] {
 		return 0, nil
 	}
 	return filter.writePacket(packet)

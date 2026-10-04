@@ -24,6 +24,12 @@ import (
 
 type e2eClock struct{ now time.Time }
 
+func e2ePayloadPacket() []byte {
+	packet := bytes.Repeat([]byte{0xff}, 188)
+	copy(packet[:4], []byte{0x47, 0x01, 0x01, 0x10})
+	return packet
+}
+
 func (clock *e2eClock) Now() time.Time { return clock.now }
 
 type e2eStream struct {
@@ -59,7 +65,7 @@ func (stream *stopE2EStream) OpenStream(context.Context, providerstream.Request)
 type stopE2ELease struct{ stream *stopE2EStream }
 
 func (lease *stopE2ELease) Read(_ context.Context, destination []byte) (int, providerstream.Terminal, error) {
-	copy(destination, bytes.Repeat([]byte{0x47}, 188))
+	copy(destination, e2ePayloadPacket())
 	if !lease.stream.called {
 		lease.stream.called = true
 		if err := lease.stream.stop(); err != nil {
@@ -96,7 +102,7 @@ func (lease *parallelE2ELease) Read(ctx context.Context, destination []byte) (in
 		return 0, providerstream.Terminal{Done: true, Reason: providerstream.TerminalCancelled}, ctx.Err()
 	case <-lease.stream.release:
 	}
-	copy(destination, bytes.Repeat([]byte{0x47}, 188))
+	copy(destination, e2ePayloadPacket())
 	lease.stream.clock.now = lease.stream.end
 	return 188, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
 }
@@ -163,7 +169,7 @@ func (stream *finalizationRaceStream) OpenStream(_ context.Context,
 				<-ctx.Done()
 				return 0, providerstream.Terminal{Done: true, Reason: providerstream.TerminalCancelled}, ctx.Err()
 			default:
-				copy(destination, bytes.Repeat([]byte{0x47}, 188))
+				copy(destination, e2ePayloadPacket())
 				close(stream.oneSegWritten)
 				return 188, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
 			}
@@ -190,7 +196,7 @@ func (stream *finalizationRaceStream) OpenStream(_ context.Context,
 				return 0, providerstream.Terminal{Done: true, Reason: providerstream.TerminalCancelled}, ctx.Err()
 			case <-stream.secondStarted:
 			}
-			copy(destination, bytes.Repeat([]byte{0x47}, 188))
+			copy(destination, e2ePayloadPacket())
 			stream.clock.set(stream.end)
 			return 188, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
 		}
@@ -201,7 +207,7 @@ func (stream *finalizationRaceStream) OpenStream(_ context.Context,
 			return 0, providerstream.Terminal{Done: true, Reason: providerstream.TerminalCancelled}, ctx.Err()
 		case <-stream.releaseSecond:
 		}
-		copy(destination, bytes.Repeat([]byte{0x47}, 188))
+		copy(destination, e2ePayloadPacket())
 		stream.clock.set(stream.end)
 		return 188, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
 	}}, nil
@@ -244,7 +250,7 @@ func (file *blockedSyncPartial) Close() error {
 }
 
 func (lease *e2eLease) Read(_ context.Context, destination []byte) (int, providerstream.Terminal, error) {
-	copy(destination, bytes.Repeat([]byte{0x47}, 188))
+	copy(destination, e2ePayloadPacket())
 	if lease.stream.onRead != nil && !lease.stream.hooked {
 		lease.stream.hooked = true
 		lease.stream.onRead()

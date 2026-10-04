@@ -88,7 +88,9 @@ func (lease *syntheticLease) Read(ctx context.Context, destination []byte) (int,
 		return 0, providerstream.Terminal{Done: true, Reason: providerstream.TerminalTimeout},
 			provider.NewFailure(provider.ReasonTimeout, "synthetic-cycle")
 	}
-	copy(destination, bytes.Repeat([]byte{0x47}, 188))
+	packet := bytes.Repeat([]byte{0xff}, 188)
+	copy(packet[:4], []byte{0x47, 0x01, 0x01, 0x10})
+	copy(destination, packet)
 	if !lease.stream.hooked {
 		lease.stream.hooked = true
 		if lease.stream.onFirstRead != nil {

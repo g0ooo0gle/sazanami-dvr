@@ -245,9 +245,7 @@ func TestExecutorPublishesOnlyAfterPlannedEnd(t *testing.T) {
 		if len(destination) != provider.MaxStreamChunk {
 			t.Fatalf("buffer=%d", len(destination))
 		}
-		for index := 0; index < 188; index++ {
-			destination[index] = 0x47
-		}
+		copy(destination, bytesOf(0x47, 188))
 		clock.now = store.end
 		return 188, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
 	}
@@ -776,12 +774,14 @@ func eventIndex(values []string, target string) int {
 	return -1
 }
 
-func TestExecutorFailsMalformedSelectedStreamWithoutReconnect(t *testing.T) {
+func TestExecutorDiscardsMalformedSelectedStreamWithoutReconnect(t *testing.T) {
 	start := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
 	clock := &mutableClock{now: start}
 	store := &attemptMemory{start: start, end: start.Add(time.Minute)}
 	lease := &fakeLease{read: func(destination []byte) (int, providerstream.Terminal, error) {
-		copy(destination, bytesOf(0x47, tsPacketBytes))
+		packet := makePayloadPacket(0x101)
+		packet[3] = 0 // 構造不正のpacketは捨てるが、予定終了まで受信する。
+		copy(destination, packet)
 		clock.now = store.end
 		return tsPacketBytes, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
 	}}
@@ -790,7 +790,7 @@ func TestExecutorFailsMalformedSelectedStreamWithoutReconnect(t *testing.T) {
 	reservation := reservationForExecutor(t, start, time.Minute)
 	reservation.Components = core.ComponentDefault
 	result, err := executor.Execute(context.Background(), reservation)
-	if err != nil || result.State != core.AttemptFailed || result.Reason != core.ReasonStreamFormatInvalid ||
+	if err != nil || result.State != core.AttemptFailed || result.Reason != core.ReasonStreamEndedEarly ||
 		stream.opens != 1 || store.finish.ByteCount != 0 {
 		t.Fatalf("result=%+v opens=%d finish=%+v err=%v", result, stream.opens, store.finish, err)
 	}
@@ -827,9 +827,7 @@ func TestExecutorUsesExtendedPlannedEnd(t *testing.T) {
 	reads := 0
 	lease := &fakeLease{read: func(destination []byte) (int, providerstream.Terminal, error) {
 		reads++
-		for index := 0; index < 188; index++ {
-			destination[index] = 0x47
-		}
+		copy(destination, bytesOf(0x47, 188))
 		switch reads {
 		case 1:
 			clock.now = start.Add(progressInterval)
@@ -863,9 +861,7 @@ func TestExecutorUsesExtensionObservedBeforeRecordingStart(t *testing.T) {
 	reads := 0
 	lease := &fakeLease{read: func(destination []byte) (int, providerstream.Terminal, error) {
 		reads++
-		for index := 0; index < 188; index++ {
-			destination[index] = 0x47
-		}
+		copy(destination, bytesOf(0x47, 188))
 		if reads == 1 {
 			clock.now = initialEnd
 		} else {
@@ -908,9 +904,7 @@ func TestExecutorRejectsInvalidPlannedEndUpdate(t *testing.T) {
 			clock := &mutableClock{now: start}
 			store := &attemptMemory{start: start, end: start.Add(time.Minute), progressEnd: plannedEnd}
 			lease := &fakeLease{read: func(destination []byte) (int, providerstream.Terminal, error) {
-				for index := 0; index < 188; index++ {
-					destination[index] = 0x47
-				}
+				copy(destination, bytesOf(0x47, 188))
 				clock.now = start.Add(progressInterval)
 				return 188, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
 			}}
@@ -962,9 +956,7 @@ func TestExecutorKeepsEarlyStreamAsPartialWhenLessThanReconnectWindowRemains(t *
 	clock := &mutableClock{now: start}
 	store := &attemptMemory{start: start, end: start.Add(time.Minute - time.Nanosecond)}
 	lease := &fakeLease{read: func(destination []byte) (int, providerstream.Terminal, error) {
-		for index := 0; index < 188; index++ {
-			destination[index] = 0x47
-		}
+		copy(destination, bytesOf(0x47, 188))
 		return 188, providerstream.Terminal{Done: true, Reason: providerstream.TerminalEarlyEOF},
 			provider.NewFailure(provider.ReasonEarlyEOF, "test")
 	}}
@@ -986,12 +978,13 @@ func TestExecutorDoesNotTreatShortWriteAsUsefulRecording(t *testing.T) {
 	clock := &mutableClock{now: start}
 	store := &attemptMemory{start: start, end: start.Add(time.Minute)}
 	lease := &fakeLease{read: func(destination []byte) (int, providerstream.Terminal, error) {
-		return 100, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
+		copy(destination, bytesOf(0x47, 188))
+		return 188, providerstream.Terminal{Reason: providerstream.TerminalActive}, nil
 	}}
 	executor := executorForTest(t, store, &fakeProvider{lease: lease}, clock, true)
 	result, err := executor.Execute(context.Background(), reservationForExecutor(t, start, time.Minute))
 	if err != nil || result.State != core.AttemptFailed || result.Reason != core.ReasonFileWriteFailed ||
-		store.finish.ByteCount != 99 || store.finish.Availability != core.AvailabilityPartial {
+		store.finish.ByteCount != 187 || store.finish.Availability != core.AvailabilityPartial {
 		t.Fatalf("result=%+v finish=%+v err=%v", result, store.finish, err)
 	}
 }
@@ -1348,7 +1341,7 @@ func TestExecutorDoesNotPublishTooShortUserStoppedRecording(t *testing.T) {
 	select {
 	case result := <-done:
 		if result.State != core.AttemptCancelled || result.Reason != core.ReasonUserRequestedStop ||
-			store.finish.ByteCount != minimumUsefulTS-1 || store.finish.Availability != core.AvailabilityPartial {
+			store.finish.ByteCount != 0 || store.finish.Availability != core.AvailabilityPartial {
 			t.Fatalf("result=%+v finish=%+v", result, store.finish)
 		}
 	case <-time.After(time.Second):
@@ -1753,6 +1746,11 @@ func bytesOf(value byte, count int) []byte {
 	result := make([]byte, count)
 	for index := range result {
 		result[index] = value
+	}
+	if value == 0x47 {
+		for offset := 0; offset+4 <= count; offset += 188 {
+			copy(result[offset:offset+4], []byte{0x47, 0x01, 0x01, 0x10 | byte(offset/188)&15})
+		}
 	}
 	return result
 }

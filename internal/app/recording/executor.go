@@ -107,6 +107,7 @@ type streamCopyResult struct {
 	Reason       recording.TerminalReason
 	ReachedEnd   bool
 	Retryable    bool
+	Quality      recording.QualitySummary
 }
 
 // Missはストリームを開かず、実行できなかった予約を終了状態へ進める。
@@ -394,21 +395,30 @@ func (executor Executor) publishFinal(ctx context.Context, attempt recording.Att
 
 func (executor Executor) copy(ctx context.Context, lease providerstream.Lease, file PartialFile, attempt recording.Attempt,
 	componentMode recording.ComponentMode, result streamCopyResult, oneSeg bool,
-) streamCopyResult {
+) (out streamCopyResult) {
 	result.ReachedEnd = false
 	result.Retryable = false
 	buffer := make([]byte, provider.MaxStreamChunk)
 	components := componentMode.Effective()
-	var filter *tsComponentFilter
-	if !components.Captions || !components.Data {
-		filter = newTSComponentFilter(file, components.Captions, components.Data)
-	}
+	filter := newTSComponentFilter(file, components.Captions, components.Data, result.Quality)
+	defer func() {
+		allow := out.ReachedEnd || out.Reason == recording.ReasonUserRequestedStop ||
+			ctx.Err() == nil && (out.Reason == recording.ReasonStreamEndedEarly ||
+				out.Reason == recording.ReasonStreamTimeout || out.Reason == recording.ReasonStreamUnavailable)
+		written, err := filter.Finish(allow)
+		out.Quality = filter.Quality()
+		if out.ByteCount > math.MaxInt64-written {
+			err = errors.New("recording: TS byte count overflow")
+		} else {
+			out.ByteCount += written
+		}
+		if err != nil {
+			out.Reason = recording.ReasonFileWriteFailed
+			out.Retryable, out.ReachedEnd = false, false
+		}
+	}()
 	for {
 		if !executor.now().Before(result.PlannedEnd) {
-			if filter != nil && filter.Finish() != nil {
-				result.Reason = recording.ReasonStreamFormatInvalid
-				return result
-			}
 			result.Reason = recording.ReasonCompleted
 			result.ReachedEnd = true
 			return result
@@ -419,21 +429,8 @@ func (executor Executor) copy(ctx context.Context, lease providerstream.Lease, f
 			return result
 		}
 		if read > 0 {
-			var written int64
-			var writeErr error
-			if filter == nil {
-				count, err := file.Write(buffer[:read])
-				if count < 0 || count > read {
-					writeErr = errors.New("recording: invalid file write count")
-				} else {
-					written, writeErr = int64(count), err
-					if writeErr == nil && count != read {
-						writeErr = errors.New("recording: short file write")
-					}
-				}
-			} else {
-				written, writeErr = filter.Write(buffer[:read])
-			}
+			written, writeErr := filter.Write(buffer[:read])
+			result.Quality = filter.Quality()
 			if result.ByteCount > math.MaxInt64-written {
 				result.Reason = recording.ReasonFileWriteFailed
 				return result
@@ -476,19 +473,11 @@ func (executor Executor) copy(ctx context.Context, lease providerstream.Lease, f
 			}
 		}
 		if !now.Before(result.PlannedEnd) {
-			if filter != nil && filter.Finish() != nil {
-				result.Reason = recording.ReasonStreamFormatInvalid
-				return result
-			}
 			result.Reason = recording.ReasonCompleted
 			result.ReachedEnd = true
 			return result
 		}
 		if err != nil || terminal.Done {
-			if filter != nil && ctx.Err() == nil && filter.Finish() != nil {
-				result.Reason = recording.ReasonStreamFormatInvalid
-				return result
-			}
 			result.Reason = streamTerminalReason(err, terminal)
 			result.Retryable = retryableStreamFailure(err, terminal)
 			return result
